@@ -4,7 +4,7 @@
 
 ## 当前结构
 - `apps/trading/`：交易指标分析模块（从 `Quant_Ai` 首次迁移）
-- `apps/fundamental/`：基本面板块（待开发）
+- `apps/fundamental/`：基本面独立板块（首版已落地）
 - `apps/filter/`：大过滤器板块（待开发）
 - `shared/`：公共组件与工具（待扩展）
 - `docs/`：架构文档与里程碑
