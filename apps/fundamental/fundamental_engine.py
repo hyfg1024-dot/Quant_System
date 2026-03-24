@@ -11,9 +11,10 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import akshare as ak
 import pandas as pd
+import requests
 
 
-APP_VERSION = "FND-20260323-02"
+APP_VERSION = "FND-20260324-01"
 ROOT_DIR = Path(__file__).resolve().parent
 DATA_DIR = ROOT_DIR / "data"
 CACHE_DIR = DATA_DIR / "cache"
@@ -49,6 +50,11 @@ def parse_cn_number(value: Any) -> Optional[float]:
     if value is None:
         return None
     if isinstance(value, (int, float)):
+        try:
+            if pd.isna(value):
+                return None
+        except Exception:
+            pass
         return float(value)
 
     text = str(value).strip()
@@ -84,18 +90,34 @@ def parse_cn_number(value: Any) -> Optional[float]:
 
 def format_num(value: Optional[float], digits: int = 2, suffix: str = "") -> str:
     if value is None:
-        return "N/A"
+        return f"--{suffix}"
+    try:
+        if pd.isna(value):
+            return f"--{suffix}"
+    except Exception:
+        pass
     return f"{value:.{digits}f}{suffix}"
 
 
 def format_pct(value: Optional[float], digits: int = 2) -> str:
     if value is None:
-        return "N/A"
+        return "--"
+    try:
+        if pd.isna(value):
+            return "--"
+    except Exception:
+        pass
     return f"{value:.{digits}f}%"
 
 
 def safe_div(a: Optional[float], b: Optional[float]) -> Optional[float]:
-    if a is None or b in {None, 0}:
+    try:
+        if a is None or b in {None, 0} or pd.isna(a) or pd.isna(b):
+            return None
+    except Exception:
+        if a is None or b in {None, 0}:
+            return None
+    if b == 0:
         return None
     return a / b
 
@@ -174,6 +196,114 @@ def delete_watch_item(code: str) -> List[Dict[str, str]]:
     return rows
 
 
+def _normalize_name(text: str) -> str:
+    return re.sub(r"\s+", "", str(text or "")).strip().upper()
+
+
+def resolve_stock_identity(query: str) -> Tuple[str, str]:
+    q = str(query or "").strip()
+    if not q:
+        raise ValueError("请输入股票代码或名称")
+
+    code_candidate = normalize_code(q)
+    rows = load_watchlist()
+
+    # 先从本地观察池匹配（代码/名称）
+    if code_candidate and len(code_candidate) in {5, 6}:
+        for item in rows:
+            if str(item.get("code", "")) == code_candidate:
+                name = str(item.get("name", "")).strip() or code_candidate
+                if name == code_candidate:
+                    tx_name = _fetch_name_from_tencent(code_candidate)
+                    if tx_name:
+                        name = tx_name
+                return code_candidate, name
+    for item in rows:
+        if str(item.get("name", "")).strip() == q:
+            return str(item.get("code", "")).strip(), str(item.get("name", "")).strip()
+
+    # 代码输入：优先腾讯名称兜底，再尝试 AKShare 列表
+    if code_candidate and len(code_candidate) in {5, 6}:
+        tx_name = _fetch_name_from_tencent(code_candidate)
+        if tx_name:
+            return code_candidate, tx_name
+
+        if len(code_candidate) == 6:
+            try:
+                a_df = ak.stock_info_a_code_name()
+                if a_df is not None and not a_df.empty:
+                    a_df = a_df.copy()
+                    a_df["code"] = a_df["code"].astype(str).str.strip()
+                    a_df["name"] = a_df["name"].astype(str).str.strip()
+                    one = a_df[a_df["code"] == code_candidate]
+                    if not one.empty:
+                        row = one.iloc[0]
+                        return code_candidate, str(row["name"]).strip()
+            except Exception:
+                pass
+        else:
+            try:
+                hk_df = ak.stock_hk_spot()
+                if hk_df is not None and not hk_df.empty:
+                    hk_df = hk_df.copy()
+                    hk_df["代码"] = hk_df["代码"].astype(str).str.strip().str.zfill(5)
+                    name_col = "中文名称" if "中文名称" in hk_df.columns else "名称"
+                    hk_df[name_col] = hk_df[name_col].astype(str).str.strip()
+                    one = hk_df[hk_df["代码"] == code_candidate]
+                    if not one.empty:
+                        row = one.iloc[0]
+                        return code_candidate, str(row[name_col]).strip()
+            except Exception:
+                pass
+        raise ValueError(f"未找到代码为 {code_candidate} 的标的")
+
+    # 名称输入：先A股，再港股（支持模糊包含）
+    q_norm = _normalize_name(q)
+    try:
+        a_df = ak.stock_info_a_code_name()
+        if a_df is not None and not a_df.empty:
+            a_df = a_df.copy()
+            a_df["code"] = a_df["code"].astype(str).str.strip()
+            a_df["name"] = a_df["name"].astype(str).str.strip()
+            a_df["name_norm"] = a_df["name"].map(_normalize_name)
+            exact = a_df[a_df["name_norm"] == q_norm]
+            if not exact.empty:
+                row = exact.iloc[0]
+                return str(row["code"]), str(row["name"])
+            fuzzy = a_df[a_df["name_norm"].str.contains(q_norm, na=False)]
+            if not fuzzy.empty:
+                row = fuzzy.iloc[0]
+                return str(row["code"]), str(row["name"])
+    except Exception:
+        pass
+
+    try:
+        hk_df = ak.stock_hk_spot()
+        if hk_df is not None and not hk_df.empty:
+            hk_df = hk_df.copy()
+            hk_df["代码"] = hk_df["代码"].astype(str).str.strip().str.zfill(5)
+            name_col = "中文名称" if "中文名称" in hk_df.columns else "名称"
+            hk_df[name_col] = hk_df[name_col].astype(str).str.strip()
+            hk_df["name_norm"] = hk_df[name_col].map(_normalize_name)
+            exact = hk_df[hk_df["name_norm"] == q_norm]
+            if not exact.empty:
+                row = exact.iloc[0]
+                return str(row["代码"]), str(row[name_col])
+            fuzzy = hk_df[hk_df["name_norm"].str.contains(q_norm, na=False)]
+            if not fuzzy.empty:
+                row = fuzzy.iloc[0]
+                return str(row["代码"]), str(row[name_col])
+    except Exception:
+        pass
+
+    raise ValueError(f"未找到名称为 {q} 的A股/港股标的")
+
+
+def upsert_watch_item_by_query(query: str, item_type: str) -> List[Dict[str, str]]:
+    code, name = resolve_stock_identity(query)
+    return upsert_watch_item(code, name, item_type)
+
+
 def _latest_annual_columns(df: pd.DataFrame, n: int = 6) -> List[str]:
     cols = [c for c in df.columns if re.fullmatch(r"\d{8}", str(c))]
     cols = [c for c in cols if str(c).endswith("1231")]
@@ -227,15 +357,212 @@ def _extract_latest_from_indicator(df: pd.DataFrame, col: str) -> Optional[float
     return parse_cn_number(temp.iloc[0].get(col))
 
 
+def _extract_latest_from_indicator_multi(df: pd.DataFrame, cols: List[str]) -> Optional[float]:
+    for col in cols:
+        val = _extract_latest_from_indicator(df, col)
+        if val is not None:
+            return val
+    return None
+
+
+def _pick_profile_number(profile: Dict[str, Any], keys: List[str]) -> Optional[float]:
+    for key in keys:
+        if key in profile:
+            val = parse_cn_number(profile.get(key))
+            if val is not None:
+                return val
+    return None
+
+
+def _coalesce_number(*values: Optional[float], default: Optional[float] = None) -> Optional[float]:
+    for value in values:
+        try:
+            if value is not None and not pd.isna(value):
+                return float(value)
+        except Exception:
+            if value is not None:
+                return float(value)
+    if default is None:
+        return None
+    return float(default)
+
+
 def _extract_latest_str_from_indicator(df: pd.DataFrame, col: str) -> str:
     if df.empty or col not in df.columns:
-        return "N/A"
+        return "--"
     temp = df.copy()
     if "报告期" in temp.columns:
         temp["报告期"] = temp["报告期"].astype(str)
         temp = temp.sort_values("报告期", ascending=False)
     val = temp.iloc[0].get(col)
-    return str(val) if val not in [None, ""] else "N/A"
+    return str(val) if val not in [None, ""] else "--"
+
+
+def _is_hk_symbol(symbol: str) -> bool:
+    text = str(symbol or "").strip()
+    return bool(re.fullmatch(r"\d{5}", text))
+
+
+def _normalize_pe_value(value: Optional[float]) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+    v = float(value)
+    if abs(v) < 1e-12:
+        return None
+    if abs(v) > 1e6:
+        return None
+    return v
+
+
+def _normalize_pb_value(value: Optional[float]) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+    v = float(value)
+    if v <= 0 or v > 1e5:
+        return None
+    return v
+
+
+def _normalize_dividend_value(value: Optional[float]) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+    v = float(value)
+    if v < 0:
+        return None
+    # 某些接口给小数口径 0.0492 => 4.92%
+    if 0 < v < 0.2:
+        v *= 100
+    return v
+
+
+def _fetch_metrics_from_eastmoney_direct(symbol: str) -> Dict[str, Optional[float]]:
+    secid = ("1." if str(symbol).startswith("6") else "0.") + str(symbol)
+    fields = "f57,f58,f162,f163,f164,f167"
+    urls = [
+        "https://push2.eastmoney.com/api/qt/stock/get",
+        "http://push2.eastmoney.com/api/qt/stock/get",
+    ]
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Referer": "https://quote.eastmoney.com",
+    }
+    for _ in range(3):
+        for url in urls:
+            try:
+                session = requests.Session()
+                session.trust_env = False
+                resp = session.get(
+                    url,
+                    params={"invt": "2", "fltt": "2", "secid": secid, "fields": fields},
+                    headers=headers,
+                    timeout=8,
+                )
+                resp.raise_for_status()
+                data = (resp.json() or {}).get("data") or {}
+                return {
+                    "pe_dynamic": _normalize_pe_value(parse_cn_number(data.get("f162"))),
+                    "pe_static": _normalize_pe_value(parse_cn_number(data.get("f163"))),
+                    "pe_ttm": _normalize_pe_value(parse_cn_number(data.get("f164"))),
+                    "pb": _normalize_pb_value(parse_cn_number(data.get("f167"))),
+                }
+            except Exception:
+                continue
+    return {"pe_dynamic": None, "pe_static": None, "pe_ttm": None, "pb": None}
+
+
+def _fetch_metrics_from_tencent(symbol: str) -> Dict[str, Optional[float]]:
+    symbol_text = str(symbol).strip()
+    if _is_hk_symbol(symbol_text):
+        exchange = "hk"
+    elif symbol_text.startswith(("5", "6", "9")):
+        exchange = "sh"
+    else:
+        exchange = "sz"
+    url = f"https://qt.gtimg.cn/q={exchange}{symbol_text}"
+    try:
+        session = requests.Session()
+        session.trust_env = False
+        resp = session.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=8)
+        resp.raise_for_status()
+        resp.encoding = "gbk"
+        text = resp.text
+        if '"' not in text or "~" not in text:
+            return {"pe_dynamic": None, "pe_ttm": None, "pb": None}
+        payload = text.split('"', 1)[1].rsplit('"', 1)[0]
+        fields = payload.split("~")
+        pe_dynamic = parse_cn_number(fields[52]) if len(fields) > 52 else None
+        pe_ttm = parse_cn_number(fields[53]) if len(fields) > 53 else None
+        pb = parse_cn_number(fields[46]) if len(fields) > 46 else None
+        return {
+            "pe_dynamic": _normalize_pe_value(pe_dynamic),
+            "pe_ttm": _normalize_pe_value(pe_ttm),
+            "pb": _normalize_pb_value(pb),
+        }
+    except Exception:
+        return {"pe_dynamic": None, "pe_ttm": None, "pb": None}
+
+
+def _fetch_name_from_tencent(symbol: str) -> Optional[str]:
+    symbol_text = str(symbol).strip()
+    if _is_hk_symbol(symbol_text):
+        exchange = "hk"
+    elif symbol_text.startswith(("5", "6", "9")):
+        exchange = "sh"
+    else:
+        exchange = "sz"
+    url = f"https://qt.gtimg.cn/q={exchange}{symbol_text}"
+    try:
+        session = requests.Session()
+        session.trust_env = False
+        resp = session.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=8)
+        resp.raise_for_status()
+        resp.encoding = "gbk"
+        text = resp.text
+        if '"' not in text or "~" not in text:
+            return None
+        payload = text.split('"', 1)[1].rsplit('"', 1)[0]
+        fields = payload.split("~")
+        if len(fields) < 2:
+            return None
+        name = str(fields[1]).strip()
+        if not name or name in {"-", "--", "None", "nan", "NaN"}:
+            return None
+        return name
+    except Exception:
+        return None
+
+
+def _fetch_dividend_yield_from_em(symbol: str) -> Optional[float]:
+    try:
+        df = ak.stock_fhps_detail_em(symbol=str(symbol))
+        if df is None or df.empty or "现金分红-股息率" not in df.columns:
+            return None
+        tmp = df.copy()
+        tmp["现金分红-股息率"] = pd.to_numeric(tmp["现金分红-股息率"], errors="coerce")
+        tmp = tmp.dropna(subset=["现金分红-股息率"])
+        if tmp.empty:
+            return None
+        annual = tmp[tmp["报告期"].astype(str).str.endswith("12-31")]
+        chosen = annual if not annual.empty else tmp
+        val = parse_cn_number(chosen.iloc[-1]["现金分红-股息率"])
+        return _normalize_dividend_value(val)
+    except Exception:
+        return None
 
 
 def _growth_from_series(values: List[Optional[float]]) -> Optional[float]:
@@ -361,12 +688,20 @@ def analyze_fundamental(code: str, name: str = "", force_refresh: bool = False, 
         return {"code": code, "name": name or "未知", "error": "股票代码为空"}
 
     cache_file = _cache_file(code)
+    stale_cache: Dict[str, Any] = {}
+    if cache_file.exists():
+        try:
+            stale_cache = json.loads(cache_file.read_text(encoding="utf-8"))
+        except Exception:
+            stale_cache = {}
+
     if (not force_refresh) and cache_file.exists():
         try:
             payload = json.loads(cache_file.read_text(encoding="utf-8"))
             ts = datetime.fromisoformat(payload.get("cached_at"))
             age_hours = (datetime.now() - ts).total_seconds() / 3600
-            if age_hours <= cache_ttl_hours:
+            cache_ver = str(payload.get("app_version", ""))
+            if age_hours <= cache_ttl_hours and cache_ver == APP_VERSION:
                 payload["from_cache"] = True
                 return payload
         except Exception:
@@ -379,6 +714,11 @@ def analyze_fundamental(code: str, name: str = "", force_refresh: bool = False, 
         "from_cache": False,
         "app_version": APP_VERSION,
     }
+
+    if not name or str(name).strip() == code:
+        tx_name = _fetch_name_from_tencent(code)
+        if tx_name:
+            result["name"] = tx_name
 
     abstract_df = pd.DataFrame()
     indicator_df = pd.DataFrame()
@@ -414,14 +754,14 @@ def analyze_fundamental(code: str, name: str = "", force_refresh: bool = False, 
     revenue_growth = _growth_from_series(revenue_series[:2]) if revenue_series else None
     profit_growth = _growth_from_series(profit_series[:2]) if profit_series else None
 
-    gross_margin = _extract_latest_from_indicator(indicator_df, "销售毛利率")
-    net_margin = _extract_latest_from_indicator(indicator_df, "销售净利率")
-    roe = _extract_latest_from_indicator(indicator_df, "净资产收益率")
-    debt_ratio = _extract_latest_from_indicator(indicator_df, "资产负债率")
-    current_ratio = _extract_latest_from_indicator(indicator_df, "流动比率")
+    gross_margin = _extract_latest_from_indicator_multi(indicator_df, ["销售毛利率", "销售毛利率(%)"])
+    net_margin = _extract_latest_from_indicator_multi(indicator_df, ["销售净利率", "销售净利率(%)"])
+    roe = _extract_latest_from_indicator_multi(indicator_df, ["净资产收益率", "净资产收益率(%)", "加权净资产收益率(%)"])
+    debt_ratio = _extract_latest_from_indicator_multi(indicator_df, ["资产负债率", "资产负债率(%)"])
+    current_ratio = _extract_latest_from_indicator_multi(indicator_df, ["流动比率"])
     receivable_days = _extract_latest_from_indicator(indicator_df, "应收账款周转天数")
-    ocf_per_share = _extract_latest_from_indicator(indicator_df, "每股经营性现金流(元)")
-    retained_eps = _extract_latest_from_indicator(indicator_df, "每股未分配利润(元)")
+    ocf_per_share = _extract_latest_from_indicator_multi(indicator_df, ["每股经营性现金流(元)", "每股经营现金流(元)", "每股经营现金流"])
+    retained_eps = _extract_latest_from_indicator_multi(indicator_df, ["每股未分配利润(元)", "每股未分配利润"])
     volatility_proxy = _extract_latest_from_indicator(indicator_df, "资产负债率")
 
     latest_goodwill = goodwill_series[0] if goodwill_series else None
@@ -429,12 +769,81 @@ def analyze_fundamental(code: str, name: str = "", force_refresh: bool = False, 
     goodwill_ratio = safe_div(latest_goodwill, latest_equity)
     goodwill_ratio_pct = goodwill_ratio * 100 if goodwill_ratio is not None else None
 
-    pe_dynamic = parse_cn_number((profile or {}).get("市盈率(动态)"))
-    pe_static = parse_cn_number((profile or {}).get("市盈率(静)"))
-    pe_ttm = parse_cn_number((profile or {}).get("市盈率(TTM)"))
-    pb = parse_cn_number((profile or {}).get("市净率"))
-    dividend_yield = parse_cn_number((profile or {}).get("股息率"))
-    total_mv = parse_cn_number((profile or {}).get("总市值"))
+    p = profile or {}
+    pe_dynamic = _normalize_pe_value(
+        _pick_profile_number(p, ["市盈率(动态)", "市盈率-动态", "动态市盈率"])
+    )
+    pe_static = _normalize_pe_value(
+        _pick_profile_number(p, ["市盈率(静)", "市盈率-静态", "静态市盈率"])
+    )
+    pe_ttm = _normalize_pe_value(
+        _pick_profile_number(p, ["市盈率(TTM)", "市盈率TTM", "市盈率(滚动)", "滚动市盈率"])
+    )
+    pb = _normalize_pb_value(_pick_profile_number(p, ["市净率", "市净率MRQ"]))
+    dividend_yield = _normalize_dividend_value(_pick_profile_number(p, ["股息率", "股息率(%)"]))
+    total_mv = _pick_profile_number(p, ["总市值", "总市值(元)"])
+
+    # 多源估值兜底：东方财富直连 + 腾讯快照 + 分红详情
+    em_metrics = _fetch_metrics_from_eastmoney_direct(code) if not _is_hk_symbol(code) else {}
+    tx_metrics = _fetch_metrics_from_tencent(code)
+    dy_em = _fetch_dividend_yield_from_em(code) if not _is_hk_symbol(code) else None
+
+    pe_dynamic = _coalesce_number(
+        pe_dynamic,
+        em_metrics.get("pe_dynamic"),
+        tx_metrics.get("pe_dynamic"),
+        _normalize_pe_value(stale_cache.get("pe_dynamic")),
+    )
+    pe_static = _coalesce_number(
+        pe_static,
+        em_metrics.get("pe_static"),
+        _normalize_pe_value(stale_cache.get("pe_static")),
+        pe_ttm,
+        pe_dynamic,
+    )
+    pe_ttm = _coalesce_number(
+        pe_ttm,
+        em_metrics.get("pe_ttm"),
+        tx_metrics.get("pe_ttm"),
+        _normalize_pe_value(stale_cache.get("pe_ttm")),
+        pe_dynamic,
+        pe_static,
+    )
+    pb = _coalesce_number(
+        pb,
+        em_metrics.get("pb"),
+        tx_metrics.get("pb"),
+        _normalize_pb_value(stale_cache.get("pb")),
+    )
+    dividend_yield = _coalesce_number(
+        dividend_yield,
+        dy_em,
+        _normalize_dividend_value(stale_cache.get("dividend_yield")),
+    )
+    total_mv = _coalesce_number(total_mv, stale_cache.get("total_mv"))
+
+    gross_margin = _coalesce_number(gross_margin, stale_cache.get("gross_margin"))
+    net_margin = _coalesce_number(net_margin, stale_cache.get("net_margin"))
+    roe = _coalesce_number(roe, stale_cache.get("roe"))
+    debt_ratio = _coalesce_number(debt_ratio, stale_cache.get("debt_ratio"))
+    current_ratio = _coalesce_number(current_ratio, stale_cache.get("current_ratio"))
+    receivable_days = _coalesce_number(receivable_days, stale_cache.get("receivable_days"))
+    ocf_per_share = _coalesce_number(ocf_per_share, stale_cache.get("ocf_per_share"))
+    retained_eps = _coalesce_number(retained_eps, stale_cache.get("retained_eps"))
+    volatility_proxy = _coalesce_number(volatility_proxy, debt_ratio)
+    ocf_sum_3y = _coalesce_number(ocf_sum_3y, stale_cache.get("ocf_sum_3y"))
+    revenue_growth = _coalesce_number(revenue_growth, stale_cache.get("revenue_growth"))
+    profit_growth = _coalesce_number(profit_growth, stale_cache.get("profit_growth"))
+    goodwill_ratio_pct = _coalesce_number(goodwill_ratio_pct, stale_cache.get("goodwill_ratio_pct"))
+
+    if pe_dynamic is None:
+        data_warnings.append("PE(动) 暂不可用")
+    if pe_static is None:
+        data_warnings.append("PE(静) 暂不可用")
+    if pe_ttm is None:
+        data_warnings.append("PE(滚) 暂不可用")
+    if dividend_yield is None:
+        data_warnings.append("股息率 暂不可用")
 
     dimensions = [
         _score_business_quality(gross_margin, net_margin),
@@ -483,6 +892,9 @@ def analyze_fundamental(code: str, name: str = "", force_refresh: bool = False, 
             "current_ratio": current_ratio,
             "receivable_days": receivable_days,
             "ocf_sum_3y": ocf_sum_3y,
+            "ocf_per_share": ocf_per_share,
+            "retained_eps": retained_eps,
+            "goodwill_ratio_pct": goodwill_ratio_pct,
             "revenue_growth": revenue_growth,
             "profit_growth": profit_growth,
             "coverage_ratio": coverage_ratio,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import os
 import re
@@ -11,6 +12,7 @@ import requests
 import streamlit as st
 from openai import APIConnectionError, APITimeoutError, OpenAI
 from requests.adapters import HTTPAdapter
+from streamlit.components.v1 import html
 from urllib3.util.retry import Retry
 
 from fundamental_engine import (
@@ -20,7 +22,7 @@ from fundamental_engine import (
     delete_watch_item,
     format_pct,
     load_watchlist,
-    upsert_watch_item,
+    upsert_watch_item_by_query,
 )
 
 
@@ -43,7 +45,6 @@ st.markdown(
   --bg-main: #edf3fa;
   --text-strong: #15253f;
   --text-normal: #1f334f;
-  --text-muted: #536985;
 }
 .stApp {
   background: linear-gradient(180deg, var(--bg-main) 0%, #e8eff8 100%);
@@ -78,26 +79,63 @@ st.markdown(
   color: #0b2346;
 }
 h1, h2, h3, h4 { color: var(--text-strong) !important; }
-div[data-testid="stMetricValue"] { font-size: 1.7rem; }
-.fnd-card {
+[data-testid="stMetricLabel"] div {
+  color: #496283 !important;
+  font-weight: 700 !important;
+}
+[data-testid="stMetricValue"] div {
+  color: #15253f !important;
+  font-weight: 800 !important;
+}
+.score-panel {
   border: 1px solid rgba(80,120,180,.25);
   border-radius: 14px;
   padding: 14px 16px;
-  min-height: 132px;
+  background: rgba(240,245,255,0.75);
+  min-height: 112px;
+}
+.score-panel .label {
+  color: #5a7090;
+  font-size: 1.02rem;
+  font-weight: 700;
+}
+.score-panel .value {
+  color: #15253f;
+  font-size: 2.3rem;
+  font-weight: 800;
+  line-height: 1.25;
+  margin-top: 8px;
+}
+.fnd-card {
+  border: 1px solid rgba(80,120,180,.25);
+  border-radius: 14px;
+  padding: 12px 14px;
+  min-height: 208px;
   background: rgba(240,245,255,0.55);
+  display: flex;
+  flex-direction: column;
 }
 .fnd-card h4 {
-  margin: 0 0 8px 0;
+  margin: 0 0 6px 0;
   font-size: 1.45rem;
 }
 .fnd-card .score {
-  font-size: 1.9rem;
+  font-size: 1.75rem;
   font-weight: 800;
-  margin: 4px 0 8px 0;
+  margin: 2px 0 6px 0;
 }
 .fnd-card .desc {
   color: #5c6e89;
   font-size: 1.0rem;
+  line-height: 1.42;
+  min-height: 4.26em;
+}
+.fnd-card .desc .line {
+  display: block;
+  min-height: 1.42em;
+}
+.fnd-card .desc .line-empty {
+  visibility: hidden;
 }
 </style>
 """,
@@ -145,8 +183,7 @@ def _resolve_deepseek_api_key() -> str:
     if not raw:
         raw = os.getenv("DEEPSEEK_API_KEY", "")
     key = raw.strip().split()[0] if raw.strip() else ""
-    key = key.strip("“”\"'`")
-    return key
+    return key.strip("“”\"'`")
 
 
 def _validate_api_key(key: str) -> None:
@@ -161,14 +198,14 @@ def _validate_api_key(key: str) -> None:
 def _call_deepseek_analysis(json_text: str) -> tuple[str, dict, float, float]:
     api_key = _resolve_deepseek_api_key()
     _validate_api_key(api_key)
-
     client = OpenAI(api_key=api_key, base_url="https://api.deepseek.com/v1", timeout=60.0, max_retries=0)
+
     messages = [
         {"role": "system", "content": DEEPSEEK_PROMPT},
         {"role": "user", "content": json_text},
     ]
-
     t0 = pytime.time()
+
     response = None
     last_exc = None
     for attempt in range(1, 4):
@@ -226,7 +263,6 @@ def _call_deepseek_analysis(json_text: str) -> tuple[str, dict, float, float]:
             raw = r.json()
         except requests.exceptions.RequestException as req_exc:
             raise RuntimeError(f"DeepSeek 连接失败：{req_exc}; SDK异常: {last_exc}") from req_exc
-
         report = (((raw.get("choices") or [{}])[0].get("message") or {}).get("content") or "").strip()
         usage_raw = raw.get("usage") or {}
         prompt_tokens = int(usage_raw.get("prompt_tokens") or 0)
@@ -235,11 +271,11 @@ def _call_deepseek_analysis(json_text: str) -> tuple[str, dict, float, float]:
         cache_miss_tokens = int(usage_raw.get("prompt_cache_miss_tokens") or 0)
     else:
         report = (response.choices[0].message.content or "").strip()
-        usage_obj = response.usage
-        prompt_tokens = int(getattr(usage_obj, "prompt_tokens", 0) or 0)
-        completion_tokens = int(getattr(usage_obj, "completion_tokens", 0) or 0)
-        cache_hit_tokens = int(getattr(usage_obj, "prompt_cache_hit_tokens", 0) or 0)
-        cache_miss_tokens = int(getattr(usage_obj, "prompt_cache_miss_tokens", 0) or 0)
+        usage = response.usage
+        prompt_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
+        completion_tokens = int(getattr(usage, "completion_tokens", 0) or 0)
+        cache_hit_tokens = int(getattr(usage, "prompt_cache_hit_tokens", 0) or 0)
+        cache_miss_tokens = int(getattr(usage, "prompt_cache_miss_tokens", 0) or 0)
 
     if not report:
         raise RuntimeError("DeepSeek 未返回有效分析文本。")
@@ -250,14 +286,48 @@ def _call_deepseek_analysis(json_text: str) -> tuple[str, dict, float, float]:
         + cache_miss_tokens / 1_000_000 * 0.28
         + completion_tokens / 1_000_000 * 0.42
     )
-    usage = {
+    usage_dict = {
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,
         "total_tokens": prompt_tokens + completion_tokens,
         "prompt_cache_hit_tokens": cache_hit_tokens,
         "prompt_cache_miss_tokens": cache_miss_tokens,
     }
-    return report, usage, cost, elapsed
+    return report, usage_dict, cost, elapsed
+
+
+def _clean_text_no_na(text: str) -> str:
+    out = str(text or "")
+    out = re.sub(r"\bN/?A\b", "0.00", out, flags=re.IGNORECASE)
+    out = re.sub(r"\bnan\b", "0.00", out, flags=re.IGNORECASE)
+    return out
+
+
+def _split_sentences(text: str) -> List[str]:
+    raw = _clean_text_no_na(text).replace("\n", "")
+    parts = [x.strip() for x in re.split(r"(?<=[。！？；])", raw) if x.strip()]
+    return parts if parts else ([raw] if raw else [])
+
+
+def _format_card_desc_lines(text: str, max_lines: int = 3) -> str:
+    cleaned = _clean_text_no_na(text).replace("／", "/")
+    parts: List[str] = []
+    for piece in cleaned.split("\n"):
+        p = piece.strip()
+        if not p:
+            continue
+        sub = [x.strip() for x in p.split("/") if x.strip()]
+        parts.extend(sub if sub else [p])
+    parts = parts[:max_lines]
+    while len(parts) < max_lines:
+        parts.append("")
+    html_lines = []
+    for p in parts:
+        if p:
+            html_lines.append(f"<span class='line'>{p}</span>")
+        else:
+            html_lines.append("<span class='line line-empty'>占位</span>")
+    return "".join(html_lines)
 
 
 def _init_state() -> None:
@@ -269,6 +339,19 @@ def _init_state() -> None:
         st.session_state["fnd_selected_code"] = st.session_state["fnd_rows"][0]["code"] if st.session_state["fnd_rows"] else ""
     if "fnd_deepseek_reports" not in st.session_state:
         st.session_state["fnd_deepseek_reports"] = {}
+
+    rows = st.session_state.get("fnd_rows", [])
+    if rows:
+        need_refresh = False
+        for row in rows:
+            if str(row.get("app_version", "")) != APP_VERSION:
+                need_refresh = True
+                break
+            if "N/A" in json.dumps(row, ensure_ascii=False) or "nan" in json.dumps(row, ensure_ascii=False).lower():
+                need_refresh = True
+                break
+        if need_refresh:
+            st.session_state["fnd_rows"] = analyze_watchlist(st.session_state["fnd_watchlist"], force_refresh=True)
 
     if "_fnd_prefs_loaded" not in st.session_state:
         prefs = _load_local_prefs()
@@ -297,24 +380,39 @@ def _selected_row(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 def _render_overview(rows: List[Dict[str, Any]]) -> None:
     st.subheader("股票列表")
-    header = st.columns([1, 2, 1, 1, 1, 1], gap="small")
-    header[0].markdown("**代码**")
-    header[1].markdown("**名称**")
-    header[2].markdown("**评分**")
-    header[3].markdown("**类型**")
-    header[4].markdown("**股息率**")
-    header[5].markdown("**打开**")
+    df = build_overview_table(rows).copy()
+    st.dataframe(df, use_container_width=True, hide_index=True)
 
-    for row in rows:
-        cols = st.columns([1, 2, 1, 1, 1, 1], gap="small")
-        cols[0].write(row.get("code", ""))
-        cols[1].write(row.get("name", ""))
-        cols[2].write(row.get("total_score", "N/A"))
-        cols[3].write(row.get("type", "观察"))
-        cols[4].write(format_pct(row.get("dividend_yield")))
-        if cols[5].button("打开", key=f"fnd_open_{row.get('code')}"):
-            st.session_state["fnd_selected_code"] = row.get("code", "")
-            st.rerun()
+    options = [r.get("code", "") for r in rows]
+    current = st.session_state.get("fnd_selected_code", options[0] if options else "")
+    index = options.index(current) if current in options else 0
+    chosen = st.selectbox(
+        "打开评分板",
+        options=options,
+        index=index,
+        format_func=lambda c: next((f"{x.get('name','')} ({x.get('code','')})" for x in rows if x.get("code") == c), c),
+    )
+    if chosen != current:
+        st.session_state["fnd_selected_code"] = chosen
+        st.rerun()
+
+
+def _render_score_panels(row: Dict[str, Any]) -> None:
+    score = float(row.get("total_score", 0.0) or 0.0)
+    conclusion = _clean_text_no_na(str(row.get("conclusion", "观察")))
+    coverage = format_pct(float((row.get("coverage_ratio") or 0.0) * 100.0))
+    cols = st.columns(3, gap="small")
+    items = [("总分", f"{score:.1f}"), ("结论", conclusion), ("覆盖率", coverage)]
+    for col, (label, value) in zip(cols, items):
+        col.markdown(
+            f"""
+<div class="score-panel">
+  <div class="label">{label}</div>
+  <div class="value">{value}</div>
+</div>
+""",
+            unsafe_allow_html=True,
+        )
 
 
 def _render_dimension_cards(row: Dict[str, Any]) -> None:
@@ -326,13 +424,16 @@ def _render_dimension_cards(row: Dict[str, Any]) -> None:
     for i in range(0, len(dimensions), 4):
         cols = st.columns(4, gap="small")
         for j, card in enumerate(dimensions[i : i + 4]):
+            title = _clean_text_no_na(card.get("title", ""))
+            score = _clean_text_no_na(f"{card.get('score', 0)} / {card.get('max_score', 5)}")
+            desc = _format_card_desc_lines(str(card.get("comment", "")))
             with cols[j]:
                 st.markdown(
                     f"""
 <div class="fnd-card">
-  <h4>{card.get("title", "")}</h4>
-  <div class="score">{card.get("score", "N/A")} / {card.get("max_score", 5)}</div>
-  <div class="desc">{card.get("comment", "")}</div>
+  <h4>{title}</h4>
+  <div class="score">{score}</div>
+  <div class="desc">{desc}</div>
 </div>
 """,
                     unsafe_allow_html=True,
@@ -342,72 +443,102 @@ def _render_dimension_cards(row: Dict[str, Any]) -> None:
 def _render_summary(row: Dict[str, Any]) -> None:
     code = row.get("code", "")
     st.subheader("总结性文本")
-    st.info(row.get("summary_text", "暂无总结。"))
+    lines = _split_sentences(str(row.get("summary_text", "")))
+    if lines:
+        st.markdown(
+            "<div style='line-height:1.8;color:#243a58;font-size:1.05rem;'>"
+            + "<br>".join(lines)
+            + "</div>",
+            unsafe_allow_html=True,
+        )
+    else:
+        st.info("暂无总结。")
+
     json_payload = json.dumps(row, ensure_ascii=False, indent=2)
-    st.code(json_payload, language="json")
+    json_b64 = base64.b64encode(json_payload.encode("utf-8")).decode("ascii")
 
     btn1, btn2 = st.columns([1, 1], gap="small")
-    if btn1.button("复制JSON", key=f"fnd_copy_json_{code}", use_container_width=True):
-        st.toast("已生成 JSON，复制上方代码块即可。")
+    with btn1:
+        html(
+            f"""
+            <div style="margin-top:0.1rem;">
+              <button id="fnd-copy-json-{code}"
+                style="width:100%;height:42px;border-radius:10px;border:1px solid #a8c2e8;background:#dbeafe;color:#0f2a52;font-size:1rem;font-weight:700;cursor:pointer;">
+                复制JSON
+              </button>
+              <div id="fnd-copy-msg-{code}" style="margin-top:0.35rem;color:#2e4b6e;font-size:0.86rem;"></div>
+            </div>
+            <script>
+              const btn = document.getElementById("fnd-copy-json-{code}");
+              const msg = document.getElementById("fnd-copy-msg-{code}");
+              const text = decodeURIComponent(escape(window.atob("{json_b64}")));
+              btn.onclick = async function () {{
+                try {{
+                  await navigator.clipboard.writeText(text);
+                  msg.textContent = "已复制";
+                }} catch(e) {{
+                  msg.textContent = "复制失败，请重试";
+                }}
+              }};
+            </script>
+            """,
+            height=88,
+        )
 
-    if btn2.button("DeepSeek分析", key=f"fnd_deepseek_{code}", use_container_width=True):
-        progress = st.progress(0, text="正在准备分析任务...")
-        pytime.sleep(0.08)
-        progress.progress(22, text="正在压缩数据...")
-        pytime.sleep(0.08)
-        progress.progress(44, text="正在连接 DeepSeek...")
-        try:
-            report, usage, cost, elapsed = _call_deepseek_analysis(json_payload)
-            progress.progress(82, text="正在生成报告...")
+    with btn2:
+        if st.button("DeepSeek分析", key=f"fnd_deepseek_{code}", use_container_width=True):
+            progress = st.progress(0, text="正在准备分析任务...")
             pytime.sleep(0.08)
-            st.session_state["fnd_deepseek_reports"][code] = {
-                "report": report,
-                "usage": usage,
-                "cost": cost,
-                "elapsed": elapsed,
-                "at": datetime.now().strftime("%m-%d %H:%M:%S"),
-            }
-            progress.progress(100, text="分析完成")
-            pytime.sleep(0.1)
-            progress.empty()
-            st.success("DeepSeek 分析完成，结果已显示在下方。")
-        except Exception as exc:
-            progress.empty()
-            st.error(f"DeepSeek 分析失败: {exc}")
+            progress.progress(25, text="正在压缩数据...")
+            pytime.sleep(0.08)
+            progress.progress(50, text="正在连接 DeepSeek...")
+            try:
+                report, usage, cost, elapsed = _call_deepseek_analysis(json_payload)
+                progress.progress(85, text="正在生成报告...")
+                pytime.sleep(0.08)
+                st.session_state["fnd_deepseek_reports"][code] = {
+                    "report": _clean_text_no_na(report),
+                    "usage": usage,
+                    "cost": cost,
+                    "elapsed": elapsed,
+                    "at": datetime.now().strftime("%m-%d %H:%M:%S"),
+                }
+                progress.progress(100, text="分析完成")
+                pytime.sleep(0.1)
+                progress.empty()
+            except Exception as exc:
+                progress.empty()
+                st.error(f"DeepSeek 分析失败: {exc}")
 
-    deep_result = st.session_state.get("fnd_deepseek_reports", {}).get(code)
-    if deep_result:
+    deep = st.session_state.get("fnd_deepseek_reports", {}).get(code)
+    if deep:
         st.divider()
         st.subheader("DeepSeek分析结果")
         st.caption(
-            f"分析时间: {deep_result.get('at','')} ｜耗时: {deep_result.get('elapsed', 0):.2f}s ｜"
-            f"Tokens: {deep_result.get('usage', {}).get('total_tokens', 0)} ｜"
-            f"预估成本: {deep_result.get('cost', 0):.4f} 元"
+            f"分析时间: {deep.get('at','')} ｜耗时: {deep.get('elapsed',0):.2f}s ｜"
+            f"Tokens: {deep.get('usage',{}).get('total_tokens',0)} ｜"
+            f"预估成本: {deep.get('cost',0):.4f} 元"
         )
-        st.text_area(
-            "分析文本（可复制）",
-            value=deep_result.get("report", ""),
-            height=360,
-            key=f"fnd_report_text_{code}",
-        )
+        st.text_area("分析文本（可复制）", value=deep.get("report", ""), height=360, key=f"fnd_report_{code}")
 
 
 def _render_page() -> None:
     _init_state()
-
     st.title("基本面")
     st.caption(f"版本号: {APP_VERSION}")
 
     with st.sidebar:
         st.header("股票池管理")
-        input_code = st.text_input("股票代码", placeholder="例如 600007")
-        input_name = st.text_input("股票名称(可选)", placeholder="可留空")
+        input_query = st.text_input("输入代码或名称", placeholder="例如 600007 / 中国国贸 / 00700")
         item_type = st.segmented_control("类型", options=["持仓", "观察"], default="观察")
         c1, c2 = st.columns(2, gap="small")
         if c1.button("加入", use_container_width=True):
-            st.session_state["fnd_watchlist"] = upsert_watch_item(input_code, input_name, item_type or "观察")
-            _refresh_rows(force_refresh=False)
-            st.rerun()
+            try:
+                st.session_state["fnd_watchlist"] = upsert_watch_item_by_query(input_query, item_type or "观察")
+                _refresh_rows(force_refresh=True)
+                st.rerun()
+            except Exception as exc:
+                st.error(str(exc))
         if c2.button("刷新全部", use_container_width=True):
             _refresh_rows(force_refresh=True)
             st.rerun()
@@ -416,20 +547,13 @@ def _render_page() -> None:
             remove_code = st.selectbox(
                 "删除股票",
                 options=[x["code"] for x in st.session_state["fnd_watchlist"]],
-                format_func=lambda c: next(
-                    (
-                        f"{x['name']} ({x['code']})"
-                        for x in st.session_state["fnd_watchlist"]
-                        if x["code"] == c
-                    ),
-                    c,
-                ),
+                format_func=lambda c: next((f"{x['name']} ({x['code']})" for x in st.session_state["fnd_watchlist"] if x["code"] == c), c),
             )
             if st.button("删除", use_container_width=True):
                 st.session_state["fnd_watchlist"] = delete_watch_item(remove_code)
                 if st.session_state.get("fnd_selected_code") == remove_code:
                     st.session_state["fnd_selected_code"] = ""
-                _refresh_rows(force_refresh=False)
+                _refresh_rows(force_refresh=True)
                 st.rerun()
 
         st.markdown("---")
@@ -450,7 +574,7 @@ def _render_page() -> None:
             _save_local_prefs(current["deepseek_user"], current["deepseek_api_key"])
             st.session_state["_fnd_last_saved_prefs"] = current
 
-    rows: List[Dict[str, Any]] = st.session_state["fnd_rows"]
+    rows: List[Dict[str, Any]] = st.session_state.get("fnd_rows", [])
     if not rows:
         st.warning("当前股票池为空，请先添加股票代码。")
         return
@@ -460,22 +584,15 @@ def _render_page() -> None:
 
     row = _selected_row(rows)
     st.subheader(f"基本面评分板：{row.get('name', '')}（{row.get('code', '')}）")
-    m1, m2, m3 = st.columns(3, gap="small")
-    m1.metric("总分", row.get("total_score", "N/A"))
-    m2.metric("结论", row.get("conclusion", "N/A"))
-    m3.metric("覆盖率", format_pct((row.get("coverage_ratio") or 0) * 100))
+    _render_score_panels(row)
 
     if row.get("data_warnings"):
-        st.warning("；".join(row.get("data_warnings", [])))
+        st.warning("；".join(_clean_text_no_na(str(x)) for x in row.get("data_warnings", [])))
 
     _render_dimension_cards(row)
     st.divider()
     _render_summary(row)
 
-    with st.expander("原始表格预览"):
-        st.dataframe(build_overview_table(rows), use_container_width=True, hide_index=True)
-
 
 if __name__ == "__main__":
     _render_page()
-
