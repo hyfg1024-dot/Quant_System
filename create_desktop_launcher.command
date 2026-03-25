@@ -25,6 +25,7 @@ exec python3 -m streamlit run app.py --server.headless false
 EOF
 
 chmod +x "$LAUNCHER_PATH"
+xattr -d com.apple.quarantine "$LAUNCHER_PATH" 2>/dev/null || true
 
 echo "已生成桌面一键启动按钮：$LAUNCHER_PATH"
 echo "请双击桌面的“启动Quant_System.command”启动程序。"
