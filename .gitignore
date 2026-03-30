@@ -10,3 +10,7 @@
 **/data/analysis_jobs/
 **/apps/fundamental/data/watchlist.json
 **/apps/fundamental/data/cache/
+**/apps/filter/data/filter_market.db
+**/apps/filter/data/cache/
+**/apps/filter/data/filter_templates.json
+**/apps/filter/data/manual_flags.json

@@ -1,4 +1,5 @@
 import base64
+import copy
 import hashlib
 import json
 import math
@@ -16,8 +17,31 @@ import altair as alt
 import pandas as pd
 import requests
 import streamlit as st
-from openai import APIConnectionError, APIStatusError, APITimeoutError, AuthenticationError, OpenAI, RateLimitError
 from streamlit.components.v1 import html
+
+OPENAI_AVAILABLE = True
+OPENAI_IMPORT_ERROR = None
+try:
+    from openai import APIConnectionError, APIStatusError, APITimeoutError, AuthenticationError, OpenAI, RateLimitError
+except Exception as _exc:  # pragma: no cover - 依赖缺失时兜底
+    OPENAI_AVAILABLE = False
+    OPENAI_IMPORT_ERROR = _exc
+    OpenAI = None  # type: ignore[assignment]
+
+    class APIConnectionError(Exception):
+        pass
+
+    class APIStatusError(Exception):
+        pass
+
+    class APITimeoutError(Exception):
+        pass
+
+    class AuthenticationError(Exception):
+        pass
+
+    class RateLimitError(Exception):
+        pass
 
 from fast_engine import fetch_fast_panel
 from slow_engine import (
@@ -31,6 +55,9 @@ from slow_engine import (
 )
 
 CURRENT_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = CURRENT_DIR.parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 FUNDAMENTAL_DIR = CURRENT_DIR.parent / "fundamental"
 if str(FUNDAMENTAL_DIR) not in sys.path:
     sys.path.insert(0, str(FUNDAMENTAL_DIR))
@@ -42,8 +69,28 @@ from fundamental_engine import (
     format_pct as format_fundamental_pct,
 )
 
+FILTER_DIR = CURRENT_DIR.parent / "filter"
+if str(FILTER_DIR) not in sys.path:
+    sys.path.insert(0, str(FILTER_DIR))
+
+from filter_engine import (
+    APP_VERSION as FILTER_APP_VERSION,
+    DISPLAY_COLUMNS as FILTER_DISPLAY_COLUMNS,
+    apply_filters as filter_apply_filters,
+    build_ai_quick_config as filter_build_ai_quick_config,
+    default_filter_config as filter_default_filter_config,
+    export_results_excel as filter_export_results_excel,
+    get_snapshot_meta as filter_get_snapshot_meta,
+    get_template_config as filter_get_template_config,
+    load_snapshot as filter_load_snapshot,
+    load_templates as filter_load_templates,
+    refresh_market_snapshot as filter_refresh_market_snapshot,
+    save_template as filter_save_template,
+)
+from shared.ui_shell import render_app_shell, render_section_intro, render_status_row
+
 st.set_page_config(page_title="Quant Dashboard", page_icon="📊", layout="wide")
-APP_VERSION = "QDB-20260323-DSWIN-03"
+APP_VERSION = "QDB-20260327-FLT5Y-01"
 LOCAL_PREFS_PATH = "data/local_user_prefs.json"
 ANALYSIS_CACHE_PATH = "data/deepseek_analysis_cache.json"
 ANALYSIS_JOB_DIR = "data/analysis_jobs"
@@ -186,107 +233,30 @@ def _dict_delta(curr, prev):
 st.markdown(
     """
     <style>
-    :root {
-        --bg-main: #edf3fa;
-        --text-strong: #15253f;
-        --text-normal: #1f334f;
-        --text-muted: #536985;
-    }
-    .stApp {
-        background: linear-gradient(180deg, var(--bg-main) 0%, #e8eff8 100%);
-        color: var(--text-normal);
-    }
-    [data-testid="stSidebar"] {
-        background: #1e2432;
-        color: #e8eef8;
-    }
-    [data-testid="stSidebar"] label,
-    [data-testid="stSidebar"] h1,
-    [data-testid="stSidebar"] h2,
-    [data-testid="stSidebar"] h3,
-    [data-testid="stSidebar"] p,
-    [data-testid="stSidebar"] span {
-        color: #e8eef8 !important;
-    }
-    [data-testid="stSidebar"] .stButton > button:not([kind="tertiary"]) {
-        background: #dbeafe !important;
-        color: #0f2a52 !important;
-        border: 1px solid #a8c2e8 !important;
-    }
-    [data-testid="stSidebar"] .stButton > button:not([kind="tertiary"]) span,
-    [data-testid="stSidebar"] .stButton > button:not([kind="tertiary"]) p,
-    [data-testid="stSidebar"] .stButton > button:not([kind="tertiary"]) div {
-        color: #0f2a52 !important;
-        -webkit-text-fill-color: #0f2a52 !important;
-    }
-    [data-testid="stSidebar"] .stButton > button:not([kind="tertiary"]):hover {
-        background: #c7ddfb !important;
-        color: #0b2346 !important;
-    }
-    h1, h2, h3, h4 { color: var(--text-strong) !important; }
-    .stButton > button:not([kind="tertiary"]) {
-        background: #dbeafe;
-        color: #0f2a52;
-        border: 1px solid #a8c2e8;
-        font-weight: 600;
-    }
-    .stButton > button:not([kind="tertiary"]):hover {
-        background: #c7ddfb;
-        color: #0b2346;
-    }
-    [data-testid="stMetricLabel"] div { color: #5b6f89 !important; }
-    [data-testid="stMetricValue"] div { color: #15253f !important; }
-    [data-testid="stSelectbox"] div[data-baseweb="select"] > div {
-        background: #f7fbff !important;
-        border: 1px solid #b8cdea !important;
-        color: #0f2a52 !important;
-    }
-    [data-testid="stToggle"] label p,
-    [data-testid="stSelectbox"] label p {
-        color: #1f334f !important;
-        font-weight: 700 !important;
-    }
-    [data-testid="stCheckbox"] label p,
-    [data-testid="stCheckbox"] label span {
-        color: #000000 !important;
-        -webkit-text-fill-color: #000000 !important;
-        opacity: 1 !important;
-        font-weight: 700 !important;
-    }
-    div[data-testid="stToggle"] label,
-    div[data-testid="stToggle"] label span,
-    div[data-testid="stToggle"] label p,
-    div[data-testid="stToggle"] label [data-testid="stMarkdownContainer"],
-    div[data-testid="stToggle"] label [data-testid="stMarkdownContainer"] p {
-        color: #000000 !important;
-        -webkit-text-fill-color: #000000 !important;
-        opacity: 1 !important;
-        font-weight: 700 !important;
-    }
     .engine-divider {
         margin: 2.4rem 0 2rem 0;
-        border-top: 4px solid #b8c9de;
+        border-top: 4px solid rgba(255, 255, 255, 0.14);
         position: relative;
     }
     .engine-divider span {
         position: relative;
         top: -1.45rem;
-        background: #edf3fa;
+        background: rgba(13, 24, 38, 0.96);
         padding: 0 0.8rem;
-        color: #15253f;
+        color: rgba(255, 248, 241, 0.98);
         font-weight: 800;
         font-size: 2.05rem;
         line-height: 1.1;
     }
     .section-title {
-        color: #15253f;
+        color: rgba(255, 248, 241, 0.98);
         font-size: 2.05rem;
         font-weight: 800;
         line-height: 1.1;
         margin: 0.9rem 0 0.8rem 0;
     }
     .fast-head-title {
-        color: #324760;
+        color: rgba(255, 248, 241, 0.98);
         font-size: 2rem;
         font-weight: 700;
         letter-spacing: 0.2px;
@@ -310,8 +280,8 @@ st.markdown(
     .a-up { color: #d14343; }
     .a-down { color: #1fab63; }
     .fast-card {
-        background: #f5f7fb;
-        border: 1px solid #d9e2ef;
+        background: linear-gradient(180deg, rgba(255,255,255,0.09), rgba(255,255,255,0.03));
+        border: 1px solid rgba(255,255,255,0.10);
         border-radius: 10px;
         padding: 0.62rem 0.78rem;
         height: 156px;
@@ -321,7 +291,7 @@ st.markdown(
         justify-content: flex-start;
     }
     .fast-card .t {
-        color: #5f738f;
+        color: rgba(232, 223, 210, 0.88);
         font-size: 0.94rem;
         font-weight: 700;
     }
@@ -341,11 +311,11 @@ st.markdown(
         font-size: 0.82rem;
     }
     .fast-card .k {
-        color: #7689a2;
+        color: rgba(232, 223, 210, 0.88);
         font-weight: 600;
     }
     .fast-card .vv {
-        color: #1f2d42;
+        color: rgba(255, 248, 241, 0.98);
         font-weight: 800;
         text-align: right;
         font-variant-numeric: tabular-nums;
@@ -354,18 +324,18 @@ st.markdown(
         overflow-wrap: anywhere;
     }
     .fast-card .d {
-        color: #8a98ac;
+        color: rgba(232, 223, 210, 0.88);
         font-size: 0.78rem;
         margin-top: 0.25rem;
     }
     .ob-title {
         font-size: 1.95rem;
-        color: #23364f;
+        color: rgba(255, 248, 241, 0.98);
         font-weight: 800;
     }
     .panel-title {
         font-size: 2.7rem;
-        color: #1e3450;
+        color: rgba(255, 248, 241, 0.98);
         font-weight: 800;
         line-height: 1.1;
         margin: 0 0 0.5rem 0;
@@ -376,7 +346,7 @@ st.markdown(
         font-size: 1.15rem;
         line-height: 1.15;
         font-weight: 700;
-        color: #5f738f;
+        color: rgba(232, 223, 210, 0.88);
         margin-top: 0.12rem;
     }
     .fast-panels-gap {
@@ -384,7 +354,7 @@ st.markdown(
     }
     .subsection-divider {
         margin: 0.9rem 0 1.1rem 0;
-        border-top: 3px solid #c4d3e6;
+        border-top: 3px solid rgba(255, 255, 255, 0.14);
     }
     .ob-block { margin-top: 0.3rem; }
     .ob-row {
@@ -407,7 +377,7 @@ st.markdown(
     }
     .ob-bar-wrap {
         height: 24px;
-        background: rgba(207, 221, 236, 0.38);
+        background: rgba(255, 255, 255, 0.08);
         border-radius: 4px;
         position: relative;
         overflow: hidden;
@@ -420,15 +390,15 @@ st.markdown(
     .ob-bar.buy { background: rgba(231, 98, 98, 0.28); }
     .ob-vol {
         text-align: right;
-        color: #2f4059;
+        color: rgba(255, 248, 241, 0.98);
         font-weight: 700;
         font-size: 1rem;
         letter-spacing: 0.2px;
     }
-    .ob-sell { color: #2f9f5d; }
-    .ob-buy { color: #d84f4f; }
+    .ob-sell { color: #8fe3c3; }
+    .ob-buy { color: #ff9f8e; }
     .ob-sep {
-        border-top: 1px solid #d7e0ec;
+        border-top: 1px solid rgba(255, 255, 255, 0.12);
         margin: 0.5rem 0;
     }
     .stock-open-wrap div.stButton > button {
@@ -463,7 +433,7 @@ st.markdown(
         background: transparent !important;
         background-color: transparent !important;
         background-image: none !important;
-        color: #5d708a !important;
+        color: rgba(232, 223, 210, 0.78) !important;
         font-size: 1.05rem !important;
         padding: 0 !important;
         box-shadow: none !important;
@@ -474,18 +444,18 @@ st.markdown(
         background: transparent !important;
         background-color: transparent !important;
         background-image: none !important;
-        color: #1f334f !important;
+        color: rgba(255, 248, 241, 0.98) !important;
         border: none !important;
         box-shadow: none !important;
     }
     .watch-split-divider {
         min-height: 0;
-        border-left: 2px solid #c7d3e3;
+        border-left: 2px solid rgba(255, 255, 255, 0.14);
         margin: 0.2rem auto 0 auto;
         width: 1px;
     }
     .group-title {
-        color: #15253f;
+        color: rgba(255, 248, 241, 0.98);
         font-size: 1.6rem;
         font-weight: 800;
         line-height: 1.12;
@@ -509,44 +479,46 @@ st.markdown(
     .rsi-switch-month .stButton > button { background: #fef3c7 !important; color: #92400e !important; border: 1px solid #fcd34d !important; }
     .rsi-switch-intra .stButton > button { background: #fee2e2 !important; color: #991b1b !important; border: 1px solid #fca5a5 !important; }
     .score-panel {
-        border: 1px solid rgba(80,120,180,.25);
+        border: 1px solid rgba(255,255,255,0.10);
         border-radius: 14px;
         padding: 14px 16px;
-        background: rgba(240,245,255,0.75);
+        background: linear-gradient(180deg, rgba(255,255,255,0.09), rgba(255,255,255,0.03));
         min-height: 112px;
     }
     .score-panel .label {
-        color: #5a7090;
+        color: rgba(232, 223, 210, 0.88);
         font-size: 1.02rem;
         font-weight: 700;
     }
     .score-panel .value {
-        color: #15253f;
+        color: rgba(255, 248, 241, 0.98);
         font-size: 2.3rem;
         font-weight: 800;
         line-height: 1.25;
         margin-top: 8px;
     }
     .fnd-card {
-        border: 1px solid rgba(80,120,180,.25);
+        border: 1px solid rgba(255,255,255,0.10);
         border-radius: 14px;
         padding: 12px 14px;
         min-height: 208px;
-        background: rgba(240,245,255,0.55);
+        background: linear-gradient(180deg, rgba(255,255,255,0.09), rgba(255,255,255,0.03));
         display: flex;
         flex-direction: column;
     }
     .fnd-card h4 {
         margin: 0 0 6px 0;
         font-size: 1.45rem;
+        color: rgba(255, 248, 241, 0.98);
     }
     .fnd-card .score {
         font-size: 1.75rem;
         font-weight: 800;
         margin: 2px 0 6px 0;
+        color: rgba(255, 248, 241, 0.98);
     }
     .fnd-card .desc {
-        color: #5c6e89;
+        color: rgba(232, 223, 210, 0.88);
         font-size: 1.0rem;
         line-height: 1.42;
         min-height: 4.26em;
@@ -567,6 +539,10 @@ init_db()
 
 if "active_page" not in st.session_state:
     st.session_state["active_page"] = "trading"
+if "flt_cfg" not in st.session_state:
+    st.session_state["flt_cfg"] = filter_default_filter_config()
+if "flt_result" not in st.session_state:
+    st.session_state["flt_result"] = None
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("股票池管理")
@@ -645,8 +621,50 @@ if st.sidebar.button("基本面", use_container_width=True, type="primary" if st
     st.session_state["active_page"] = "fundamental"
 if st.sidebar.button("交易面", use_container_width=True, type="primary" if st.session_state["active_page"] == "trading" else "secondary"):
     st.session_state["active_page"] = "trading"
+if st.sidebar.button("大过滤器", use_container_width=True, type="primary" if st.session_state["active_page"] == "filter" else "secondary"):
+    st.session_state["active_page"] = "filter"
 
-st.title("基本面" if st.session_state.get("active_page") == "fundamental" else "股票观察面板")
+_active_page = st.session_state.get("active_page", "trading")
+_group_map = get_stock_group_map()
+_holding_count = sum(1 for code, _name in pool_rows_for_sidebar if _group_map.get(code) == "holding")
+_watch_count = sum(1 for code, _name in pool_rows_for_sidebar if _group_map.get(code) != "holding")
+render_app_shell(
+    _active_page,
+    version={
+        "fundamental": FUND_APP_VERSION,
+        "trading": APP_VERSION,
+        "filter": FILTER_APP_VERSION,
+    }.get(_active_page, APP_VERSION),
+    badges={
+        "fundamental": ("八维评分", "观察名单", "结构化结论"),
+        "trading": ("实时盘口", "分时结构", "DeepSeek 分析"),
+        "filter": ("两段筛选", "快照更新", "结果导出"),
+    }.get(_active_page, ("实时盘口", "分时结构", "DeepSeek 分析")),
+    metrics={
+        "fundamental": (
+            ("当前关注", f"{len(pool_rows_for_sidebar)} 只"),
+            ("研究视角", "评分 + 文本 + AI"),
+            ("池子结构", f"持仓 {_holding_count} / 观察 {_watch_count}"),
+        ),
+        "trading": (
+            ("当前关注", f"{len(pool_rows_for_sidebar)} 只"),
+            ("池子结构", f"持仓 {_holding_count} / 观察 {_watch_count}"),
+            ("工作流", "盘口 -> 研判 -> 决策"),
+        ),
+        "filter": (
+            ("股票池联动", f"{len(pool_rows_for_sidebar)} 只"),
+            ("筛选方式", "两段排雷"),
+            ("工作流", "快照 -> 条件 -> 导出"),
+        ),
+    }.get(
+        _active_page,
+        (
+            ("当前关注", f"{len(pool_rows_for_sidebar)} 只"),
+            ("池子结构", f"持仓 {_holding_count} / 观察 {_watch_count}"),
+            ("工作流", "盘口 -> 研判 -> 决策"),
+        ),
+    ),
+)
 
 rows = get_latest_fundamental_snapshot()
 if st.session_state.get("active_page") == "trading" and not rows:
@@ -880,6 +898,12 @@ def _call_deepseek_with_prompt(
     temperature: float = 0.3,
     top_p: float = 0.9,
 ) -> tuple[str, dict, float, float]:
+    if (not OPENAI_AVAILABLE) or (OpenAI is None):
+        hint = "缺少 openai 依赖，请先安装：cd /Users/wellthen/Desktop/TEST/Quant_System/apps/trading && source venv/bin/activate && pip install -r requirements.txt"
+        if OPENAI_IMPORT_ERROR is not None:
+            raise RuntimeError(f"{hint}；原始错误: {OPENAI_IMPORT_ERROR}")
+        raise RuntimeError(hint)
+
     api_key = _resolve_deepseek_api_key()
     _validate_api_key(api_key)
     client = OpenAI(api_key=api_key, base_url="https://api.deepseek.com/v1", timeout=60.0, max_retries=0)
@@ -1101,6 +1125,27 @@ def _render_fundamental_page():
         st.info("正在生成基本面数据，请稍后刷新。")
         return
 
+    row = next(
+        (
+            x
+            for x in rows_fnd
+            if str(x.get("code", "")) == str(st.session_state.get("fnd_selected_code", ""))
+        ),
+        rows_fnd[0],
+    )
+    render_section_intro(
+        "研究名单",
+        "保持列表总览和评分板之间的切换距离足够短，让你能先扫一遍股票池，再快速下钻到单只标的。",
+        kicker="Overview",
+        pills=("股票池总览", "打开评分板", "支持快速切换"),
+    )
+    render_status_row(
+        (
+            ("名单规模", f"{len(rows_fnd)} 只"),
+            ("当前标的", f"{row.get('name', '')} ({row.get('code', '')})"),
+            ("当前结论", _clean_text_no_na(str(row.get("conclusion", "观察")))),
+        )
+    )
     st.subheader("股票列表")
     df = build_fundamental_overview_table(rows_fnd).copy()
     st.dataframe(df, use_container_width=True, hide_index=True)
@@ -1121,6 +1166,12 @@ def _render_fundamental_page():
 
     st.divider()
     row = next((x for x in rows_fnd if str(x.get("code", "")) == str(st.session_state.get("fnd_selected_code", ""))), rows_fnd[0])
+    render_section_intro(
+        "评分概览",
+        "先看总分与结论，再往下阅读八维解释和总结文本，会更接近真实的研究顺序。",
+        kicker="Scoreboard",
+        pills=("总分", "结论", "覆盖率"),
+    )
     st.subheader(f"基本面评分板：{row.get('name', '')}（{row.get('code', '')}）")
     score = float(row.get("total_score", 0.0) or 0.0)
     conclusion = _clean_text_no_na(str(row.get("conclusion", "观察")))
@@ -1139,6 +1190,12 @@ def _render_fundamental_page():
 
     dims = row.get("dimensions", []) or []
     if dims:
+        render_section_intro(
+            "八维拆解",
+            "把各维度拆成独立卡片，便于你快速发现强项、短板和需要二次验证的地方。",
+            kicker="Dimensions",
+            pills=("八维卡片", "便于横向比较", "统一句长"),
+        )
         st.subheader("八维评分")
         for i in range(0, len(dims), 4):
             cols = st.columns(4, gap="small")
@@ -1159,11 +1216,17 @@ def _render_fundamental_page():
                     )
 
     st.divider()
+    render_section_intro(
+        "总结与输出",
+        "把总结、复制 JSON 和 DeepSeek 深挖放在一起，形成研究闭环。",
+        kicker="Narrative",
+        pills=("总结文本", "复制 JSON", "DeepSeek 深挖"),
+    )
     st.subheader("总结性文本")
     lines = _split_sentences(str(row.get("summary_text", "")))
     if lines:
         st.markdown(
-            "<div style='line-height:1.8;color:#243a58;font-size:1.05rem;'>"
+            "<div style='line-height:1.8;color:rgba(242,235,225,0.94);font-size:1.05rem;'>"
             + "<br>".join(lines)
             + "</div>",
             unsafe_allow_html=True,
@@ -1180,10 +1243,10 @@ def _render_fundamental_page():
             f"""
             <div style="margin-top:0.1rem;">
               <button id="fnd-copy-json-{code}"
-                style="width:100%;height:42px;border-radius:10px;border:1px solid #a8c2e8;background:#dbeafe;color:#0f2a52;font-size:1rem;font-weight:700;cursor:pointer;">
+                style="width:100%;height:42px;border-radius:999px;border:1px solid rgba(255,255,255,0.14);background:linear-gradient(135deg,#d9ece7 0%,#76b6b5 100%);color:#11202f;font-size:1rem;font-weight:800;cursor:pointer;box-shadow:0 12px 24px rgba(0,0,0,0.18);">
                 复制JSON
               </button>
-              <div id="fnd-copy-msg-{code}" style="margin-top:0.35rem;color:#2e4b6e;font-size:0.86rem;"></div>
+              <div id="fnd-copy-msg-{code}" style="margin-top:0.35rem;color:rgba(239,229,216,0.82);font-size:0.86rem;"></div>
             </div>
             <script>
               const btn = document.getElementById("fnd-copy-json-{code}");
@@ -1236,6 +1299,385 @@ def _render_fundamental_page():
         report_text = (deep.get("report", "") or "").strip()
         st.markdown(report_text)
         st.text_area("分析文本（可复制）", value=report_text, height=260, key=f"fnd_report_{code}")
+
+
+def _has_rearview_enabled(cfg: dict) -> bool:
+    d5 = cfg.get("rearview_5y", {}) if isinstance(cfg, dict) else {}
+    return any(bool(v) for k, v in d5.items() if str(k).endswith("_enabled"))
+
+
+def _build_stage1_config(cfg: dict) -> dict:
+    out = copy.deepcopy(cfg)
+    d5 = out.get("rearview_5y", {})
+    for k in list(d5.keys()):
+        if str(k).endswith("_enabled"):
+            d5[k] = False
+    return out
+
+
+def _build_stage2_config(cfg: dict) -> dict:
+    out = copy.deepcopy(cfg)
+    risk = out.get("risk", {})
+    for key in [
+        "exclude_st",
+        "exclude_investigation",
+        "exclude_penalty",
+        "exclude_fund_occupation",
+        "exclude_illegal_reduce",
+        "require_standard_audit",
+        "exclude_sunset_industry",
+        "exclude_no_dividend_5y",
+        "pledge_ratio_max_enabled",
+        "audit_change_max_enabled",
+    ]:
+        if key in risk:
+            risk[key] = False
+
+    for group in ["quality", "valuation", "growth_liquidity"]:
+        g = out.get(group, {})
+        for k in list(g.keys()):
+            if str(k).endswith("_enabled"):
+                g[k] = False
+    return out
+
+
+def _concat_dedup(df1: pd.DataFrame, df2: pd.DataFrame) -> pd.DataFrame:
+    if df1 is None or df1.empty:
+        merged = df2.copy() if isinstance(df2, pd.DataFrame) else pd.DataFrame()
+    elif df2 is None or df2.empty:
+        merged = df1.copy()
+    else:
+        merged = pd.concat([df1, df2], ignore_index=True)
+    if isinstance(merged, pd.DataFrame) and (not merged.empty) and ("code" in merged.columns):
+        merged = merged.drop_duplicates(subset=["code"], keep="first")
+    return merged
+
+
+def _render_filter_page():
+    st.caption(f"版本号: {FILTER_APP_VERSION} ｜ 侧边栏统一，筛选参数在主区顶部")
+
+    cfg = st.session_state.get("flt_cfg", filter_default_filter_config())
+    meta = filter_get_snapshot_meta()
+    render_section_intro(
+        "筛选作业流",
+        "这一页现在按真实筛选流程组织：先更新快照，再准备模板和条件，最后执行并导出结果。",
+        kicker="Workflow",
+        pills=("更新快照", "模板", "执行筛选", "导出 Excel"),
+    )
+    render_status_row(
+        (
+            ("快照状态", meta.get("last_update", "尚未更新") if meta else "尚未更新"),
+            ("样本数量", f"{int(meta.get('row_count', 0) or 0)} 只" if meta else "0 只"),
+            ("深度补充", f"{int(meta.get('enriched_count', 0) or 0)} 只" if meta else "0 只"),
+        )
+    )
+
+    st.subheader("过滤器参数")
+    top_cols = st.columns([1.1, 1.1, 0.8, 1.0], vertical_alignment="bottom")
+    max_stocks = top_cols[0].number_input("本次更新股票数（0=全部）", min_value=0, max_value=6000, value=2000, step=100, key="flt_max_stocks_main")
+    enrich_n = top_cols[1].number_input("深度补充数量（调用基本面引擎）", min_value=0, max_value=2000, value=300, step=50, key="flt_enrich_n_main")
+    force_refresh = top_cols[2].checkbox("忽略缓存强制重抓", value=False, key="flt_force_refresh_main")
+    if top_cols[3].button("更新全市场数据", use_container_width=True, key="flt_refresh_market_main"):
+        with st.spinner("正在更新市场数据，请稍候..."):
+            try:
+                stats = filter_refresh_market_snapshot(
+                    max_stocks=int(max_stocks),
+                    enrich_top_n=int(enrich_n),
+                    force_refresh=bool(force_refresh),
+                )
+                if bool(stats.get("fallback", False)):
+                    st.warning(
+                        "本次未连通东财接口，已回退为本地快照（未覆盖旧数据）。"
+                        "请检查系统代理/VPN后再重试。"
+                    )
+                else:
+                    st.success(f"更新完成：{stats['row_count']} 只，深度补充 {stats['enriched_count']} 只")
+                st.session_state["flt_result"] = None
+                st.rerun()
+            except Exception as exc:
+                st.error(f"更新失败: {exc}")
+
+    if meta:
+        st.caption(
+            f"最近更新: {meta.get('last_update', '--')} ｜ "
+            f"样本数量: {meta.get('row_count', '--')} ｜ "
+            f"深度补充: {meta.get('enriched_count', '--')}"
+        )
+
+    tpl_cols = st.columns([1.1, 0.65, 1.0, 0.65], vertical_alignment="bottom")
+    all_tpl = filter_load_templates()
+    tpl_names = sorted(all_tpl.keys())
+    selected_tpl = tpl_cols[0].selectbox("模板", options=["(无)"] + tpl_names, key="flt_tpl_select_main")
+    if tpl_cols[1].button("读取模板", use_container_width=True, key="flt_tpl_load_main"):
+        if selected_tpl and selected_tpl != "(无)":
+            st.session_state["flt_cfg"] = filter_get_template_config(selected_tpl)
+            st.success(f"已加载模板: {selected_tpl}")
+            st.rerun()
+
+    save_tpl_name = tpl_cols[2].text_input("保存为模板名", value="", key="flt_tpl_save_main")
+    if tpl_cols[3].button("保存模板", use_container_width=True, key="flt_tpl_save_btn_main"):
+        try:
+            filter_save_template(save_tpl_name, cfg)
+            st.success("模板已保存")
+        except Exception as exc:
+            st.error(str(exc))
+
+    mode = st.radio("筛选模式", options=["手动筛选", "AI辅助设定"], horizontal=True, key="flt_mode_main")
+    if mode == "AI辅助设定":
+        render_section_intro(
+            "AI 条件草拟",
+            "先用自然语言生成一版初稿条件，再继续手动微调，适合从模糊目标快速进入筛选状态。",
+            kicker="Assist",
+            pills=("自然语言", "自动生成", "可继续微调"),
+        )
+        prompt = st.text_area("输入你的目标", value="高股息、低估值、低负债、防御型", height=80, key="flt_ai_prompt_main")
+        if st.button("生成条件并应用", type="primary", key="flt_ai_apply_main"):
+            cfg = filter_build_ai_quick_config(prompt, cfg)
+            st.session_state["flt_cfg"] = cfg
+            st.success("已根据描述生成条件，你可继续微调后执行筛选。")
+            st.rerun()
+
+    render_section_intro(
+        "条件矩阵",
+        "筛选条件被拆成四层，从硬排除到五年后视镜，帮助你先做风险清洗，再做估值与长期验证。",
+        kicker="Configuration",
+        pills=("A 硬排除", "B 估值质量", "C 行业规模", "D 五年后视镜"),
+    )
+    st.subheader("筛选条件（支持手动开关，像电商筛选一样）")
+
+    with st.expander("A. 财务健康度与硬排除", expanded=True):
+        c1, c2, c3 = st.columns(3)
+        cfg["missing_policy"] = c1.selectbox("缺失数据处理", options=["ignore", "exclude"], index=0 if cfg.get("missing_policy") == "ignore" else 1)
+
+        r = cfg["risk"]
+        q = cfg["quality"]
+
+        r["exclude_st"] = c1.checkbox("排除 ST/*ST", value=bool(r.get("exclude_st", True)))
+        r["exclude_investigation"] = c1.checkbox("排除立案调查", value=bool(r.get("exclude_investigation", True)))
+        r["exclude_penalty"] = c1.checkbox("排除重大处罚", value=bool(r.get("exclude_penalty", True)))
+
+        r["exclude_fund_occupation"] = c2.checkbox("排除资金占用", value=bool(r.get("exclude_fund_occupation", True)))
+        r["exclude_illegal_reduce"] = c2.checkbox("排除违规减持", value=bool(r.get("exclude_illegal_reduce", True)))
+        r["require_standard_audit"] = c2.checkbox("审计意见必须标准无保留", value=bool(r.get("require_standard_audit", False)))
+
+        q["ocf_3y_min_enabled"] = c3.checkbox("启用近3年经营现金流下限(亿)", value=bool(q.get("ocf_3y_min_enabled", False)))
+        q["ocf_3y_min"] = c3.number_input("经营现金流下限(亿)", value=float(q.get("ocf_3y_min", 0.0)), step=1.0)
+        q["asset_liability_max_enabled"] = c3.checkbox("启用资产负债率上限(%)", value=bool(q.get("asset_liability_max_enabled", False)))
+        q["asset_liability_max"] = c3.number_input("资产负债率上限(%)", value=float(q.get("asset_liability_max", 80.0)), step=1.0)
+
+    with st.expander("B. 估值与质量", expanded=True):
+        c1, c2, c3 = st.columns(3)
+        q = cfg["quality"]
+        v = cfg["valuation"]
+
+        q["roe_min_enabled"] = c1.checkbox("启用 ROE 下限(%)", value=bool(q.get("roe_min_enabled", False)))
+        q["roe_min"] = c1.number_input("ROE 下限(%)", value=float(q.get("roe_min", 5.0)), step=0.5)
+        q["gross_margin_min_enabled"] = c1.checkbox("启用毛利率下限(%)", value=bool(q.get("gross_margin_min_enabled", False)))
+        q["gross_margin_min"] = c1.number_input("毛利率下限(%)", value=float(q.get("gross_margin_min", 20.0)), step=0.5)
+        q["net_margin_min_enabled"] = c1.checkbox("启用净利率下限(%)", value=bool(q.get("net_margin_min_enabled", False)))
+        q["net_margin_min"] = c1.number_input("净利率下限(%)", value=float(q.get("net_margin_min", 8.0)), step=0.5)
+
+        q["receivable_ratio_max_enabled"] = c2.checkbox("启用应收代理指标上限", value=bool(q.get("receivable_ratio_max_enabled", False)))
+        q["receivable_ratio_max"] = c2.number_input("应收代理指标上限", value=float(q.get("receivable_ratio_max", 50.0)), step=1.0)
+        q["goodwill_ratio_max_enabled"] = c2.checkbox("启用商誉/净资产上限(%)", value=bool(q.get("goodwill_ratio_max_enabled", False)))
+        q["goodwill_ratio_max"] = c2.number_input("商誉/净资产上限(%)", value=float(q.get("goodwill_ratio_max", 30.0)), step=1.0)
+        q["interest_debt_asset_max_enabled"] = c2.checkbox("启用有息负债/总资产上限(%)", value=bool(q.get("interest_debt_asset_max_enabled", False)))
+        q["interest_debt_asset_max"] = c2.number_input("有息负债/总资产上限(%)", value=float(q.get("interest_debt_asset_max", 20.0)), step=1.0)
+
+        v["pe_ttm_min_enabled"] = c3.checkbox("启用 PE(TTM) 下限", value=bool(v.get("pe_ttm_min_enabled", False)))
+        v["pe_ttm_min"] = c3.number_input("PE(TTM) 下限", value=float(v.get("pe_ttm_min", 0.0)), step=1.0)
+        v["pe_ttm_max_enabled"] = c3.checkbox("启用 PE(TTM) 上限", value=bool(v.get("pe_ttm_max_enabled", False)))
+        v["pe_ttm_max"] = c3.number_input("PE(TTM) 上限", value=float(v.get("pe_ttm_max", 25.0)), step=1.0)
+        v["pb_max_enabled"] = c3.checkbox("启用 PB 上限", value=bool(v.get("pb_max_enabled", False)))
+        v["pb_max"] = c3.number_input("PB 上限", value=float(v.get("pb_max", 3.0)), step=0.1)
+
+    with st.expander("C. 行业、分红、流动性与规模", expanded=True):
+        c1, c2, c3 = st.columns(3)
+        r = cfg["risk"]
+        v = cfg["valuation"]
+        g = cfg["growth_liquidity"]
+
+        r["exclude_sunset_industry"] = c1.checkbox("排除夕阳行业", value=bool(r.get("exclude_sunset_industry", False)))
+        r["sunset_industries"] = c1.text_area("夕阳行业关键词（逗号分隔）", value=str(r.get("sunset_industries", "")), height=120)
+        r["pledge_ratio_max_enabled"] = c1.checkbox("启用质押率上限(%)", value=bool(r.get("pledge_ratio_max_enabled", False)))
+        r["pledge_ratio_max"] = c1.number_input("质押率上限(%)", value=float(r.get("pledge_ratio_max", 80.0)), step=1.0)
+
+        v["dividend_min_enabled"] = c2.checkbox("启用股息率下限(%)", value=bool(v.get("dividend_min_enabled", False)))
+        v["dividend_min"] = c2.number_input("股息率下限(%)", value=float(v.get("dividend_min", 3.0)), step=0.1)
+        v["dividend_max_enabled"] = c2.checkbox("启用股息率上限(%)", value=bool(v.get("dividend_max_enabled", False)))
+        v["dividend_max"] = c2.number_input("股息率上限(%)", value=float(v.get("dividend_max", 12.0)), step=0.1)
+        r["exclude_no_dividend_5y"] = c2.checkbox("排除近5年未分红", value=bool(r.get("exclude_no_dividend_5y", False)))
+
+        g["market_cap_min_enabled"] = c3.checkbox("启用总市值下限(亿)", value=bool(g.get("market_cap_min_enabled", False)))
+        g["market_cap_min"] = c3.number_input("总市值下限(亿)", value=float(g.get("market_cap_min", 100.0)), step=10.0)
+        g["market_cap_max_enabled"] = c3.checkbox("启用总市值上限(亿)", value=bool(g.get("market_cap_max_enabled", False)))
+        g["market_cap_max"] = c3.number_input("总市值上限(亿)", value=float(g.get("market_cap_max", 5000.0)), step=10.0)
+
+        g["turnover_min_enabled"] = c3.checkbox("启用换手率下限(%)", value=bool(g.get("turnover_min_enabled", False)))
+        g["turnover_min"] = c3.number_input("换手率下限(%)", value=float(g.get("turnover_min", 0.2)), step=0.1)
+        g["turnover_max_enabled"] = c3.checkbox("启用换手率上限(%)", value=bool(g.get("turnover_max_enabled", False)))
+        g["turnover_max"] = c3.number_input("换手率上限(%)", value=float(g.get("turnover_max", 15.0)), step=0.1)
+
+        g["volume_ratio_min_enabled"] = c3.checkbox("启用量比下限", value=bool(g.get("volume_ratio_min_enabled", False)))
+        g["volume_ratio_min"] = c3.number_input("量比下限", value=float(g.get("volume_ratio_min", 0.5)), step=0.1)
+        g["volume_ratio_max_enabled"] = c3.checkbox("启用量比上限", value=bool(g.get("volume_ratio_max_enabled", False)))
+        g["volume_ratio_max"] = c3.number_input("量比上限", value=float(g.get("volume_ratio_max", 3.0)), step=0.1)
+
+    with st.expander("D. 五年后视镜（先看长期，再做当前筛选）", expanded=False):
+        st.caption("建议先开这一层做长期体检，再叠加 A/B/C 做当下过滤。")
+        d1, d2, d3 = st.columns(3)
+        d5 = cfg.setdefault("rearview_5y", {})
+
+        d5["revenue_cagr_5y_min_enabled"] = d1.checkbox(
+            "启用营收5年CAGR下限(%)", value=bool(d5.get("revenue_cagr_5y_min_enabled", False))
+        )
+        d5["revenue_cagr_5y_min"] = d1.number_input(
+            "营收5年CAGR下限(%)", value=float(d5.get("revenue_cagr_5y_min", 3.0)), step=0.5
+        )
+        d5["profit_cagr_5y_min_enabled"] = d1.checkbox(
+            "启用净利5年CAGR下限(%)", value=bool(d5.get("profit_cagr_5y_min_enabled", False))
+        )
+        d5["profit_cagr_5y_min"] = d1.number_input(
+            "净利5年CAGR下限(%)", value=float(d5.get("profit_cagr_5y_min", 3.0)), step=0.5
+        )
+
+        d5["roe_avg_5y_min_enabled"] = d2.checkbox(
+            "启用ROE 5年均值下限(%)", value=bool(d5.get("roe_avg_5y_min_enabled", False))
+        )
+        d5["roe_avg_5y_min"] = d2.number_input(
+            "ROE 5年均值下限(%)", value=float(d5.get("roe_avg_5y_min", 8.0)), step=0.5
+        )
+        d5["ocf_positive_years_5y_min_enabled"] = d2.checkbox(
+            "启用经营现金流为正年数下限", value=bool(d5.get("ocf_positive_years_5y_min_enabled", False))
+        )
+        d5["ocf_positive_years_5y_min"] = int(
+            d2.number_input(
+                "经营现金流为正年数下限(0-5)",
+                min_value=0,
+                max_value=5,
+                value=int(d5.get("ocf_positive_years_5y_min", 4)),
+                step=1,
+            )
+        )
+
+        d5["debt_ratio_change_5y_max_enabled"] = d3.checkbox(
+            "启用负债率5年变化上限(百分点)", value=bool(d5.get("debt_ratio_change_5y_max_enabled", False))
+        )
+        d5["debt_ratio_change_5y_max"] = d3.number_input(
+            "负债率5年变化上限(百分点)", value=float(d5.get("debt_ratio_change_5y_max", 8.0)), step=0.5
+        )
+        d5["gross_margin_change_5y_min_enabled"] = d3.checkbox(
+            "启用毛利率5年变化下限(百分点)", value=bool(d5.get("gross_margin_change_5y_min_enabled", False))
+        )
+        d5["gross_margin_change_5y_min"] = d3.number_input(
+            "毛利率5年变化下限(百分点)", value=float(d5.get("gross_margin_change_5y_min", -6.0)), step=0.5
+        )
+
+    st.session_state["flt_cfg"] = cfg
+
+    render_section_intro(
+        "执行与结果",
+        "执行区负责跑规则，结果区负责解释结果和导出表格，让批量筛选的收尾动作更集中。",
+        kicker="Execution",
+        pills=("执行筛选", "二段筛选", "结果导出"),
+    )
+    run_col1, run_col2, run_col3 = st.columns([1, 1.4, 2])
+    run_now = run_col1.button("执行筛选", type="primary", use_container_width=True, key="flt_run_filter_btn")
+    two_stage = run_col2.checkbox("二段筛选（先 A/B/C，再 D 五年后视镜）", value=True, key="flt_two_stage_main")
+    run_col3.caption("注：部分标的5年数据可能缺失；可通过“缺失数据处理”决定是否直接排除。")
+
+    if run_now:
+        snap = filter_load_snapshot()
+        if snap.empty:
+            st.error("还没有市场快照。请先在上方点击“更新全市场数据”。")
+        else:
+            with st.spinner("正在执行筛选..."):
+                if two_stage:
+                    stage1_cfg = _build_stage1_config(cfg)
+                    p1, r1, m1, s1 = filter_apply_filters(snap, stage1_cfg)
+
+                    if _has_rearview_enabled(cfg):
+                        stage2_cfg = _build_stage2_config(cfg)
+                        p2, r2, m2, _s2 = filter_apply_filters(p1, stage2_cfg)
+                        passed_df = p2
+                        rejected_df = _concat_dedup(r1, r2)
+                        missing_df = _concat_dedup(m1, m2)
+                    else:
+                        passed_df, rejected_df, missing_df = p1, r1, m1
+
+                    stats = {
+                        "total": int(len(snap)),
+                        "passed": int(len(passed_df)),
+                        "rejected": int(len(rejected_df)),
+                        "missing": int(len(missing_df)),
+                        "stage1_passed": int(s1.get("passed", len(p1))),
+                        "stage2_passed": int(len(passed_df)),
+                        "stage_mode": "two",
+                    }
+                else:
+                    passed_df, rejected_df, missing_df, stats = filter_apply_filters(snap, cfg)
+                    stats["stage_mode"] = "single"
+                st.session_state["flt_result"] = {
+                    "passed": passed_df,
+                    "rejected": rejected_df,
+                    "missing": missing_df,
+                    "stats": stats,
+                    "run_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                }
+
+    res = st.session_state.get("flt_result")
+    if not res:
+        st.info("请先更新市场快照，然后点击“执行筛选”。")
+        return
+
+    stats = res["stats"]
+    render_status_row(
+        (
+            ("总样本", str(stats.get("total", 0))),
+            ("通过池", str(stats.get("passed", 0))),
+            ("排除池", str(stats.get("rejected", 0))),
+            ("含缺失项", str(stats.get("missing", 0))),
+        )
+    )
+    k1, k2, k3, k4 = st.columns(4)
+    for col, label, val in [
+        (k1, "总样本", stats.get("total", 0)),
+        (k2, "通过池", stats.get("passed", 0)),
+        (k3, "排除池", stats.get("rejected", 0)),
+        (k4, "含缺失项", stats.get("missing", 0)),
+    ]:
+        col.markdown(f"<div class='kpi'><div class='label'>{label}</div><div class='value'>{val}</div></div>", unsafe_allow_html=True)
+
+    if str(stats.get("stage_mode", "")) == "two":
+        st.caption(
+            f"二段筛选结果：第一段(A/B/C) 保留 {int(stats.get('stage1_passed', 0))} 只 ｜ "
+            f"第二段(D) 后最终保留 {int(stats.get('stage2_passed', 0))} 只"
+        )
+
+    passed_df = res["passed"]
+    rejected_df = res["rejected"]
+    missing_df = res["missing"]
+    st.caption(f"筛选时间: {res.get('run_at', '--')}")
+
+    xlsx_bytes = filter_export_results_excel(passed_df, rejected_df, missing_df)
+    st.download_button(
+        "导出 Excel（通过池/排除池/缺失项）",
+        data=xlsx_bytes,
+        file_name=f"filter_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+    )
+
+    tab1, tab2, tab3 = st.tabs(["通过池", "排除池", "缺失项"])
+    with tab1:
+        cols1 = [c for c in FILTER_DISPLAY_COLUMNS if c in passed_df.columns]
+        st.dataframe(passed_df[cols1] if cols1 else passed_df, use_container_width=True, hide_index=True)
+    with tab2:
+        cols2 = [c for c in FILTER_DISPLAY_COLUMNS if c in rejected_df.columns]
+        st.dataframe(rejected_df[cols2] if cols2 else rejected_df, use_container_width=True, hide_index=True)
+    with tab3:
+        cols3 = [c for c in FILTER_DISPLAY_COLUMNS if c in missing_df.columns]
+        st.dataframe(missing_df[cols3] if cols3 else missing_df, use_container_width=True, hide_index=True)
 
 
 def _analysis_job_file(job_id: str) -> str:
@@ -1380,7 +1822,7 @@ def _render_final_report_block(job_id: str, job_obj: dict, key_suffix: str, heig
             style="height:38px;padding:0 0.9rem;border-radius:8px;border:1px solid #a8c2e8;background:#dbeafe;color:#0f2a52;font-size:0.95rem;font-weight:700;cursor:pointer;">
             复制分析文档
           </button>
-          <span id="copy-job-msg-{job_id}-{key_suffix}" style="margin-left:0.55rem;color:#2e4b6e;font-size:0.86rem;"></span>
+          <span id="copy-job-msg-{job_id}-{key_suffix}" style="margin-left:0.55rem;color:rgba(239,229,216,0.82);font-size:0.86rem;"></span>
         </div>
         <script>
           const b = document.getElementById("copy-job-doc-{job_id}-{key_suffix}");
@@ -1580,6 +2022,9 @@ def _is_market_open(code: str) -> bool:
 if st.session_state.get("active_page") == "fundamental":
     _render_fundamental_page()
     st.stop()
+if st.session_state.get("active_page") == "filter":
+    _render_filter_page()
+    st.stop()
 
 
 if "fast_selected_code" not in st.session_state:
@@ -1599,6 +2044,20 @@ auto_refresh_sec = header_cols[2].selectbox(
 )
 if header_cols[3].button("立即刷新", use_container_width=True, disabled=not market_open_for_ctrl):
     st.rerun()
+render_section_intro(
+    "标的工作台",
+    "上方保留自动刷新和即时刷新，下方把股票池拆成持仓与观察两栏，减少切换负担，方便快速定位当前关注标的。",
+    kicker="Deck",
+    pills=("自动刷新", "持仓 / 观察", "单击切换标的"),
+)
+render_status_row(
+    (
+        ("当前标的", f"{st.session_state.get('fast_selected_name', '')} ({selected_code_for_ctrl})"),
+        ("市场状态", "交易时段内" if market_open_for_ctrl else "非交易时段"),
+        ("刷新策略", f"{auto_refresh_sec} 秒自动刷新" if auto_refresh_on else "手动刷新"),
+        ("股票池结构", f"持仓 {_holding_count} / 观察 {_watch_count}"),
+    )
+)
 
 group_map = get_stock_group_map()
 holding_rows = [r for r in rows if group_map.get(str(r["code"]), "watch") == "holding"]
@@ -2096,6 +2555,14 @@ def _render_fast_panel(selected_code: str, selected_name: str, panel=None):
         "selected_timeframe_label": tf_caption,
     }
     fast_compact_metrics["cards_snapshot"] = cards_snapshot
+    render_status_row(
+        (
+            ("当前周期", tf_caption),
+            ("更新时间", q_time if q_time else "N/A"),
+            ("盘口失衡", _fmt(ofi, 2)),
+            ("估值口径", f"PB {_fmt(pb_val, 2)} / 股息 {_fmt_pct(dy_val, 2)}"),
+        )
+    )
 
     export_payload = {
         "meta": {
@@ -2140,10 +2607,10 @@ def _render_fast_panel(selected_code: str, selected_name: str, panel=None):
                 f"""
                 <div style="margin:0.1rem 0 0.45rem 0;">
                   <button id="copy-json-btn-{selected_code}"
-                    style="width:100%;height:44px;padding:0 0.95rem;border-radius:10px;border:1px solid #a8c2e8;background:#dbeafe;color:#0f2a52;font-size:1.05rem;font-weight:700;cursor:pointer;white-space:nowrap;">
+                    style="width:100%;height:44px;padding:0 0.95rem;border-radius:999px;border:1px solid rgba(255,255,255,0.14);background:linear-gradient(135deg,#f0d7b0 0%,#c99859 100%);color:#111827;font-size:1.02rem;font-weight:800;cursor:pointer;white-space:nowrap;box-shadow:0 12px 24px rgba(0,0,0,0.22);">
                     复制JSON
                   </button>
-                  <div id="copy-json-msg-{selected_code}" style="margin-top:0.35rem;color:#2e4b6e;font-size:0.88rem;"></div>
+                  <div id="copy-json-msg-{selected_code}" style="margin-top:0.35rem;color:rgba(239,229,216,0.82);font-size:0.88rem;"></div>
                 </div>
                 <script>
                   const btn = document.getElementById("copy-json-btn-{selected_code}");
@@ -2165,6 +2632,12 @@ def _render_fast_panel(selected_code: str, selected_name: str, panel=None):
             st.markdown('<div style="margin-top:0.22rem;"></div>', unsafe_allow_html=True)
             run_analysis_now = st.button("DeepSeek分析", key=f"run_inline_analysis_{selected_code}", use_container_width=True)
 
+    render_section_intro(
+        "快照矩阵",
+        "把实时价格、成交、盘口、估值和技术指标压进一组可快速扫描的卡片，让盘中判断尽量停留在同一屏里。",
+        kicker="Snapshot Matrix",
+        pills=("实时报价", "盘口结构", "估值尺度", "技术状态"),
+    )
     for i in range(0, len(cards), 4):
         cols = st.columns(4)
         for col, (title, kv_rows, desc) in zip(cols, cards[i : i + 4]):
@@ -2172,6 +2645,12 @@ def _render_fast_panel(selected_code: str, selected_name: str, panel=None):
 
     st.markdown('<div class="subsection-divider"></div>', unsafe_allow_html=True)
     st.markdown('<div class="fast-panels-gap"></div>', unsafe_allow_html=True)
+    render_section_intro(
+        "盘中结构",
+        "左侧保留分时强弱，右侧保留五档盘口，用双栏视角把成交节奏和挂单深度放在一起读。",
+        kicker="Intraday Structure",
+        pills=("资金分时", "五档盘口", "同屏观察"),
+    )
     left, right = st.columns([2, 1], vertical_alignment="top")
     with left:
         st.markdown('<div class="panel-title">资金分时</div>', unsafe_allow_html=True)

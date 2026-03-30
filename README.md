@@ -1,7 +1,14 @@
 # Quant_System（Mac 安装必成版）
 
-这个项目主入口是交易面（内含“基本面/交易面”切换）：
-- 启动文件：`apps/trading/app.py`
+这是一个多模块量化工作台，目前包含：
+- `Trading`：交易面 + 深度行情 + DeepSeek 分析
+- `Fundamental`：基本面八维评分 + DeepSeek 解读
+- `Filter`：大过滤器（全市场条件筛选）
+
+## 模块入口
+- 交易面：`apps/trading/app.py`
+- 基本面：`apps/fundamental/app.py`
+- 大过滤器：`apps/filter/app.py`
 
 下面按 **macOS** 给出最稳妥的安装方式。
 
@@ -41,7 +48,7 @@ xattr -d com.apple.quarantine create_desktop_launcher.command 2>/dev/null || tru
 ## 3) 浏览器访问
 
 启动后打开：
-- [http://localhost:8501](http://localhost:8501)
+- 默认启动交易面：[http://localhost:8501](http://localhost:8501)
 
 ---
 
@@ -75,6 +82,24 @@ python3 -m pip install -r requirements.txt
 streamlit run app.py
 ```
 
+切换其他模块只需替换目录：
+
+```bash
+# 基本面
+cd apps/fundamental
+python3 -m venv venv
+source venv/bin/activate
+python3 -m pip install -r requirements.txt
+streamlit run app.py
+
+# 大过滤器
+cd apps/filter
+python3 -m venv venv
+source venv/bin/activate
+python3 -m pip install -r requirements.txt
+streamlit run app.py
+```
+
 ---
 
 ## 6) 常见问题
@@ -96,4 +121,5 @@ streamlit run app.py --server.port 8510
 
 ## 版本
 
-- Trading 代码内版本号：`QDB-20260323-DSWIN-03`
+- Trading：`QDB-20260323-DSWIN-03`
+- Filter：`FLT-20260327-01`

@@ -365,6 +365,33 @@ def _extract_latest_from_indicator_multi(df: pd.DataFrame, cols: List[str]) -> O
     return None
 
 
+def _extract_indicator_series_multi(df: pd.DataFrame, cols: List[str], n: int = 5) -> List[float]:
+    if df.empty:
+        return []
+    hit_col = ""
+    for col in cols:
+        if col in df.columns:
+            hit_col = col
+            break
+    if not hit_col:
+        return []
+
+    temp = df.copy()
+    if "报告期" in temp.columns:
+        temp["报告期"] = temp["报告期"].astype(str)
+        temp = temp[temp["报告期"].str.contains("12-31|1231", na=False)]
+        temp = temp.sort_values("报告期", ascending=False)
+
+    out: List[float] = []
+    for _, r in temp.iterrows():
+        v = parse_cn_number(r.get(hit_col))
+        if v is not None:
+            out.append(float(v))
+        if len(out) >= max(1, int(n)):
+            break
+    return out
+
+
 def _pick_profile_number(profile: Dict[str, Any], keys: List[str]) -> Optional[float]:
     for key in keys:
         if key in profile:
@@ -574,6 +601,33 @@ def _growth_from_series(values: List[Optional[float]]) -> Optional[float]:
     return (float(values[0]) - prev) / abs(prev) * 100.0
 
 
+def _cagr_from_series(values: List[Optional[float]], years: int = 5) -> Optional[float]:
+    need_n = max(2, int(years))
+    valid = [float(x) for x in values[:need_n] if x is not None]
+    if len(valid) < need_n:
+        return None
+    latest = valid[0]
+    oldest = valid[need_n - 1]
+    periods = need_n - 1
+    if oldest <= 0 or latest <= 0 or periods <= 0:
+        return None
+    try:
+        return (pow(latest / oldest, 1.0 / periods) - 1.0) * 100.0
+    except Exception:
+        return None
+
+
+def _avg_from_series(values: List[Optional[float]], n: int = 5) -> Optional[float]:
+    valid = [float(x) for x in values[: max(1, int(n))] if x is not None]
+    if not valid:
+        return None
+    return sum(valid) / len(valid)
+
+
+def _positive_years(values: List[Optional[float]], n: int = 5) -> int:
+    return sum(1 for x in values[: max(1, int(n))] if x is not None and float(x) > 0)
+
+
 @dataclass
 class DimensionScore:
     key: str
@@ -753,6 +807,9 @@ def analyze_fundamental(code: str, name: str = "", force_refresh: bool = False, 
     ocf_sum_3y = sum(x for x in ocf_series[:3] if x is not None) if ocf_series else None
     revenue_growth = _growth_from_series(revenue_series[:2]) if revenue_series else None
     profit_growth = _growth_from_series(profit_series[:2]) if profit_series else None
+    revenue_cagr_5y = _cagr_from_series(revenue_series, years=5) if revenue_series else None
+    profit_cagr_5y = _cagr_from_series(profit_series, years=5) if profit_series else None
+    ocf_positive_years_5y = _positive_years(ocf_series, n=5) if ocf_series else 0
 
     gross_margin = _extract_latest_from_indicator_multi(indicator_df, ["销售毛利率", "销售毛利率(%)"])
     net_margin = _extract_latest_from_indicator_multi(indicator_df, ["销售净利率", "销售净利率(%)"])
@@ -763,6 +820,18 @@ def analyze_fundamental(code: str, name: str = "", force_refresh: bool = False, 
     ocf_per_share = _extract_latest_from_indicator_multi(indicator_df, ["每股经营性现金流(元)", "每股经营现金流(元)", "每股经营现金流"])
     retained_eps = _extract_latest_from_indicator_multi(indicator_df, ["每股未分配利润(元)", "每股未分配利润"])
     volatility_proxy = _extract_latest_from_indicator(indicator_df, "资产负债率")
+    roe_5y_series = _extract_indicator_series_multi(indicator_df, ["净资产收益率", "净资产收益率(%)", "加权净资产收益率(%)"], n=5)
+    gross_margin_5y_series = _extract_indicator_series_multi(indicator_df, ["销售毛利率", "销售毛利率(%)"], n=5)
+    debt_ratio_5y_series = _extract_indicator_series_multi(indicator_df, ["资产负债率", "资产负债率(%)"], n=5)
+    roe_avg_5y = _avg_from_series(roe_5y_series, n=5)
+    gross_margin_avg_5y = _avg_from_series(gross_margin_5y_series, n=5)
+    debt_ratio_avg_5y = _avg_from_series(debt_ratio_5y_series, n=5)
+    gross_margin_change_5y = None
+    debt_ratio_change_5y = None
+    if len(gross_margin_5y_series) >= 5:
+        gross_margin_change_5y = float(gross_margin_5y_series[0]) - float(gross_margin_5y_series[4])
+    if len(debt_ratio_5y_series) >= 5:
+        debt_ratio_change_5y = float(debt_ratio_5y_series[0]) - float(debt_ratio_5y_series[4])
 
     latest_goodwill = goodwill_series[0] if goodwill_series else None
     latest_equity = equity_series[0] if equity_series else None
@@ -834,6 +903,14 @@ def analyze_fundamental(code: str, name: str = "", force_refresh: bool = False, 
     ocf_sum_3y = _coalesce_number(ocf_sum_3y, stale_cache.get("ocf_sum_3y"))
     revenue_growth = _coalesce_number(revenue_growth, stale_cache.get("revenue_growth"))
     profit_growth = _coalesce_number(profit_growth, stale_cache.get("profit_growth"))
+    revenue_cagr_5y = _coalesce_number(revenue_cagr_5y, stale_cache.get("revenue_cagr_5y"))
+    profit_cagr_5y = _coalesce_number(profit_cagr_5y, stale_cache.get("profit_cagr_5y"))
+    roe_avg_5y = _coalesce_number(roe_avg_5y, stale_cache.get("roe_avg_5y"))
+    gross_margin_avg_5y = _coalesce_number(gross_margin_avg_5y, stale_cache.get("gross_margin_avg_5y"))
+    debt_ratio_avg_5y = _coalesce_number(debt_ratio_avg_5y, stale_cache.get("debt_ratio_avg_5y"))
+    gross_margin_change_5y = _coalesce_number(gross_margin_change_5y, stale_cache.get("gross_margin_change_5y"))
+    debt_ratio_change_5y = _coalesce_number(debt_ratio_change_5y, stale_cache.get("debt_ratio_change_5y"))
+    ocf_positive_years_5y = int(_coalesce_number(ocf_positive_years_5y, stale_cache.get("ocf_positive_years_5y"), default=0) or 0)
     goodwill_ratio_pct = _coalesce_number(goodwill_ratio_pct, stale_cache.get("goodwill_ratio_pct"))
 
     if pe_dynamic is None:
@@ -897,6 +974,14 @@ def analyze_fundamental(code: str, name: str = "", force_refresh: bool = False, 
             "goodwill_ratio_pct": goodwill_ratio_pct,
             "revenue_growth": revenue_growth,
             "profit_growth": profit_growth,
+            "revenue_cagr_5y": revenue_cagr_5y,
+            "profit_cagr_5y": profit_cagr_5y,
+            "roe_avg_5y": roe_avg_5y,
+            "gross_margin_avg_5y": gross_margin_avg_5y,
+            "debt_ratio_avg_5y": debt_ratio_avg_5y,
+            "gross_margin_change_5y": gross_margin_change_5y,
+            "debt_ratio_change_5y": debt_ratio_change_5y,
+            "ocf_positive_years_5y": ocf_positive_years_5y,
             "coverage_ratio": coverage_ratio,
             "total_score": round(total_score, 1),
             "conclusion": conclusion,

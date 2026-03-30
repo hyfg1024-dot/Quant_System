@@ -4,16 +4,37 @@ import base64
 import json
 import os
 import re
+import sys
 import time as pytime
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, List
 
 import requests
 import streamlit as st
-from openai import APIConnectionError, APITimeoutError, OpenAI
 from requests.adapters import HTTPAdapter
 from streamlit.components.v1 import html
 from urllib3.util.retry import Retry
+
+CURRENT_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = CURRENT_DIR.parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+OPENAI_AVAILABLE = True
+OPENAI_IMPORT_ERROR = None
+try:
+    from openai import APIConnectionError, APITimeoutError, OpenAI
+except Exception as _exc:  # pragma: no cover - 依赖缺失时兜底
+    OPENAI_AVAILABLE = False
+    OPENAI_IMPORT_ERROR = _exc
+    OpenAI = None  # type: ignore[assignment]
+
+    class APIConnectionError(Exception):
+        pass
+
+    class APITimeoutError(Exception):
+        pass
 
 from fundamental_engine import (
     APP_VERSION,
@@ -24,6 +45,7 @@ from fundamental_engine import (
     load_watchlist,
     upsert_watch_item_by_query,
 )
+from shared.ui_shell import render_app_shell, render_section_intro, render_status_row
 
 
 LOCAL_PREFS_PATH = "data/local_user_prefs.json"
@@ -41,91 +63,47 @@ st.set_page_config(page_title="基本面板块", page_icon="📊", layout="wide"
 st.markdown(
     """
 <style>
-:root {
-  --bg-main: #edf3fa;
-  --text-strong: #15253f;
-  --text-normal: #1f334f;
-}
-.stApp {
-  background: linear-gradient(180deg, var(--bg-main) 0%, #e8eff8 100%);
-  color: var(--text-normal);
-}
-[data-testid="stSidebar"] {
-  background: #1e2432;
-  color: #e8eef8;
-}
-[data-testid="stSidebar"] label,
-[data-testid="stSidebar"] h1,
-[data-testid="stSidebar"] h2,
-[data-testid="stSidebar"] h3,
-[data-testid="stSidebar"] p,
-[data-testid="stSidebar"] span {
-  color: #e8eef8 !important;
-}
-[data-testid="stSidebar"] .stButton > button,
-[data-testid="stSidebar"] .stButton > button * {
-  background: #dbeafe !important;
-  color: #0f2a52 !important;
-  border: 1px solid #a8c2e8 !important;
-}
-.stButton > button:not([kind="tertiary"]) {
-  background: #dbeafe;
-  color: #0f2a52;
-  border: 1px solid #a8c2e8;
-  font-weight: 700;
-}
-.stButton > button:not([kind="tertiary"]):hover {
-  background: #c7ddfb;
-  color: #0b2346;
-}
-h1, h2, h3, h4 { color: var(--text-strong) !important; }
-[data-testid="stMetricLabel"] div {
-  color: #496283 !important;
-  font-weight: 700 !important;
-}
-[data-testid="stMetricValue"] div {
-  color: #15253f !important;
-  font-weight: 800 !important;
-}
 .score-panel {
-  border: 1px solid rgba(80,120,180,.25);
+  border: 1px solid rgba(255,255,255,0.10);
   border-radius: 14px;
   padding: 14px 16px;
-  background: rgba(240,245,255,0.75);
+  background: linear-gradient(180deg, rgba(255,255,255,0.09), rgba(255,255,255,0.03));
   min-height: 112px;
 }
 .score-panel .label {
-  color: #5a7090;
+  color: rgba(232, 223, 210, 0.88);
   font-size: 1.02rem;
   font-weight: 700;
 }
 .score-panel .value {
-  color: #15253f;
+  color: rgba(255, 248, 241, 0.98);
   font-size: 2.3rem;
   font-weight: 800;
   line-height: 1.25;
   margin-top: 8px;
 }
 .fnd-card {
-  border: 1px solid rgba(80,120,180,.25);
+  border: 1px solid rgba(255,255,255,0.10);
   border-radius: 14px;
   padding: 12px 14px;
   min-height: 208px;
-  background: rgba(240,245,255,0.55);
+  background: linear-gradient(180deg, rgba(255,255,255,0.09), rgba(255,255,255,0.03));
   display: flex;
   flex-direction: column;
 }
 .fnd-card h4 {
   margin: 0 0 6px 0;
   font-size: 1.45rem;
+  color: rgba(255, 248, 241, 0.98);
 }
 .fnd-card .score {
   font-size: 1.75rem;
   font-weight: 800;
   margin: 2px 0 6px 0;
+  color: rgba(255, 248, 241, 0.98);
 }
 .fnd-card .desc {
-  color: #5c6e89;
+  color: rgba(232, 223, 210, 0.88);
   font-size: 1.0rem;
   line-height: 1.42;
   min-height: 4.26em;
@@ -196,6 +174,12 @@ def _validate_api_key(key: str) -> None:
 
 
 def _call_deepseek_analysis(json_text: str) -> tuple[str, dict, float, float]:
+    if (not OPENAI_AVAILABLE) or (OpenAI is None):
+        hint = "缺少 openai 依赖，请先安装：cd /Users/wellthen/Desktop/TEST/Quant_System/apps/fundamental && source venv/bin/activate && pip install -r requirements.txt"
+        if OPENAI_IMPORT_ERROR is not None:
+            raise RuntimeError(f"{hint}；原始错误: {OPENAI_IMPORT_ERROR}")
+        raise RuntimeError(hint)
+
     api_key = _resolve_deepseek_api_key()
     _validate_api_key(api_key)
     client = OpenAI(api_key=api_key, base_url="https://api.deepseek.com/v1", timeout=60.0, max_retries=0)
@@ -446,7 +430,7 @@ def _render_summary(row: Dict[str, Any]) -> None:
     lines = _split_sentences(str(row.get("summary_text", "")))
     if lines:
         st.markdown(
-            "<div style='line-height:1.8;color:#243a58;font-size:1.05rem;'>"
+            "<div style='line-height:1.8;color:rgba(242,235,225,0.94);font-size:1.05rem;'>"
             + "<br>".join(lines)
             + "</div>",
             unsafe_allow_html=True,
@@ -463,10 +447,10 @@ def _render_summary(row: Dict[str, Any]) -> None:
             f"""
             <div style="margin-top:0.1rem;">
               <button id="fnd-copy-json-{code}"
-                style="width:100%;height:42px;border-radius:10px;border:1px solid #a8c2e8;background:#dbeafe;color:#0f2a52;font-size:1rem;font-weight:700;cursor:pointer;">
+                style="width:100%;height:42px;border-radius:999px;border:1px solid rgba(255,255,255,0.14);background:linear-gradient(135deg,#d9ece7 0%,#76b6b5 100%);color:#11202f;font-size:1rem;font-weight:800;cursor:pointer;box-shadow:0 12px 24px rgba(0,0,0,0.18);">
                 复制JSON
               </button>
-              <div id="fnd-copy-msg-{code}" style="margin-top:0.35rem;color:#2e4b6e;font-size:0.86rem;"></div>
+              <div id="fnd-copy-msg-{code}" style="margin-top:0.35rem;color:rgba(239,229,216,0.82);font-size:0.86rem;"></div>
             </div>
             <script>
               const btn = document.getElementById("fnd-copy-json-{code}");
@@ -524,8 +508,17 @@ def _render_summary(row: Dict[str, Any]) -> None:
 
 def _render_page() -> None:
     _init_state()
-    st.title("基本面")
-    st.caption(f"版本号: {APP_VERSION}")
+    watchlist = st.session_state.get("fnd_watchlist", [])
+    render_app_shell(
+        "fundamental",
+        version=APP_VERSION,
+        badges=("八维评分", "观察名单", "DeepSeek 研判"),
+        metrics=(
+            ("当前股票池", f"{len(watchlist)} 只"),
+            ("研究视角", "八维拆解"),
+            ("输出方式", "摘要 + 结构化结论"),
+        ),
+    )
 
     with st.sidebar:
         st.header("股票池管理")
@@ -579,18 +572,49 @@ def _render_page() -> None:
         st.warning("当前股票池为空，请先添加股票代码。")
         return
 
+    row = _selected_row(rows)
+    render_section_intro(
+        "研究名单",
+        "从股票池总览进入单只标的，先筛选，再展开评分板和结论文本，让研究路径更连续。",
+        kicker="Overview",
+        pills=("股票池总览", "打开评分板", "支持快速切换"),
+    )
+    render_status_row(
+        (
+            ("名单规模", f"{len(rows)} 只"),
+            ("当前标的", f"{row.get('name', '')} ({row.get('code', '')})"),
+            ("当前结论", _clean_text_no_na(str(row.get("conclusion", "观察")))),
+        )
+    )
     _render_overview(rows)
     st.divider()
 
-    row = _selected_row(rows)
+    render_section_intro(
+        "评分概览",
+        "把总分、结论和覆盖率提到前面，先读结论，再看八维拆解，会更接近真实研究流程。",
+        kicker="Scoreboard",
+        pills=("总分", "结论", "覆盖率"),
+    )
     st.subheader(f"基本面评分板：{row.get('name', '')}（{row.get('code', '')}）")
     _render_score_panels(row)
 
     if row.get("data_warnings"):
         st.warning("；".join(_clean_text_no_na(str(x)) for x in row.get("data_warnings", [])))
 
+    render_section_intro(
+        "八维拆解",
+        "每个维度保留独立卡片，方便你一眼分辨优势项、短板项和需要进一步验证的部分。",
+        kicker="Dimensions",
+        pills=("独立维度卡", "统一阅读节奏", "便于横向比较"),
+    )
     _render_dimension_cards(row)
     st.divider()
+    render_section_intro(
+        "总结与输出",
+        "把摘要文本和后续分析动作留在同一区域，便于你在研究结束时直接复制或继续深挖。",
+        kicker="Narrative",
+        pills=("总结文本", "复制 JSON", "DeepSeek 深挖"),
+    )
     _render_summary(row)
 
 
