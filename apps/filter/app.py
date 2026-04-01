@@ -167,6 +167,7 @@ st.sidebar.markdown("---")
 st.sidebar.subheader("数据更新")
 max_stocks = st.sidebar.number_input("本次更新股票数（0=全部）", min_value=0, max_value=6000, value=2000, step=100)
 enrich_n = st.sidebar.number_input("深度补充数量（调用基本面引擎）", min_value=0, max_value=2000, value=300, step=50)
+rotate_enrich = st.sidebar.checkbox("深度补充采用轮转增量（推荐）", value=True)
 force_refresh = st.sidebar.checkbox("忽略缓存强制重抓", value=False)
 
 if st.sidebar.button("更新全市场数据", use_container_width=True):
@@ -176,11 +177,16 @@ if st.sidebar.button("更新全市场数据", use_container_width=True):
                 max_stocks=int(max_stocks),
                 enrich_top_n=int(enrich_n),
                 force_refresh=bool(force_refresh),
+                rotate_enrich=bool(rotate_enrich),
             )
             if bool(stats.get("fallback", False)):
                 st.sidebar.warning("本次未连通东财接口，已回退到本地快照（未覆盖旧数据）。请检查代理/VPN后重试。")
             else:
-                st.sidebar.success(f"更新完成：{stats['row_count']} 只，深度补充 {stats['enriched_count']} 只")
+                mode_label = "轮转" if str(stats.get("enrich_mode", "")) == "rotate" else "前排固定"
+                start_pos = int(stats.get("enrich_start", 0) or 0)
+                end_pos = int(stats.get("enrich_end", 0) or 0)
+                extra = f"（{mode_label}区间 {start_pos} -> {end_pos}）" if int(stats.get("enriched_count", 0) or 0) > 0 else ""
+                st.sidebar.success(f"更新完成：{stats['row_count']} 只，深度补充 {stats['enriched_count']} 只{extra}")
             meta = get_snapshot_meta()
         except Exception as exc:
             st.sidebar.error(f"更新失败: {exc}")

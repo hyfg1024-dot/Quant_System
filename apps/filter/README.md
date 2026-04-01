@@ -18,7 +18,7 @@
 
 ## 启动
 ```bash
-cd /Users/wellthen/Desktop/TEST/Quant_System/apps/filter
+cd /Users/wellthen/Desktop/Quant/Quant_System/apps/filter
 python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt

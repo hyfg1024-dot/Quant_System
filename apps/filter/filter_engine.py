@@ -612,6 +612,7 @@ def refresh_market_snapshot(
     max_stocks: int = 0,
     enrich_top_n: int = 300,
     force_refresh: bool = False,
+    rotate_enrich: bool = True,
 ) -> Dict[str, Any]:
     init_db()
     try:
@@ -630,6 +631,9 @@ def refresh_market_snapshot(
                 "updated_at": now_text,
                 "fallback": True,
                 "error": str(exc),
+                "enrich_mode": "rotate" if rotate_enrich else "top",
+                "enrich_start": 0,
+                "enrich_end": 0,
             }
         raise RuntimeError(
             f"未能拉取市场快照（可能是代理/VPN导致连接被拒绝）：{exc}"
@@ -643,7 +647,23 @@ def refresh_market_snapshot(
     manual_flags = _load_manual_flags()
 
     enrich_n = max(0, min(int(enrich_top_n), len(df)))
-    for idx in range(enrich_n):
+    total_count = len(df)
+    start_idx = 0
+    target_indices: List[int] = []
+
+    if enrich_n > 0 and total_count > 0:
+        if rotate_enrich:
+            meta = get_snapshot_meta()
+            try:
+                start_idx = int(meta.get("enrich_cursor_index", "0"))
+            except Exception:
+                start_idx = 0
+            start_idx = start_idx % total_count
+            target_indices = [int((start_idx + step) % total_count) for step in range(enrich_n)]
+        else:
+            target_indices = list(range(enrich_n))
+
+    for idx in target_indices:
         code = str(df.at[idx, "code"])
         name = str(df.at[idx, "name"])
         try:
@@ -763,11 +783,16 @@ def refresh_market_snapshot(
     _snapshot_meta_set("last_refresh_fallback", "0")
     _snapshot_meta_set("last_refresh_error", "")
     _snapshot_meta_set("last_refresh_error_at", "")
+    if rotate_enrich and enrich_n > 0 and total_count > 0:
+        _snapshot_meta_set("enrich_cursor_index", str((start_idx + enrich_n) % total_count))
 
     return {
         "row_count": len(save_df),
         "enriched_count": enrich_n,
         "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "enrich_mode": "rotate" if rotate_enrich else "top",
+        "enrich_start": int(start_idx + 1) if enrich_n > 0 else 0,
+        "enrich_end": int(((start_idx + enrich_n - 1) % total_count) + 1) if enrich_n > 0 and total_count > 0 else 0,
     }
 
 

@@ -255,6 +255,20 @@ st.markdown(
         line-height: 1.1;
         margin: 0.9rem 0 0.8rem 0;
     }
+    .analysis-time-badge {
+        display: inline-flex;
+        align-items: center;
+        padding: 0.28rem 0.72rem;
+        border-radius: 10px;
+        border: 1px solid rgba(252, 211, 77, 0.7);
+        background: linear-gradient(135deg, rgba(253, 224, 71, 0.26) 0%, rgba(251, 191, 36, 0.22) 100%);
+        color: #fff4bf;
+        font-size: 2rem;
+        font-weight: 900;
+        line-height: 1.08;
+        margin: 0.12rem 0 0.55rem 0;
+        text-shadow: 0 1px 2px rgba(0, 0, 0, 0.35);
+    }
     .fast-head-title {
         color: rgba(255, 248, 241, 0.98);
         font-size: 2rem;
@@ -1077,6 +1091,30 @@ def _call_deepseek_analysis(json_text: str) -> tuple[str, dict, float, float]:
     )
 
 
+def _sanitize_deepseek_report(text: str) -> str:
+    s = str(text or "").strip()
+    if not s:
+        return s
+
+    # 去掉模型常见抬头（标题型）
+    s = re.sub(r"^\s*#{1,6}\s*DeepSeek[^\n]*\n+", "", s, flags=re.IGNORECASE)
+    s = re.sub(r"^\s*DeepSeek[^\n]*\n+", "", s, flags=re.IGNORECASE)
+
+    # 去掉常见开场客套句
+    s = re.sub(
+        r"^\s*(好的|当然|明白了|收到)[，,。!\s]*作为[^\n。！？]*[。！？]?\s*",
+        "",
+        s,
+        flags=re.IGNORECASE,
+    )
+
+    # 若仍以“我将/我会...进行分析”开头，继续剥离一次
+    s = re.sub(r"^\s*我将[^\n。！？]*[。！？]?\s*", "", s)
+    s = re.sub(r"^\s*我会[^\n。！？]*[。！？]?\s*", "", s)
+
+    return s.strip()
+
+
 def _call_deepseek_fundamental(json_text: str) -> tuple[str, dict, float, float]:
     return _call_deepseek_with_prompt(
         user_content=json_text,
@@ -1866,11 +1904,16 @@ def _render_final_report_block(job_id: str, job_obj: dict, key_suffix: str, heig
     done_mark = str(job_obj.get("done_at", "") or "")
     text_key = f"job_text_{job_id}_{key_suffix}_{hashlib.md5((final_text + done_mark).encode('utf-8')).hexdigest()[:10]}"
     stats = job_obj.get("stats", {}) or {}
+    analyzed_at = str(job_obj.get("done_at") or job_obj.get("updated_at") or job_obj.get("created_at") or "--")
+    st.markdown(
+        f"<div class='analysis-time-badge'>分析时间: {analyzed_at}</div>",
+        unsafe_allow_html=True,
+    )
     st.caption(
         f"深析输入: {stats.get('deep_prompt_tokens', 0)} | 深析输出: {stats.get('deep_completion_tokens', 0)} | "
         f"预估总成本: {float(stats.get('total_cost', 0) or 0):.4f} 元"
     )
-    report_text = final_text.strip()
+    report_text = _sanitize_deepseek_report(final_text)
     if report_text:
         st.markdown(report_text)
     else:
@@ -1904,7 +1947,7 @@ def _render_final_report_block(job_id: str, job_obj: dict, key_suffix: str, heig
     )
 
 
-def _execute_analysis_job(job_id: str, mode: str, ui_prefix: str = "") -> dict:
+def _execute_analysis_job(job_id: str, mode: str, ui_prefix: str = "", force_refresh: bool = False) -> dict:
     job = _load_json_file(_analysis_job_file(job_id))
     if not job:
         raise RuntimeError("分析任务不存在或已失效。")
@@ -1933,49 +1976,71 @@ def _execute_analysis_job(job_id: str, mode: str, ui_prefix: str = "") -> dict:
     deep_hash = str(job.get("deep_hash", "") or "")
 
     try:
-        progress.progress(28, text=f"{ui_prefix}检查缓存...")
-        d_cached = cache_store.get(deep_hash) if deep_hash else None
-        if d_cached and isinstance(d_cached, dict):
-            deep_report = str(d_cached.get("result", "") or "")
-            deep_usage = d_cached.get("usage", {}) or deep_usage
-            deep_source = "同快照复用"
-        else:
-            deep_cd = cooldown_store.get(stock_code, {})
-            last_ts = float(deep_cd.get("last_ts", 0) or 0)
-            in_cooldown = (now_ts - last_ts) < (DEEP_COOLDOWN_MINUTES * 60)
-            cached_hash = str(deep_cd.get("last_deep_hash", ""))
-            if in_cooldown and cached_hash:
-                cd_cached = cache_store.get(cached_hash)
-                if cd_cached and isinstance(cd_cached, dict):
-                    deep_report = str(cd_cached.get("result", "") or "")
-                    deep_usage = cd_cached.get("usage", {}) or deep_usage
-                    deep_source = f"冷却期复用({DEEP_COOLDOWN_MINUTES}分钟)"
-
-            if not deep_report:
-                progress.progress(75, text=f"{ui_prefix}执行深析...")
-                deep_report, d_usage, d_cost, _ = _call_deepseek_analysis(json_text=deep_json)
-                deep_usage = d_usage
-                total_cost += float(d_cost or 0.0)
-                cache_store[deep_hash] = {
-                    "stage": "deep",
-                    "result": deep_report,
-                    "usage": deep_usage,
-                    "saved_at": datetime.now().strftime("%m-%d %H:%M:%S"),
-                    "stock_code": stock_code,
-                    "stock_name": stock_name,
-                }
-                _save_analysis_cache(cache_store)
-                deep_source = "实时调用"
-
+        if force_refresh:
+            progress.progress(36, text=f"{ui_prefix}强制刷新分析...")
+            deep_report, d_usage, d_cost, _ = _call_deepseek_analysis(json_text=deep_json)
+            deep_usage = d_usage
+            total_cost += float(d_cost or 0.0)
+            deep_source = "手动刷新"
+            cache_store[deep_hash] = {
+                "stage": "deep",
+                "result": deep_report,
+                "usage": deep_usage,
+                "saved_at": datetime.now().strftime("%m-%d %H:%M:%S"),
+                "stock_code": stock_code,
+                "stock_name": stock_name,
+            }
+            _save_analysis_cache(cache_store)
             cooldown_store[stock_code] = {
                 "last_ts": now_ts,
                 "last_time": datetime.now().strftime("%m-%d %H:%M:%S"),
                 "last_deep_hash": deep_hash,
             }
             _save_json_file(ANALYSIS_COOLDOWN_PATH, cooldown_store)
+        else:
+            progress.progress(28, text=f"{ui_prefix}检查缓存...")
+            d_cached = cache_store.get(deep_hash) if deep_hash else None
+            if d_cached and isinstance(d_cached, dict):
+                deep_report = str(d_cached.get("result", "") or "")
+                deep_usage = d_cached.get("usage", {}) or deep_usage
+                deep_source = "同快照复用"
+            else:
+                deep_cd = cooldown_store.get(stock_code, {})
+                last_ts = float(deep_cd.get("last_ts", 0) or 0)
+                in_cooldown = (now_ts - last_ts) < (DEEP_COOLDOWN_MINUTES * 60)
+                cached_hash = str(deep_cd.get("last_deep_hash", ""))
+                if in_cooldown and cached_hash:
+                    cd_cached = cache_store.get(cached_hash)
+                    if cd_cached and isinstance(cd_cached, dict):
+                        deep_report = str(cd_cached.get("result", "") or "")
+                        deep_usage = cd_cached.get("usage", {}) or deep_usage
+                        deep_source = f"冷却期复用({DEEP_COOLDOWN_MINUTES}分钟)"
+
+                if not deep_report:
+                    progress.progress(75, text=f"{ui_prefix}执行深析...")
+                    deep_report, d_usage, d_cost, _ = _call_deepseek_analysis(json_text=deep_json)
+                    deep_usage = d_usage
+                    total_cost += float(d_cost or 0.0)
+                    cache_store[deep_hash] = {
+                        "stage": "deep",
+                        "result": deep_report,
+                        "usage": deep_usage,
+                        "saved_at": datetime.now().strftime("%m-%d %H:%M:%S"),
+                        "stock_code": stock_code,
+                        "stock_name": stock_name,
+                    }
+                    _save_analysis_cache(cache_store)
+                    deep_source = "实时调用"
+
+                cooldown_store[stock_code] = {
+                    "last_ts": now_ts,
+                    "last_time": datetime.now().strftime("%m-%d %H:%M:%S"),
+                    "last_deep_hash": deep_hash,
+                }
+                _save_json_file(ANALYSIS_COOLDOWN_PATH, cooldown_store)
 
         progress.progress(100, text=f"{ui_prefix}分析完成")
-        final_text = f"## DeepSeek 深析结果（{deep_source}）\n\n{deep_report}"
+        final_text = _sanitize_deepseek_report(deep_report)
 
         stats = {
             "deep_prompt_tokens": int(deep_usage.get("prompt_tokens", 0) or 0),
@@ -2032,11 +2097,16 @@ def _render_analysis_window(job_id: str, embedded: bool = False, auto_mode: str 
         st.caption(f"任务ID: {job_id} | 上次模式: {mode}")
 
     run_mode = ""
+    force_refresh = False
     if embedded:
         run_mode = "deep" if auto_mode else ""
     else:
-        if st.button("DeepSeek分析", key=f"analysis_window_deep_{job_id}", use_container_width=True):
+        btn_cols = st.columns(2)
+        if btn_cols[0].button("DeepSeek分析", key=f"analysis_window_deep_{job_id}", use_container_width=True):
             run_mode = "deep"
+        if btn_cols[1].button("刷新", key=f"analysis_window_refresh_{job_id}", use_container_width=True):
+            run_mode = "deep"
+            force_refresh = True
 
     if not run_mode:
         if job.get("status") == "done":
@@ -2052,7 +2122,12 @@ def _render_analysis_window(job_id: str, embedded: bool = False, auto_mode: str 
         return
 
     try:
-        done_job = _execute_analysis_job(job_id=job_id, mode="deep", ui_prefix=f"{stock_name} ")
+        done_job = _execute_analysis_job(
+            job_id=job_id,
+            mode="deep",
+            ui_prefix=f"{stock_name} ",
+            force_refresh=force_refresh,
+        )
         if not embedded:
             st.success("深析已完成。")
         else:
@@ -2662,6 +2737,7 @@ def _render_fast_panel(selected_code: str, selected_name: str, panel=None):
         deep_hash=deep_hash,
     )
     run_analysis_now = False
+    refresh_analysis_now = False
 
     if copy_slot is not None:
         with copy_slot:
@@ -2786,11 +2862,20 @@ def _render_fast_panel(selected_code: str, selected_name: str, panel=None):
 
     st.caption(panel.get("depth_note", ""))
     st.markdown('<div class="subsection-divider"></div>', unsafe_allow_html=True)
-    st.subheader(f"DeepSeek分析文档 · {selected_name} ({selected_code})")
+    doc_cols = st.columns([5, 1], vertical_alignment="center")
+    with doc_cols[0]:
+        st.subheader(f"DeepSeek分析文档 · {selected_name} ({selected_code})")
+    with doc_cols[1]:
+        refresh_analysis_now = st.button("刷新", key=f"refresh_inline_analysis_{selected_code}", use_container_width=True)
 
     try:
-        if run_analysis_now:
-            done_job = _execute_analysis_job(job_id=live_job_id, mode="deep", ui_prefix=f"{selected_name} ")
+        if run_analysis_now or refresh_analysis_now:
+            done_job = _execute_analysis_job(
+                job_id=live_job_id,
+                mode="deep",
+                ui_prefix=f"{selected_name} ",
+                force_refresh=bool(refresh_analysis_now),
+            )
             _render_final_report_block(live_job_id, done_job, f"inline_new_{selected_code}", height=520)
         else:
             live_job_obj = _load_json_file(_analysis_job_file(live_job_id))
