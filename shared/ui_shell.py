@@ -68,18 +68,32 @@ _SHELLS: dict[str, ShellMeta] = {
         nav_title="回测系统",
         title="策略回测台",
         subtitle="配置标的池、仓位和成本参数，执行港股多空历史回测并生成交互式诊断报告。",
-        accent="#8bb37a",
-        accent_soft="#d8e8ce",
-        glow="rgba(139, 179, 122, 0.24)",
+        accent="#1fab63",
+        accent_soft="#8fd8b2",
+        glow="rgba(31, 171, 99, 0.24)",
         metrics=(
             ("主视角", "策略验证"),
             ("信息层级", "配置 + 回测 + 报告"),
             ("工作方式", "参数迭代与复盘"),
         ),
     ),
+    "paper": ShellMeta(
+        label="Paper Trade",
+        nav_title="模拟实盘",
+        title="模拟实盘台",
+        subtitle="按策略逐日推进模拟持仓，记录交易与快照，低摩擦追踪真实执行路径。",
+        accent="#d14343",
+        accent_soft="#e89d9d",
+        glow="rgba(209, 67, 67, 0.24)",
+        metrics=(
+            ("主视角", "策略跟踪"),
+            ("信息层级", "建仓 + 更新 + 状态"),
+            ("工作方式", "逐日执行与复盘"),
+        ),
+    ),
 }
 
-_NAV_ORDER = ("filter", "fundamental", "trading", "backtest")
+_NAV_ORDER = ("filter", "fundamental", "trading", "backtest", "paper")
 
 
 def _shell_style(meta: ShellMeta, active_page: str) -> str:
@@ -473,8 +487,13 @@ def _shell_style(meta: ShellMeta, active_page: str) -> str:
     }}
     .st-key-qs_top_nav_backtest div.stButton > button {{
       background:
-        linear-gradient(180deg, rgba(175, 201, 145, 0.98), rgba(137, 167, 108, 1)) !important;
-      border-color: rgba(221, 236, 201, 0.78) !important;
+        linear-gradient(180deg, rgba(31, 171, 99, 0.99), rgba(31, 171, 99, 0.99)) !important;
+      border-color: rgba(31, 171, 99, 0.86) !important;
+    }}
+    .st-key-qs_top_nav_paper div.stButton > button {{
+      background:
+        linear-gradient(180deg, rgba(209, 67, 67, 0.99), rgba(209, 67, 67, 0.99)) !important;
+      border-color: rgba(209, 67, 67, 0.86) !important;
     }}
     div[data-testid="column"]:has(.qs-top-nav-marker) div.stButton > button:hover {{
       opacity: 1;
@@ -977,7 +996,7 @@ def render_top_nav(active_page: str) -> str:
     selected = active_page
     st.markdown("<div class='qs-top-nav-reserve'></div>", unsafe_allow_html=True)
     with st.container(key="qs_top_nav_row"):
-        cols = st.columns([1.02, 1.02, 1.02, 1.02, 3.2], vertical_alignment="center")
+        cols = st.columns([1.0] * len(_NAV_ORDER) + [2.8], vertical_alignment="center")
         for idx, key in enumerate(_NAV_ORDER):
             with cols[idx]:
                 marker_class = "qs-top-nav-marker is-active" if key == active_page else "qs-top-nav-marker"

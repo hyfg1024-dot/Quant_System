@@ -5,6 +5,7 @@ import json
 import math
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time as pytime
@@ -15,6 +16,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 import altair as alt
+import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
@@ -96,6 +98,7 @@ from shared.ui_shell import render_app_shell, render_section_intro, render_statu
 st.set_page_config(page_title="Quant Dashboard", page_icon="📊", layout="wide")
 APP_VERSION = "QDB-20260327-FLT5Y-01"
 BACKTEST_APP_VERSION = "BT-20260411-01"
+PAPER_APP_VERSION = "PT-20260411-01"
 LOCAL_PREFS_PATH = "data/local_user_prefs.json"
 ANALYSIS_CACHE_PATH = "data/deepseek_analysis_cache.json"
 ANALYSIS_JOB_DIR = "data/analysis_jobs"
@@ -104,8 +107,13 @@ ANALYSIS_COOLDOWN_PATH = "data/deepseek_cooldown.json"
 DEEP_COOLDOWN_MINUTES = 5
 BACKTEST_DIR = CURRENT_DIR.parent / "backtest"
 BACKTEST_RUNNER = BACKTEST_DIR / "run_backtest.py"
+BACKTEST_PAPER_RUNNER = BACKTEST_DIR / "paper_trade.py"
 BACKTEST_STRATEGY_DIR = BACKTEST_DIR / "config" / "strategies"
+BACKTEST_STRATEGY_TRASH_DIR = BACKTEST_STRATEGY_DIR / "_trash"
 BACKTEST_REPORT_DIR = BACKTEST_DIR / "reports"
+BACKTEST_PAPER_DIR = BACKTEST_DIR / "paper_trades"
+BACKTEST_PAPER_ACTIVE = BACKTEST_PAPER_DIR / ".active"
+BACKTEST_PAPER_DASHBOARD = BACKTEST_PAPER_DIR / "dashboard.html"
 DEEPSEEK_SYSTEM_PROMPT = """你是一个专业的股票分析师。必须严格按照【五维分析框架】分析：
 
 【五维分析框架】
@@ -699,12 +707,31 @@ if _curr_user != _last.get("deepseek_user", "") or _curr_key != _last.get("deeps
         "deepseek_api_key": _curr_key,
     }
 
+_allowed_pages = {"trading", "fundamental", "filter", "backtest", "paper"}
+try:
+    _qp_page = str(st.query_params.get("page", "")).strip().lower()
+except Exception:
+    _qp_page = ""
+if _qp_page not in _allowed_pages:
+    _qp_page = "trading"
+if st.session_state.get("active_page") not in _allowed_pages:
+    st.session_state["active_page"] = _qp_page
+
 _active_page = st.session_state.get("active_page", "trading")
 _nav_selected = render_top_nav(_active_page)
 if _nav_selected != _active_page:
     st.session_state["active_page"] = _nav_selected
+    try:
+        st.query_params["page"] = _nav_selected
+    except Exception:
+        pass
     st.rerun()
 _active_page = st.session_state.get("active_page", "trading")
+try:
+    if str(st.query_params.get("page", "")).strip().lower() != _active_page:
+        st.query_params["page"] = _active_page
+except Exception:
+    pass
 _group_map = get_stock_group_map()
 _holding_count = sum(1 for code, _name in pool_rows_for_sidebar if _group_map.get(code) == "holding")
 _watch_count = sum(1 for code, _name in pool_rows_for_sidebar if _group_map.get(code) != "holding")
@@ -715,12 +742,14 @@ render_app_shell(
         "trading": APP_VERSION,
         "filter": FILTER_APP_VERSION,
         "backtest": BACKTEST_APP_VERSION,
+        "paper": PAPER_APP_VERSION,
     }.get(_active_page, APP_VERSION),
     badges={
         "fundamental": ("八维评分", "观察名单", "结构化结论"),
         "trading": ("实时盘口", "分时结构", "DeepSeek 分析"),
         "filter": ("两段筛选", "快照更新", "结果导出"),
         "backtest": ("多空回测", "成本建模", "HTML报告"),
+        "paper": ("策略入口", "逐日更新", "模拟看板"),
     }.get(_active_page, ("实时盘口", "分时结构", "DeepSeek 分析")),
     metrics={
         "fundamental": (
@@ -742,6 +771,11 @@ render_app_shell(
             ("策略配置", "YAML可编辑"),
             ("回测区间", "2021-01-01 -> today"),
             ("工作流", "更新数据 -> 执行 -> 复盘"),
+        ),
+        "paper": (
+            ("执行模式", "逐日模拟"),
+            ("交易日口径", "港股实际交易日"),
+            ("工作流", "启动 -> 更新 -> 看板"),
         ),
     }.get(
         _active_page,
@@ -2017,24 +2051,73 @@ def _render_backtest_page():
         st.error(f"未找到回测入口: {BACKTEST_RUNNER}")
         return
 
-    strategy_files = sorted(BACKTEST_STRATEGY_DIR.glob("*.yaml"))
-    if not strategy_files:
-        st.error(f"未找到策略配置文件目录: {BACKTEST_STRATEGY_DIR}")
-        return
+    if "bt_preview_latest_open" not in st.session_state:
+        st.session_state["bt_preview_latest_open"] = False
 
-    default_idx = 0
-    for i, p in enumerate(strategy_files):
-        if p.name == "realestate_example.yaml":
-            default_idx = i
-            break
-    selected_cfg = st.selectbox(
-        "策略配置文件",
-        options=[p.name for p in strategy_files],
-        index=default_idx,
-        key="bt_selected_strategy",
+    BACKTEST_STRATEGY_DIR.mkdir(parents=True, exist_ok=True)
+    BACKTEST_STRATEGY_TRASH_DIR.mkdir(parents=True, exist_ok=True)
+    strategy_files = sorted(
+        [p for p in BACKTEST_STRATEGY_DIR.glob("*.yaml") if p.is_file()],
+        key=lambda p: (p.stat().st_mtime, p.name.lower()),
+        reverse=True,
+    )
+    trash_files = sorted([p for p in BACKTEST_STRATEGY_TRASH_DIR.glob("*.yaml") if p.is_file()])
+    if not strategy_files:
+        st.info("策略库为空：可直接在下方输入框粘贴策略，然后保存到策略库。")
+
+    st.markdown(
+        """
+        <style>
+        [class*="st-key-bt_"] div.stButton > button {
+          min-height: 2.2rem !important;
+          padding: 0.25rem 0.75rem !important;
+          font-size: 0.9rem !important;
+          border-radius: 12px !important;
+        }
+        [class*="st-key-bt_load_strategy_"] div.stButton > button {
+          min-height: 1.65rem !important;
+          padding: 0.08rem 0.5rem !important;
+          border-radius: 10px !important;
+          font-size: 0.84rem !important;
+        }
+        [class*="st-key-bt_close_strategy_"] div.stButton > button,
+        [class*="st-key-bt_lock_strategy_"] div.stButton > button {
+          min-height: 1.3rem !important;
+          min-width: 1.35rem !important;
+          padding: 0rem 0.28rem !important;
+          border-radius: 10px !important;
+          font-size: 0.8rem !important;
+        }
+        [class*="st-key-bt_toggle_latest_preview"] div.stButton > button,
+        [class*="st-key-bt_download_latest"] div.stDownloadButton > button {
+          min-height: 2.0rem !important;
+          border-radius: 10px !important;
+          font-size: 0.98rem !important;
+          font-weight: 650 !important;
+          padding: 0.22rem 0.72rem !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
     )
 
-    def _run_cmd(cmd: list[str], label: str) -> None:
+    strategy_names = [p.name for p in strategy_files]
+    if "bt_strategy_text" not in st.session_state:
+        st.session_state["bt_strategy_text"] = ""
+    if "bt_strategy_source" not in st.session_state:
+        st.session_state["bt_strategy_source"] = "__inline__"
+
+    selected_cfg = str(st.session_state.get("bt_selected_strategy", ""))
+    if selected_cfg not in strategy_names:
+        selected_cfg = ""
+        st.session_state["bt_selected_strategy"] = ""
+
+    strategy_source = str(st.session_state.get("bt_strategy_source", "") or "")
+    if strategy_source and strategy_source not in {"__inline__", "__manual__"} and strategy_source not in strategy_names:
+        st.session_state["bt_strategy_text"] = ""
+        st.session_state["bt_strategy_source"] = "__inline__"
+
+    def _run_cmd(cmd: list[str], label: str) -> bool:
         with st.spinner(f"{label} 执行中..."):
             try:
                 proc = subprocess.run(
@@ -2050,40 +2133,312 @@ def _render_backtest_page():
                 st.session_state["bt_console_output"] = output.strip()
                 if proc.returncode == 0:
                     st.success(f"{label} 完成")
-                else:
-                    st.error(f"{label} 失败（exit={proc.returncode}）")
+                    return True
+                st.error(f"{label} 失败（exit={proc.returncode}）")
+                return False
             except Exception as exc:
                 st.error(f"{label} 异常: {exc}")
+                return False
+
+    def _extract_strategy_codes(strategy_text: str) -> list[str]:
+        text = (strategy_text or "").strip()
+        if not text:
+            return []
+
+        codes: list[str] = []
+        try:
+            import yaml  # type: ignore
+
+            obj = yaml.safe_load(text) or {}
+            if isinstance(obj, dict):
+                for key in ("long_positions", "short_positions"):
+                    items = obj.get(key, []) or []
+                    if isinstance(items, list):
+                        for item in items:
+                            if isinstance(item, dict) and item.get("code"):
+                                codes.append(str(item.get("code", "")).strip().upper())
+        except Exception:
+            # 回退到正则提取，容忍非严格 YAML 的中间态。
+            codes = [m.strip().upper() for m in re.findall(r'^\s*code\s*:\s*["\']?([A-Za-z0-9.^_-]+)["\']?\s*$', text, flags=re.M)]
+
+        seen: set[str] = set()
+        out: list[str] = []
+        for code in codes:
+            if code and code not in seen:
+                seen.add(code)
+                out.append(code)
+        return out
+
+    def _autofill_universe_by_codes(codes: list[str]) -> tuple[list[str], str]:
+        if not codes:
+            return [], ""
+        try:
+            import yaml  # type: ignore
+        except Exception as exc:
+            return [], f"自动补全失败：缺少 PyYAML 依赖（{exc}）"
+
+        try:
+            if BACKTEST_STRATEGY_DIR.exists():
+                # 保证目录存在时，universe 也可写。
+                BACKTEST_DIR.mkdir(parents=True, exist_ok=True)
+            universe_path = BACKTEST_DIR / "config" / "universe.yaml"
+            universe_path.parent.mkdir(parents=True, exist_ok=True)
+            if universe_path.exists():
+                raw = yaml.safe_load(universe_path.read_text(encoding="utf-8")) or {}
+            else:
+                raw = {}
+            if not isinstance(raw, dict):
+                raw = {}
+
+            sectors = raw.get("sectors")
+            if not isinstance(sectors, dict):
+                sectors = {}
+                raw["sectors"] = sectors
+
+            # 收集全局已有 code，避免重复。
+            existing_codes: set[str] = set()
+            for sec_obj in sectors.values():
+                if not isinstance(sec_obj, dict):
+                    continue
+                groups = sec_obj.get("groups", {})
+                if not isinstance(groups, dict):
+                    continue
+                for grp_obj in groups.values():
+                    if not isinstance(grp_obj, dict):
+                        continue
+                    stocks = grp_obj.get("stocks", [])
+                    if not isinstance(stocks, list):
+                        continue
+                    for st_obj in stocks:
+                        if isinstance(st_obj, dict) and st_obj.get("code"):
+                            existing_codes.add(str(st_obj.get("code")).strip().upper())
+
+            auto_sector = sectors.get("auto_import")
+            if not isinstance(auto_sector, dict):
+                auto_sector = {
+                    "name": "自动补全",
+                    "description": "由策略校验按钮自动补齐的标的",
+                    "sector_benchmark": "^HSI",
+                    "groups": {},
+                }
+                sectors["auto_import"] = auto_sector
+
+            groups = auto_sector.get("groups")
+            if not isinstance(groups, dict):
+                groups = {}
+                auto_sector["groups"] = groups
+
+            auto_group = groups.get("from_strategy")
+            if not isinstance(auto_group, dict):
+                auto_group = {
+                    "name": "来自策略",
+                    "stocks": [],
+                }
+                groups["from_strategy"] = auto_group
+
+            stocks = auto_group.get("stocks")
+            if not isinstance(stocks, list):
+                stocks = []
+                auto_group["stocks"] = stocks
+
+            added_codes: list[str] = []
+            for code in codes:
+                c = str(code).strip().upper()
+                if not c or c in existing_codes:
+                    continue
+                stocks.append(
+                    {
+                        "code": c,
+                        "name": c,
+                        "tags": ["auto-added", "from-strategy"],
+                    }
+                )
+                existing_codes.add(c)
+                added_codes.append(c)
+
+            if added_codes:
+                universe_path.write_text(
+                    yaml.safe_dump(
+                        raw,
+                        allow_unicode=True,
+                        sort_keys=False,
+                        default_flow_style=False,
+                    ),
+                    encoding="utf-8",
+                )
+            return added_codes, ""
+        except Exception as exc:
+            return [], f"自动补全失败：{exc}"
+
+    st.markdown("### 策略库管理")
+    st.caption("点击策略名载入；右上角小 × 删除会进入回收站。")
+
+    def _move_strategy_to_trash(src: Path) -> Path:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        base_name = f"{src.stem}__{ts}{src.suffix}"
+        dst = BACKTEST_STRATEGY_TRASH_DIR / base_name
+        idx = 1
+        while dst.exists():
+            dst = BACKTEST_STRATEGY_TRASH_DIR / f"{src.stem}__{ts}_{idx}{src.suffix}"
+            idx += 1
+        shutil.move(str(src), str(dst))
+        return dst
+    per_row = 3
+    if not strategy_files:
+        st.caption("暂无策略文件。可在下方填写后点击“保存到策略库”。")
+    for start in range(0, len(strategy_files), per_row):
+        chunk = strategy_files[start : start + per_row]
+        cols = st.columns(per_row, vertical_alignment="top")
+        for idx, p in enumerate(chunk):
+            name = p.name
+            with cols[idx]:
+                b1, b2 = st.columns([8.8, 1.2], vertical_alignment="top")
+                if b1.button(name, use_container_width=True, key=f"bt_load_strategy_{name}"):
+                    try:
+                        st.session_state["bt_selected_strategy"] = name
+                        st.session_state["bt_strategy_text"] = p.read_text(encoding="utf-8")
+                        st.session_state["bt_strategy_source"] = name
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"读取策略失败: {exc}")
+                if b2.button("✕", use_container_width=True, key=f"bt_close_strategy_{name}"):
+                    try:
+                        _move_strategy_to_trash(p)
+                        if st.session_state.get("bt_selected_strategy") == name:
+                            st.session_state["bt_selected_strategy"] = ""
+                            st.session_state["bt_strategy_text"] = ""
+                            st.session_state["bt_strategy_source"] = "__inline__"
+                        st.success(f"已移入回收站: {name}")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"删除失败: {exc}")
+
+    st.markdown("#### 回收站")
+    trash_files = sorted([p for p in BACKTEST_STRATEGY_TRASH_DIR.glob("*.yaml") if p.is_file()], reverse=True)
+    if trash_files:
+        t1, t2, t3 = st.columns([2.4, 1.0, 1.0], vertical_alignment="bottom")
+        trash_name = t1.selectbox("回收站文件", options=[p.name for p in trash_files], key="bt_trash_selected")
+        if t2.button("恢复", use_container_width=True, key="bt_trash_restore"):
+            src = BACKTEST_STRATEGY_TRASH_DIR / trash_name
+            raw_name = trash_name.split("__", 1)[0] + ".yaml"
+            dst = BACKTEST_STRATEGY_DIR / raw_name
+            if dst.exists():
+                dst = BACKTEST_STRATEGY_DIR / f"{dst.stem}_restored_{datetime.now().strftime('%H%M%S')}{dst.suffix}"
+            try:
+                shutil.move(str(src), str(dst))
+                st.success(f"已恢复: {dst.name}")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"恢复失败: {exc}")
+        if t3.button("清空回收站", use_container_width=True, key="bt_trash_clear"):
+            err = None
+            for fp in trash_files:
+                try:
+                    fp.unlink(missing_ok=True)
+                except Exception as exc:
+                    err = exc
+            if err:
+                st.error(f"清空失败: {err}")
+            else:
+                st.success("回收站已清空。")
+                st.rerun()
+    else:
+        st.caption("回收站为空。")
+
+    st.markdown("### 策略输入（直接粘贴即可）")
+    st.caption("把你的完整 YAML 直接贴进来，点击“粘贴策略并运行”即可，无需手动改文件。")
+    st.text_area(
+        "策略YAML",
+        height=420,
+        key="bt_strategy_text",
+    )
+    s1, s2 = st.columns([1.2, 2.2], vertical_alignment="bottom")
+    save_name = s1.text_input("保存文件名（可选）", value="", key="bt_save_name")
+    if s2.button("保存到策略库", use_container_width=True, key="bt_save_strategy_text"):
+        text = (st.session_state.get("bt_strategy_text") or "").strip()
+        if not text:
+            st.error("策略文本为空，无法保存。")
+        else:
+            raw = (save_name or "").strip()
+            safe = raw or "my_strategy.yaml"
+            # 允许中文等Unicode文件名，仅替换文件系统常见非法字符。
+            safe = re.sub(r'[\\/:*?"<>|\x00-\x1f]', '_', safe)
+            safe = safe.strip().strip(".")
+            if not safe:
+                safe = "my_strategy.yaml"
+            if not safe.lower().endswith((".yaml", ".yml")):
+                safe = f"{safe}.yaml"
+            target = BACKTEST_STRATEGY_DIR / safe
+            try:
+                target.write_text(text, encoding="utf-8")
+                st.success(f"已保存策略: {target.name}")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"保存失败: {exc}")
 
     c1, c2, c3, c4 = st.columns(4)
     if c1.button("安装回测依赖", use_container_width=True, key="bt_install_deps"):
         _run_cmd([sys.executable, "-m", "pip", "install", "-r", "requirements.txt"], "安装依赖")
     if c2.button("校验Universe", use_container_width=True, key="bt_validate_universe"):
+        # 自动补齐当前策略中的缺失代码，减少手工维护 universe。
+        strategy_text_for_fill = (st.session_state.get("bt_strategy_text") or "").strip()
+        if not strategy_text_for_fill and selected_cfg:
+            try:
+                strategy_text_for_fill = (BACKTEST_STRATEGY_DIR / selected_cfg).read_text(encoding="utf-8")
+            except Exception:
+                strategy_text_for_fill = ""
+
+        if strategy_text_for_fill:
+            codes = _extract_strategy_codes(strategy_text_for_fill)
+            if codes:
+                added_codes, err = _autofill_universe_by_codes(codes)
+                if err:
+                    st.warning(err)
+                elif added_codes:
+                    preview = ", ".join(added_codes[:8])
+                    suffix = " ..." if len(added_codes) > 8 else ""
+                    st.success(f"已自动补齐 {len(added_codes)} 个代码到 universe（auto_import/from_strategy）：{preview}{suffix}")
         _run_cmd([sys.executable, "run_backtest.py", "--validate-universe"], "校验Universe")
     if c3.button("更新缓存数据", use_container_width=True, key="bt_update_data"):
         _run_cmd([sys.executable, "run_backtest.py", "--update-data-only", "--start", "2021-01-01", "--end", "today"], "更新缓存")
-    if c4.button("运行回测", type="primary", use_container_width=True, key="bt_run"):
-        _run_cmd(
-            [
-                sys.executable,
-                "run_backtest.py",
-                "--config",
-                f"config/strategies/{selected_cfg}",
-                "--output",
-                "reports",
-                "--no-browser",
-            ],
-            "运行回测",
-        )
-
-    render_status_row(
-        (
-            ("模块目录", str(BACKTEST_DIR)),
-            ("策略文件数", str(len(strategy_files))),
-            ("报告目录", str(BACKTEST_REPORT_DIR)),
-            ("Python", sys.executable),
-        )
-    )
+    if c4.button("运行选中文件", use_container_width=True, key="bt_run", disabled=not bool(selected_cfg)):
+        if not selected_cfg:
+            st.error("当前没有策略文件，请先在下方保存一个策略到策略库。")
+        else:
+            _run_cmd(
+                [
+                    sys.executable,
+                    "run_backtest.py",
+                    "--config",
+                    f"config/strategies/{selected_cfg}",
+                    "--output",
+                    "reports",
+                    "--no-browser",
+                ],
+                "运行回测",
+            )
+    if st.button("粘贴策略并运行", type="primary", use_container_width=True, key="bt_run_pasted"):
+        strategy_text = (st.session_state.get("bt_strategy_text") or "").strip()
+        if not strategy_text:
+            st.error("请先粘贴策略 YAML。")
+        else:
+            pasted_path = BACKTEST_STRATEGY_DIR / "_pasted_strategy_from_ui.yaml"
+            try:
+                pasted_path.write_text(strategy_text, encoding="utf-8")
+                _run_cmd(
+                    [
+                        sys.executable,
+                        "run_backtest.py",
+                        "--config",
+                        f"config/strategies/{pasted_path.name}",
+                        "--output",
+                        "reports",
+                        "--no-browser",
+                    ],
+                    "运行粘贴策略",
+                )
+            except Exception as exc:
+                st.error(f"写入粘贴策略失败: {exc}")
 
     console_output = st.session_state.get("bt_console_output", "")
     if console_output:
@@ -2094,15 +2449,22 @@ def _render_backtest_page():
     if reports:
         latest = reports[0]
         st.success(f"最新报告: {latest.name}")
-        st.download_button(
-            "下载最新报告HTML",
-            data=latest.read_bytes(),
-            file_name=latest.name,
-            mime="text/html",
-            use_container_width=True,
-            key="bt_download_latest",
-        )
-        if st.checkbox("页面内预览最新报告", value=False, key="bt_preview_latest"):
+        preview_label = "打开页面内预览最新报告" if not st.session_state.get("bt_preview_latest_open", False) else "关闭页面内预览最新报告"
+        pb1, pb2 = st.columns(2)
+        with pb1:
+            if st.button(preview_label, use_container_width=True, key="bt_toggle_latest_preview"):
+                st.session_state["bt_preview_latest_open"] = not bool(st.session_state.get("bt_preview_latest_open", False))
+                st.rerun()
+        with pb2:
+            st.download_button(
+                "下载最新报告HTML",
+                data=latest.read_bytes(),
+                file_name=latest.name,
+                mime="text/html",
+                use_container_width=True,
+                key="bt_download_latest",
+            )
+        if st.session_state.get("bt_preview_latest_open", False):
             try:
                 html(latest.read_text(encoding="utf-8"), height=920, scrolling=True)
             except Exception as exc:
@@ -2122,6 +2484,331 @@ def _render_backtest_page():
             st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
     else:
         st.info("暂未找到回测报告，请先点击“运行回测”。")
+
+
+def _render_paper_page():
+    render_section_intro(
+        "模拟实盘",
+        "按策略逐日推进模拟持仓，记录交易与快照；入口即策略，先启动，后续逐日更新。",
+        kicker="Paper",
+        pills=("策略入口", "逐日更新", "看板输出"),
+    )
+
+    if "paper_console_output" not in st.session_state:
+        st.session_state["paper_console_output"] = ""
+
+    BACKTEST_PAPER_DIR.mkdir(parents=True, exist_ok=True)
+    strategy_files = sorted(
+        [p for p in BACKTEST_STRATEGY_DIR.glob("*.yaml") if p.is_file()],
+        key=lambda p: (p.stat().st_mtime, p.name.lower()),
+        reverse=True,
+    )
+    if not strategy_files:
+        st.info("当前没有策略文件，请先在回测系统里保存策略。")
+        return
+    if not BACKTEST_PAPER_RUNNER.exists():
+        st.error(f"未找到模拟实盘入口: {BACKTEST_PAPER_RUNNER}")
+        return
+
+    st.markdown(
+        """
+        <style>
+        .paper-card-wrap {
+          border: 1px solid rgba(255,255,255,0.08);
+          border-radius: 14px;
+          padding: 14px 14px 10px 14px;
+          background: rgba(14, 25, 42, 0.38);
+          min-height: 196px;
+          display: flex;
+          flex-direction: column;
+          gap: 8px;
+        }
+        .paper-card-title {
+          font-size: 1.12rem;
+          font-weight: 700;
+          line-height: 1.25;
+          color: rgba(245, 248, 255, 0.96);
+          min-height: 2.6rem;
+          display: -webkit-box;
+          -webkit-line-clamp: 2;
+          -webkit-box-orient: vertical;
+          overflow: hidden;
+        }
+        .paper-card-desc {
+          color: rgba(210, 218, 232, 0.82);
+          font-size: 0.95rem;
+          line-height: 1.45;
+          min-height: 2.8rem;
+          max-height: 2.8rem;
+          display: -webkit-box;
+          -webkit-line-clamp: 2;
+          -webkit-box-orient: vertical;
+          overflow: hidden;
+        }
+        .paper-card-meta {
+          color: rgba(186, 198, 220, 0.86);
+          font-size: 0.92rem;
+          min-height: 1.5rem;
+          white-space: nowrap;
+          overflow: hidden;
+          text-overflow: ellipsis;
+        }
+        [class*="st-key-paper_action_"] div.stButton > button {
+          min-height: 2.15rem !important;
+          border-radius: 10px !important;
+          font-size: 1.02rem !important;
+          font-weight: 700 !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    def _paper_run_id_from_strategy(filename: str) -> str:
+        stem = Path(filename).stem
+        safe = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", stem)
+        safe = re.sub(r"\s+", "", safe).strip("._")
+        return f"pt_{safe or 'strategy'}"
+
+    def _run_paper_cmd(cmd: list[str], label: str) -> bool:
+        with st.spinner(f"{label} 执行中..."):
+            try:
+                proc = subprocess.run(
+                    cmd,
+                    cwd=str(BACKTEST_DIR),
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=1800,
+                )
+                output = (proc.stdout or "") + ("\n" + proc.stderr if proc.stderr else "")
+                st.session_state["paper_console_output"] = output.strip()
+                if proc.returncode == 0:
+                    st.success(f"{label} 完成")
+                    return True
+                st.error(f"{label} 失败（exit={proc.returncode}）")
+                return False
+            except Exception as exc:
+                st.error(f"{label} 异常: {exc}")
+                return False
+
+    def _auto_sync_dashboard(strategy_paths: list[Path]) -> None:
+        """Auto rebuild paper dashboard when strategy files changed."""
+        if not BACKTEST_PAPER_RUNNER.exists():
+            return
+        need_sync = False
+        if not BACKTEST_PAPER_DASHBOARD.exists():
+            need_sync = True
+        else:
+            try:
+                dash_mtime = BACKTEST_PAPER_DASHBOARD.stat().st_mtime
+                watched = [BACKTEST_PAPER_ACTIVE, *strategy_paths]
+                for p in watched:
+                    if p.exists() and p.stat().st_mtime > dash_mtime:
+                        need_sync = True
+                        break
+            except Exception:
+                need_sync = True
+        if not need_sync:
+            return
+        try:
+            proc = subprocess.run(
+                [sys.executable, "paper_trade.py", "dashboard"],
+                cwd=str(BACKTEST_DIR),
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=1800,
+            )
+            output = (proc.stdout or "") + ("\n" + proc.stderr if proc.stderr else "")
+            if proc.returncode != 0:
+                st.session_state["paper_console_output"] = output.strip()
+                st.warning("自动同步模拟看板失败，请手动点击“重建模拟看板”。")
+        except Exception:
+            st.warning("自动同步模拟看板异常，请手动点击“重建模拟看板”。")
+
+    def _load_paper_active_map() -> dict:
+        if not BACKTEST_PAPER_ACTIVE.exists():
+            return {}
+        try:
+            obj = json.loads(BACKTEST_PAPER_ACTIVE.read_text(encoding="utf-8"))
+            if not isinstance(obj, list):
+                return {}
+            out = {}
+            for item in obj:
+                if isinstance(item, dict):
+                    rid = str(item.get("run_id", "")).strip()
+                    if rid:
+                        out[rid] = item
+            return out
+        except Exception:
+            return {}
+
+    def _strategy_meta(path: Path) -> tuple[str, str]:
+        strategy_name = path.stem
+        description = ""
+        try:
+            raw = path.read_text(encoding="utf-8", errors="replace")
+            m1 = re.search(r'^\s*strategy_name\s*:\s*["\']?(.*?)["\']?\s*$', raw, flags=re.MULTILINE)
+            if m1:
+                strategy_name = (m1.group(1) or "").strip() or strategy_name
+            m2 = re.search(r'^\s*description\s*:\s*["\']?(.*?)["\']?\s*$', raw, flags=re.MULTILINE)
+            if m2:
+                description = (m2.group(1) or "").strip()
+        except Exception:
+            pass
+        return strategy_name, description
+
+    def _paper_summary(run_id: str, row) -> str:
+        if not row:
+            return f"未创建（run_id={run_id}）"
+        last_date = str(row.get("last_update_date", "")).strip() or "-"
+        status = str(row.get("status", "active")).strip() or "active"
+        run_dir = Path(str(row.get("run_dir", "")).strip())
+        snap = run_dir / "snapshots.csv"
+        if snap.exists():
+            try:
+                sdf = pd.read_csv(snap)
+                if not sdf.empty:
+                    last = sdf.iloc[-1]
+                    eq = float(last.get("equity", float("nan")))
+                    cr = float(last.get("cum_return", float("nan")))
+                    eq_txt = "-" if not np.isfinite(eq) else f"{eq:,.0f} HKD"
+                    cr_txt = "-" if not np.isfinite(cr) else f"{cr:.2%}"
+                    return f"{status} | {last_date} | 权益 {eq_txt} | 收益 {cr_txt}"
+            except Exception:
+                pass
+        return f"{status} | 最新 {last_date}"
+
+    active_map = _load_paper_active_map()
+    _auto_sync_dashboard(strategy_files)
+
+    active_rows = []
+    for rid, row in active_map.items():
+        run_dir = Path(str(row.get("run_dir", "")).strip())
+        eq = float("nan")
+        cr = float("nan")
+        snap = run_dir / "snapshots.csv"
+        if snap.exists():
+            try:
+                sdf = pd.read_csv(snap)
+                if not sdf.empty:
+                    last = sdf.iloc[-1]
+                    eq = float(last.get("equity", float("nan")))
+                    cr = float(last.get("cum_return", float("nan")))
+            except Exception:
+                pass
+        active_rows.append((rid, row, eq, cr))
+
+    total_equity = float(sum(x[2] for x in active_rows if np.isfinite(x[2])))
+    weighted_initial = float(sum((x[2] / (1.0 + x[3])) for x in active_rows if np.isfinite(x[2]) and np.isfinite(x[3]) and (1.0 + x[3]) != 0.0))
+    total_cum = (total_equity / weighted_initial - 1.0) if weighted_initial > 0 else float("nan")
+
+    h1, h2 = st.columns(2)
+    if h1.button("更新全部活跃模拟盘", use_container_width=True, key="paper_update_all"):
+        _run_paper_cmd([sys.executable, "paper_trade.py", "update", "--all", "--as-of", "today"], "更新全部活跃模拟盘")
+        st.rerun()
+    if h2.button("刷新状态", use_container_width=True, key="paper_refresh_state"):
+        st.rerun()
+
+    render_status_row(
+        (
+            ("活跃策略", str(len(active_rows))),
+            ("总权益(HKD)", "-" if not np.isfinite(total_equity) else f"{total_equity:,.2f}"),
+            ("总收益", "-" if not np.isfinite(total_cum) else f"{total_cum:.2%}"),
+        )
+    )
+
+    with st.expander("策略入口（单动作）", expanded=False):
+        per_row = 3
+        for start in range(0, len(strategy_files), per_row):
+            chunk = strategy_files[start : start + per_row]
+            cols = st.columns(per_row, vertical_alignment="top")
+            for idx, p in enumerate(chunk):
+                name = p.name
+                run_id = _paper_run_id_from_strategy(name)
+                row = active_map.get(run_id)
+                sname, sdesc = _strategy_meta(p)
+                with cols[idx]:
+                    st.markdown(
+                        f"""
+                        <div class="paper-card-wrap">
+                          <div class="paper-card-title">{sname}</div>
+                          <div class="paper-card-desc">{sdesc or "无策略说明"}</div>
+                          <div class="paper-card-meta">{_paper_summary(run_id, row)}</div>
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+                    action_label = "更新数据" if row else "启动模拟"
+                    if st.button(action_label, use_container_width=True, key=f"paper_action_{name}"):
+                        if row:
+                            _run_paper_cmd(
+                                [
+                                    sys.executable,
+                                    "paper_trade.py",
+                                    "update",
+                                    "--run-id",
+                                    run_id,
+                                    "--as-of",
+                                    "today",
+                                ],
+                                f"模拟更新({name})",
+                            )
+                        else:
+                            _run_paper_cmd(
+                                [
+                                    sys.executable,
+                                    "paper_trade.py",
+                                    "start",
+                                    "--config",
+                                    f"config/strategies/{name}",
+                                    "--run-id",
+                                    run_id,
+                                    "--as-of",
+                                    "today",
+                                ],
+                                f"模拟启动({name})",
+                            )
+                        st.rerun()
+
+    with st.expander("低频操作", expanded=False):
+        if st.button("重建模拟看板", use_container_width=True, key="paper_build_dashboard"):
+            _run_paper_cmd([sys.executable, "paper_trade.py", "dashboard"], "重建模拟看板")
+            st.rerun()
+        render_status_row(
+            (
+                ("模块目录", str(BACKTEST_DIR)),
+                ("模拟盘目录", str(BACKTEST_PAPER_DIR)),
+                ("Python", sys.executable),
+            )
+        )
+
+    if BACKTEST_PAPER_DASHBOARD.exists():
+        with st.expander("模拟盘管理中心", expanded=False):
+            try:
+                html(BACKTEST_PAPER_DASHBOARD.read_text(encoding="utf-8"), height=1500, scrolling=True)
+            except Exception as exc:
+                st.warning(f"看板预览失败: {exc}")
+        st.download_button(
+            "下载模拟看板HTML",
+            data=BACKTEST_PAPER_DASHBOARD.read_bytes(),
+            file_name=BACKTEST_PAPER_DASHBOARD.name,
+            mime="text/html",
+            use_container_width=True,
+            key="paper_download_dashboard",
+        )
+    else:
+        if st.button("生成模拟看板", use_container_width=True, key="paper_build_dashboard_init"):
+            _run_paper_cmd([sys.executable, "paper_trade.py", "dashboard"], "生成模拟看板")
+            st.rerun()
+
+    console_output = st.session_state.get("paper_console_output", "")
+    if console_output:
+        st.caption("最近一次模拟命令输出")
+        st.code(console_output, language="bash")
 
 
 def _analysis_job_file(job_id: str) -> str:
@@ -2508,6 +3195,9 @@ if st.session_state.get("active_page") == "filter":
     st.stop()
 if st.session_state.get("active_page") == "backtest":
     _render_backtest_page()
+    st.stop()
+if st.session_state.get("active_page") == "paper":
+    _render_paper_page()
     st.stop()
 
 
