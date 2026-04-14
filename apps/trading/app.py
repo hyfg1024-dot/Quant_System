@@ -49,6 +49,7 @@ except Exception as _exc:  # pragma: no cover - 依赖缺失时兜底
 from fast_engine import fetch_fast_panel
 from slow_engine import (
     add_stock_by_query,
+    fetch_live_valuation_snapshot,
     get_stock_pool,
     get_latest_fundamental_snapshot,
     get_stock_group_map,
@@ -3318,11 +3319,45 @@ def _render_fast_panel(selected_code: str, selected_name: str, panel=None):
         return
 
     selected_slow = next((r for r in rows if str(r.get("code")) == str(selected_code)), {})
+    live_val = fetch_live_valuation_snapshot(selected_code)
+    quote_pe_dynamic = quote.get("pe_dynamic")
+    quote_pb = quote.get("pb")
+    quote_pe_ttm = quote.get("pe_ttm")
+    pe_dynamic_live = (
+        quote_pe_dynamic
+        if quote_pe_dynamic is not None
+        else live_val.get("pe_dynamic")
+        if isinstance(live_val, dict)
+        else selected_slow.get("pe_dynamic")
+    )
+    pe_static_live = (
+        (live_val.get("pe_static") if isinstance(live_val, dict) else None)
+        if (isinstance(live_val, dict) and live_val.get("pe_static") is not None)
+        else (quote_pe_ttm if quote_pe_ttm is not None else selected_slow.get("pe_static"))
+    )
+    pe_rolling_live = (
+        (live_val.get("pe_rolling") if isinstance(live_val, dict) else None)
+        if (isinstance(live_val, dict) and live_val.get("pe_rolling") is not None)
+        else (quote_pe_ttm if quote_pe_ttm is not None else selected_slow.get("pe_rolling"))
+    )
+    pb_live = (
+        quote_pb
+        if quote_pb is not None
+        else live_val.get("pb")
+        if isinstance(live_val, dict)
+        else selected_slow.get("pb")
+    )
+    dy_live = (
+        live_val.get("dividend_yield")
+        if isinstance(live_val, dict) and live_val.get("dividend_yield") is not None
+        else selected_slow.get("dividend_yield")
+    )
     sell_lv_for_json = sorted(order_book_5.get("sell", []), key=lambda x: int(x.get("level", 0)))
     buy_lv_for_json = sorted(order_book_5.get("buy", []), key=lambda x: int(x.get("level", 0)))
     sell_total_for_json = sum(float(r.get("volume_lot") or 0) for r in sell_lv_for_json)
     buy_total_for_json = sum(float(r.get("volume_lot") or 0) for r in buy_lv_for_json)
     ofi_for_json = (buy_total_for_json / sell_total_for_json) if sell_total_for_json > 0 else None
+    weibi_for_json = ((buy_total_for_json - sell_total_for_json) / (buy_total_for_json + sell_total_for_json) * 100) if (buy_total_for_json + sell_total_for_json) > 0 else None
     ask1_for_json = next((r.get("price") for r in sell_lv_for_json if int(r.get("level", 0)) == 1), None)
     bid1_for_json = next((r.get("price") for r in buy_lv_for_json if int(r.get("level", 0)) == 1), None)
     spread_for_json = (
@@ -3354,15 +3389,16 @@ def _render_fast_panel(selected_code: str, selected_name: str, panel=None):
             "buy_total_lot": buy_total_for_json,
             "sell_total_lot": sell_total_for_json,
             "imbalance_bid_ask": ofi_for_json,
+            "weibi_pct": weibi_for_json,
             "spread": spread_for_json,
             "order_diff": quote.get("order_diff"),
         },
         "valuation": {
-            "pe_dynamic": selected_slow.get("pe_dynamic"),
-            "pe_static": selected_slow.get("pe_static"),
-            "pe_rolling": selected_slow.get("pe_rolling"),
-            "pb": selected_slow.get("pb"),
-            "dividend_yield": selected_slow.get("dividend_yield"),
+            "pe_dynamic": pe_dynamic_live,
+            "pe_static": pe_static_live,
+            "pe_rolling": pe_rolling_live,
+            "pb": pb_live,
+            "dividend_yield": dy_live,
             "total_market_value_yi": quote.get("total_market_value_yi"),
             "float_market_value_yi": quote.get("float_market_value_yi"),
         },
@@ -3406,6 +3442,7 @@ def _render_fast_panel(selected_code: str, selected_name: str, panel=None):
     st.markdown('<div class="subsection-divider"></div>', unsafe_allow_html=True)
     head_left, head_right = st.columns([3.2, 1], vertical_alignment="center")
     copy_slot = None
+    q_time = _format_display_time(quote.get("quote_time"))
     if price_now is not None:
         with head_left:
             st.markdown(
@@ -3418,7 +3455,6 @@ def _render_fast_panel(selected_code: str, selected_name: str, panel=None):
                 """,
                 unsafe_allow_html=True,
             )
-            q_time = _format_display_time(quote.get("quote_time"))
             st.caption(f"更新时间: {q_time if q_time else 'N/A'}")
     with head_right:
         copy_slot = st.container()
@@ -3525,11 +3561,11 @@ def _render_fast_panel(selected_code: str, selected_name: str, panel=None):
     boll_bw = active_ind.get("boll_bandwidth", ind.get("boll_bandwidth"))
     ref_val = quote.get("prev_close")
     boll_val = selected_slow.get("boll_index")
-    pe_dynamic = selected_slow.get("pe_dynamic")
-    pe_static = selected_slow.get("pe_static")
-    pe_rolling = selected_slow.get("pe_rolling")
-    pb_val = selected_slow.get("pb")
-    dy_val = selected_slow.get("dividend_yield")
+    pe_dynamic = pe_dynamic_live
+    pe_static = pe_static_live
+    pe_rolling = pe_rolling_live
+    pb_val = pb_live
+    dy_val = dy_live
 
     open_val = quote.get("open")
     high_val = quote.get("high")
@@ -3539,13 +3575,23 @@ def _render_fast_panel(selected_code: str, selected_name: str, panel=None):
     premium_pct = quote.get("premium_pct")
     amplitude_pct = quote.get("amplitude_pct")
     turnover_rate = quote.get("turnover_rate")
+    turnover_rate_estimated = bool(quote.get("turnover_rate_estimated", False))
     volume_ratio = quote.get("volume_ratio")
     total_mv = quote.get("total_market_value_yi")
     float_mv = quote.get("float_market_value_yi")
     order_diff = quote.get("order_diff")
 
     volume_shares = quote.get("volume")
-    volume_lot = (float(volume_shares) / 100.0) if volume_shares is not None else None
+    is_hk_code = str(selected_code).isdigit() and len(str(selected_code)) == 5
+    if volume_shares is not None:
+        volume_display = float(volume_shares) if is_hk_code else (float(volume_shares) / 100.0)
+    else:
+        volume_display = None
+    volume_label = "成交量(股)" if is_hk_code else "成交量(手)"
+    amount_label = "成交额(HKD)" if is_hk_code else "成交额(元)"
+    turnover_label = "换手率(估算)" if turnover_rate_estimated else "换手率"
+    volume_ratio_label = "量比(接口口径)" if is_hk_code else "量比"
+    orderbook_unit = "档位量(接口口径)" if is_hk_code else "手"
     amount_yuan = quote.get("amount")
 
     macd_tf_val = active_ind.get("macd_hist", macd_val)
@@ -3560,6 +3606,7 @@ def _render_fast_panel(selected_code: str, selected_name: str, panel=None):
     sell_total = sum(float(r.get("volume_lot") or 0) for r in sell_lv)
     buy_total = sum(float(r.get("volume_lot") or 0) for r in buy_lv)
     ofi = (buy_total / sell_total) if sell_total > 0 else None
+    weibi = ((buy_total - sell_total) / (buy_total + sell_total) * 100) if (buy_total + sell_total) > 0 else None
     ask1 = _find_level(sell_lv, 1).get("price")
     bid1 = _find_level(buy_lv, 1).get("price")
     spread = (float(ask1) - float(bid1)) if (ask1 is not None and bid1 is not None) else None
@@ -3587,10 +3634,10 @@ def _render_fast_panel(selected_code: str, selected_name: str, panel=None):
         (
             "成交活跃",
             [
-                ("成交量(手)", _fmt_lot(volume_lot)),
-                ("成交额(元)", _fmt_amount_yuan(amount_yuan)),
-                ("量比", _fmt(volume_ratio, 2)),
-                ("换手率", _fmt_pct(turnover_rate, 2)),
+                (volume_label, _fmt_lot(volume_display)),
+                (amount_label, _fmt_amount_yuan(amount_yuan)),
+                (volume_ratio_label, _fmt(volume_ratio, 2)),
+                (turnover_label, _fmt_pct(turnover_rate, 2)),
             ],
             "",
         ),
@@ -3608,7 +3655,8 @@ def _render_fast_panel(selected_code: str, selected_name: str, panel=None):
             [
                 ("买总量", _fmt_lot(buy_total)),
                 ("卖总量", _fmt_lot(sell_total)),
-                ("失衡比(B/A)", _fmt(ofi, 2)),
+                ("买卖比(B/A)", _fmt(ofi, 2)),
+                ("委比", _fmt_signed_pct(weibi, 2)),
                 ("买卖价差", _fmt(spread, 3)),
                 ("委差", _fmt_signed(order_diff, 0)),
             ],
@@ -3684,10 +3732,16 @@ def _render_fast_panel(selected_code: str, selected_name: str, panel=None):
             "quote_time": quote.get("quote_time"),
         },
         "trading": {
-            "volume_lot": volume_lot,
+            "volume_lot": volume_display,
+            "volume_shares": volume_shares,
+            "volume_display_label": volume_label,
+            "amount_display_label": amount_label,
             "amount_yuan": amount_yuan,
+            "volume_ratio_label": volume_ratio_label,
             "volume_ratio": volume_ratio,
+            "turnover_label": turnover_label,
             "turnover_rate": turnover_rate,
+            "turnover_rate_estimated": turnover_rate_estimated,
             "vwap": vwap_val,
             "premium_pct": premium_pct,
             "amplitude_pct": amplitude_pct,
@@ -3696,6 +3750,7 @@ def _render_fast_panel(selected_code: str, selected_name: str, panel=None):
             "buy_total_lot": buy_total,
             "sell_total_lot": sell_total,
             "imbalance_bid_ask": ofi,
+            "weibi_pct": weibi,
             "spread": spread,
             "order_diff": order_diff,
         },
@@ -3850,7 +3905,7 @@ def _render_fast_panel(selected_code: str, selected_name: str, panel=None):
             st.altair_chart(chart, use_container_width=True)
 
     with right:
-        st.markdown('<div class="panel-title">实时盘口<span class="unit-sub">单位：手</span></div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="panel-title">实时盘口<span class="unit-sub">单位：{orderbook_unit}</span></div>', unsafe_allow_html=True)
         sell_df = pd.DataFrame(order_book_5.get("sell", []))
         buy_df = pd.DataFrame(order_book_5.get("buy", []))
 

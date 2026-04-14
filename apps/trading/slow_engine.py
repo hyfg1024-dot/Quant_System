@@ -498,6 +498,71 @@ def _fetch_dividend_yield_from_em(symbol: str) -> Optional[float]:
         return None
 
 
+def fetch_live_valuation_snapshot(symbol: str) -> Dict[str, Optional[float]]:
+    """
+    仅拉取实时估值快照，不写库。
+    用于交易页实时展示，避免慢库口径/时点偏差。
+    """
+    symbol = str(symbol).strip()
+    pe_dynamic = None
+    pe_static = None
+    pe_rolling = None
+    pb = None
+    dividend_yield = None
+
+    if _is_hk_symbol(symbol):
+        hk_metrics = _fetch_hk_metrics_from_em(symbol)
+        pe_dynamic = hk_metrics.get("pe_dynamic")
+        pe_static = hk_metrics.get("pe_static")
+        pe_rolling = hk_metrics.get("pe_rolling")
+        pb = hk_metrics.get("pb")
+        dividend_yield = hk_metrics.get("dividend_yield")
+
+        tx_metrics = _fetch_metrics_from_tencent(symbol)
+        if pe_dynamic is None:
+            pe_dynamic = tx_metrics.get("pe_dynamic")
+        if pe_rolling is None:
+            pe_rolling = tx_metrics.get("pe_rolling")
+        if pb is None:
+            pb = tx_metrics.get("pb")
+
+        if pe_rolling is None:
+            pe_rolling = _fetch_hk_valuation_from_baidu(symbol, "市盈率(TTM)")
+        if pb is None:
+            pb = _fetch_hk_valuation_from_baidu(symbol, "市净率")
+    else:
+        em_metrics = _fetch_metrics_from_eastmoney_direct(symbol)
+        pe_dynamic = em_metrics.get("pe_dynamic")
+        pe_static = em_metrics.get("pe_static")
+        pe_rolling = em_metrics.get("pe_rolling")
+        pb = em_metrics.get("pb")
+
+        tx_metrics = _fetch_metrics_from_tencent(symbol)
+        if pe_dynamic is None:
+            pe_dynamic = tx_metrics.get("pe_dynamic")
+        if pe_rolling is None:
+            pe_rolling = tx_metrics.get("pe_rolling")
+        if pb is None:
+            pb = tx_metrics.get("pb")
+
+        if pb is None:
+            pb = _fetch_pb_from_baidu(symbol)
+        dividend_yield = _fetch_dividend_yield_from_em(symbol)
+
+    pe_ttm = pe_rolling
+    pe = pe_rolling if pe_rolling is not None else pe_dynamic
+    return {
+        "code": symbol,
+        "pe": pe,
+        "pe_ttm": pe_ttm,
+        "pe_dynamic": pe_dynamic,
+        "pe_static": pe_static,
+        "pe_rolling": pe_rolling,
+        "pb": pb,
+        "dividend_yield": dividend_yield,
+    }
+
+
 def _fetch_related_commodity_prices(symbol: str) -> Dict[str, Dict[str, Optional[float]]]:
     # Sina 内盘连续合约代码；不同品种可按策略需要继续扩展。
     contracts_map = {

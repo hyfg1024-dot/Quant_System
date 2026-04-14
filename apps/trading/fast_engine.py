@@ -80,8 +80,9 @@ def _parse_tencent_fields(symbol: str, fields: List[str]) -> Dict:
     name = fields[1].strip() or symbol
     current_price = _to_float(fields[3])
     prev_close = _to_float(fields[4])
-    volume_lot = _to_float(fields[36])  # 手
-    amount_wan = _to_float(fields[37])  # 万元
+    is_hk = str(symbol).isdigit() and len(str(symbol)) == 5
+    volume_raw = _to_float(fields[36])
+    amount_raw = _to_float(fields[37])
     quote_time = fields[30].strip()
 
     change_amount = _to_float(fields[31])
@@ -90,8 +91,15 @@ def _parse_tencent_fields(symbol: str, fields: List[str]) -> Dict:
     if current_price is None and prev_close is not None:
         current_price = prev_close
 
-    volume = volume_lot * 100 if volume_lot is not None else None
-    amount = amount_wan * 10000 if amount_wan is not None else None
+    # 口径差异：
+    # A股: f36=手, f37=万元
+    # 港股: f36=股, f37=成交额(港币)
+    if is_hk:
+        volume = volume_raw
+        amount = amount_raw
+    else:
+        volume = volume_raw * 100 if volume_raw is not None else None
+        amount = amount_raw * 10000 if amount_raw is not None else None
 
     vwap = _to_float(fields[51])
     if vwap is None:
@@ -124,6 +132,31 @@ def _parse_tencent_fields(symbol: str, fields: List[str]) -> Dict:
         bids_5.append({"level": i + 1, "price": bid_price, "volume_lot": bid_vol})
         asks_5.append({"level": i + 1, "price": ask_price, "volume_lot": ask_vol})
 
+    pe_dynamic = _to_float(fields[52])
+    pe_ttm = _to_float(fields[53])
+    if pe_dynamic is not None and pe_dynamic <= 0:
+        pe_dynamic = None
+    if pe_ttm is not None and pe_ttm <= 0:
+        pe_ttm = None
+
+    turnover_rate = _to_float(fields[38])
+    turnover_rate_estimated = False
+    float_mv_yi = _to_float(fields[44])
+    if (
+        (turnover_rate is None or turnover_rate <= 0)
+        and is_hk
+        and current_price is not None
+        and current_price > 0
+        and volume is not None
+        and volume > 0
+        and float_mv_yi is not None
+        and float_mv_yi > 0
+    ):
+        float_shares = float_mv_yi * 1e8 / current_price
+        if float_shares > 0:
+            turnover_rate = volume / float_shares * 100
+            turnover_rate_estimated = True
+
     return {
         "symbol": symbol,
         "name": name,
@@ -136,18 +169,19 @@ def _parse_tencent_fields(symbol: str, fields: List[str]) -> Dict:
         "low": _to_float(fields[34]),
         "volume": volume,
         "amount": amount,
-        "turnover_rate": _to_float(fields[38]),
+        "turnover_rate": turnover_rate,
+        "turnover_rate_estimated": turnover_rate_estimated,
         "amplitude_pct": _to_float(fields[43]),
-        "float_market_value_yi": _to_float(fields[44]),
+        "float_market_value_yi": float_mv_yi,
         "total_market_value_yi": _to_float(fields[45]),
         "volume_ratio": _to_float(fields[49]),
         "order_diff": _to_float(fields[50]),
         "vwap": vwap,
         "premium_pct": premium_pct,
         "quote_time": quote_time,
-        "is_trading_data": bool(volume_lot and volume_lot > 0),
-        "pe_dynamic": _to_float(fields[52]),
-        "pe_ttm": _to_float(fields[53]),
+        "is_trading_data": bool(volume and volume > 0),
+        "pe_dynamic": pe_dynamic,
+        "pe_ttm": pe_ttm,
         "pb": _to_float(fields[46]),
         "order_book_5": {"buy": bids_5, "sell": asks_5},
         "order_book_10": _build_order_book_10(bids_5, asks_5),
@@ -189,6 +223,7 @@ def fetch_realtime_quote(symbol: str) -> Dict:
             "volume": None,
             "amount": None,
             "turnover_rate": None,
+            "turnover_rate_estimated": False,
             "amplitude_pct": None,
             "float_market_value_yi": None,
             "total_market_value_yi": None,
@@ -256,7 +291,15 @@ def _calc_rsi(close: pd.Series, period: int = 6) -> pd.Series:
     avg_gain = gain.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
     avg_loss = loss.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
     rs = avg_gain / avg_loss.replace(0, pd.NA)
-    return 100 - (100 / (1 + rs))
+    rsi = 100 - (100 / (1 + rs))
+
+    both_zero = (avg_gain == 0) & (avg_loss == 0)
+    gain_only = (avg_gain > 0) & (avg_loss == 0)
+    loss_only = (avg_gain == 0) & (avg_loss > 0)
+    rsi = rsi.mask(both_zero, 50.0)
+    rsi = rsi.mask(gain_only, 100.0)
+    rsi = rsi.mask(loss_only, 0.0)
+    return rsi
 
 
 def _calc_rsi_set(close: pd.Series) -> Dict[str, Optional[float]]:
@@ -387,7 +430,7 @@ def fetch_multi_timeframe_rsi(symbol: str, intraday_df: Optional[pd.DataFrame] =
         daily_close = _fetch_daily_close_series(symbol, count=320)
         result["day"] = _calc_rsi_set(daily_close)
         result["week"] = _calc_rsi_set(daily_close.resample("W-FRI").last().dropna())
-        result["month"] = _calc_rsi_set(daily_close.resample("M").last().dropna())
+        result["month"] = _calc_rsi_set(daily_close.resample("ME").last().dropna())
     except Exception:
         pass
 
@@ -414,7 +457,7 @@ def fetch_multi_timeframe_indicators(symbol: str, intraday_df: Optional[pd.DataF
         daily_close = _fetch_daily_close_series(symbol, count=320)
         result["day"] = _calc_indicator_set_from_close(daily_close)
         result["week"] = _calc_indicator_set_from_close(daily_close.resample("W-FRI").last().dropna())
-        result["month"] = _calc_indicator_set_from_close(daily_close.resample("M").last().dropna())
+        result["month"] = _calc_indicator_set_from_close(daily_close.resample("ME").last().dropna())
     except Exception:
         pass
 
@@ -430,7 +473,7 @@ def fetch_multi_timeframe_indicators(symbol: str, intraday_df: Optional[pd.DataF
 
 
 def _fetch_hk_daily_ohlcv(symbol: str) -> pd.DataFrame:
-    df = ak.stock_hk_daily(symbol=str(symbol).zfill(5), adjust="")
+    df = ak.stock_hk_daily(symbol=str(symbol).zfill(5), adjust="qfq")
     if df is None or df.empty:
         raise ValueError("No HK daily data")
     required = {"open", "high", "low", "close", "volume"}
