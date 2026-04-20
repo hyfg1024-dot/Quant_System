@@ -1,8 +1,13 @@
 .DS_Store
+.env
+.env.*
 **/venv/
 **/__pycache__/
 **/*.pyc
+data/
+apps/backtest/paper_trades/
 **/data/*.db
+**/data/*.duckdb
 **/data/local_user_prefs.json
 **/data/deepseek_analysis_cache.json
 **/data/deepseek_delta_cache.json

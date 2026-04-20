@@ -1,26 +1,29 @@
 # Quant_System
 
-`Quant_System` 是一个基于 Streamlit 构建的本地量化研究工作台，面向日常股票研究、观察池管理、基本面分析与条件筛选场景。项目目前以 macOS 本地运行方式为主，强调可落地、可视化和低门槛部署。
+`Quant_System` 是一个基于 Streamlit 构建的本地量化研究工作台，面向日常股票研究、盘中交易观察、条件筛选、组合风控与策略回测场景。项目以 macOS 本地运行方式为主，强调可落地、可视化和低门槛部署。
 
 ## 项目概览
 
-当前版本包含 4 个核心模块：
+当前版本包含 6 个核心模块：
 
 | 模块 | 说明 | 入口 |
 | --- | --- | --- |
-| Trading | 交易观察台，聚合行情快照、盘口、分时结构与 DeepSeek 深析流程 | `apps/trading/app.py` |
-| Fundamental | 基本面研究台，提供八维评分、总结文本与 DeepSeek 辅助解读 | `apps/fundamental/app.py` |
-| Filter | 全市场条件筛选器，支持模板化筛选、AI 辅助设定和 Excel 导出 | `apps/filter/app.py` |
-| Backtest | 通用港股多空回测台，支持策略配置、数据更新、执行回测与HTML报告 | `apps/backtest/run_backtest.py` |
+| Trading | 交易面分析台，聚合行情快照、盘口、分时结构与多智能体分析流程 | `apps/trading/app.py` |
+| Fundamental | 基本面研究台，提供八维评分、新闻/研报催化剂摘要与 AI 解读 | `apps/fundamental/app.py` |
+| Filter | 全市场条件筛选器，使用 DuckDB SQL 做快筛、模板保存与导出 | `apps/filter/app.py` |
+| Portfolio | 仓位风控台，管理持仓、浮动盈亏、仓位权重与 ATR 风险约束 | `apps/portfolio/app.py` |
+| Backtest | 通用策略回测台，支持策略配置、数据更新、执行回测与 HTML 报告 | `apps/backtest/run_backtest.py` |
+| Paper Trade | 模拟实盘台，按策略逐日推进模拟持仓并跟踪执行结果 | `apps/backtest/paper_trade.py` |
 
 ## 主要能力
 
 - 多模块本地量化研究界面
 - 股票池管理，支持持仓与观察分组
-- 基本面八维评分与结构化总结
-- DeepSeek 分析接入，支持本地保存用户配置
-- 全市场筛选、模板保存、结果分池与 Excel 导出
-- 通用多空策略回测与交互式报告输出
+- 基本面八维评分、新闻/研报催化剂整合
+- DeepSeek 多智能体分析接入，支持本地保存用户配置
+- DuckDB 本地数据底座与 SQL 条件快筛
+- 仓位风控看板、浮动盈亏与 ATR 仓单规模建议器
+- 通用回测、模拟实盘与交互式报告输出
 - macOS 一键启动脚本与桌面快捷入口
 
 ## 目录结构
@@ -31,9 +34,10 @@ Quant_System/
 │   ├── trading/          # 交易观察模块
 │   ├── fundamental/      # 基本面研究模块
 │   ├── filter/           # 条件筛选模块
-│   └── backtest/         # 回测模块
+│   ├── portfolio/        # 仓位风控模块
+│   └── backtest/         # 回测 / 模拟实盘模块
 ├── shared/               # 共享 UI / 通用逻辑
-├── data/                 # 本地数据、缓存、用户配置
+├── data/                 # 本地数据库、缓存、用户配置（不提交）
 ├── docs/                 # 附加文档
 ├── create_desktop_launcher.command
 └── README.md
@@ -45,6 +49,8 @@ Quant_System/
 - Python 3.9+
 - 终端可用 `python3` 与 `pip`
 - 首次安装依赖时可正常访问 Python 包源
+- 若使用仓位风控 / DuckDB 快筛，需要可安装 `duckdb`
+- 若使用 QMT 数据适配层，需要本机具备 `xtquant` 运行环境
 
 ## 快速开始
 
@@ -66,7 +72,7 @@ xattr -d com.apple.quarantine create_desktop_launcher.command 2>/dev/null || tru
 
 ### 方式二：手动启动模块
 
-#### Trading
+#### Trading / 主控台
 
 ```bash
 cd apps/trading
@@ -93,6 +99,16 @@ cd apps/filter
 python3 -m venv venv
 source venv/bin/activate
 python3 -m pip install -r requirements.txt
+streamlit run app.py
+```
+
+#### Portfolio
+
+```bash
+cd apps/trading
+python3 -m venv venv
+source venv/bin/activate
+python3 -m pip install duckdb streamlit pandas altair
 streamlit run app.py
 ```
 
@@ -129,12 +145,15 @@ chmod +x ~/Desktop/启动Quant_System.command
 
 - DeepSeek 用户名与 API Key 仅保存在本地
 - 本地偏好文件默认位于 `data/local_user_prefs.json`
-- 市场快照、筛选模板和缓存均保存在项目本地目录，不会自动上传到 GitHub
+- DuckDB 数据库默认位于 `data/quant_system.duckdb`
+- 分析缓存、任务文件、回测产物和模拟实盘快照都保存在本地目录，不会自动上传到 GitHub
 
 建议将以下内容视为本地运行态数据，而不是源码的一部分：
 
 - `data/`
+- `apps/backtest/paper_trades/`
 - 各模块下的 `venv/`
+- `.env` / `.env.*`
 - 本地缓存、数据库、导出结果
 
 ## 常见问题
@@ -153,12 +172,13 @@ chmod +x ~/Desktop/启动Quant_System.command
 
 ### 3. API Key 是否会进入仓库
 
-不会。项目默认将本地用户配置与缓存文件排除在 Git 之外。
+不会。项目默认将本地用户配置、运行缓存、DuckDB 数据库和模拟实盘产物排除在 Git 之外。
 
 ## 开发说明
 
 - 项目当前以本地运行和单仓库维护为主
 - UI 共享逻辑位于 `shared/`
+- 数据适配与本地数据库能力位于 `shared/data_provider.py` 与 `shared/db_manager.py`
 - 各模块均可独立启动，也可在主工作流中联动使用
 - 若修改模块逻辑，建议优先在对应 `apps/<module>/` 下完成验证
 
