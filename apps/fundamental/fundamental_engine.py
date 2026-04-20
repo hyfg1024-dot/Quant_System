@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import random
 import re
+import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -12,9 +13,16 @@ from typing import Any, Dict, List, Optional, Tuple
 import akshare as ak
 import pandas as pd
 import requests
+try:  # pragma: no cover - 非 streamlit 场景兜底
+    import streamlit as st
+except Exception:  # pragma: no cover
+    st = None  # type: ignore[assignment]
 
 
-APP_VERSION = "FND-20260324-01"
+APP_VERSION = "FND-20260420-02"
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 ROOT_DIR = Path(__file__).resolve().parent
 DATA_DIR = ROOT_DIR / "data"
 CACHE_DIR = DATA_DIR / "cache"
@@ -26,6 +34,31 @@ DEFAULT_WATCHLIST = [
     {"code": "601088", "name": "中国神华", "type": "持仓"},
     {"code": "603871", "name": "嘉友国际", "type": "观察"},
 ]
+
+FUND_DEEPSEEK_PROMPT = """你是专业基本面分析师。请基于输入 JSON 做结构化输出：
+1) 总结（不超过120字）
+2) 八维点评（每维1句）
+3) 关键风险（3条）
+4) 跟踪清单（3条）
+5) 结论：通过 / 观察 / 谨慎（给出理由）
+
+最新新闻催化：
+{news_catalysts}
+
+机构研报摘要：
+{research_summary}
+
+请结合以上的最新新闻事件，判断目前的估值状态是否已被市场计价，以及未来一周潜在的利好/利空情绪反应方向。
+要求：数据驱动、简洁、中文输出。"""
+
+
+def _cache_data(ttl: int = 3600):
+    def _decorator(func):
+        if st is None:
+            return func
+        return st.cache_data(ttl=ttl, show_spinner=False)(func)
+
+    return _decorator
 
 
 def ensure_dirs() -> None:
@@ -198,6 +231,164 @@ def delete_watch_item(code: str) -> List[Dict[str, str]]:
 
 def _normalize_name(text: str) -> str:
     return re.sub(r"\s+", "", str(text or "")).strip().upper()
+
+
+def _to_datetime(value: Any) -> Optional[datetime]:
+    if value is None:
+        return None
+    try:
+        text = str(value).strip()
+        if text in {"", "None", "nan", "NaT", "<NA>"}:
+            return None
+        ts = pd.to_datetime(value, errors="coerce")
+        if pd.isna(ts):
+            return None
+        if hasattr(ts, "to_pydatetime"):
+            return ts.to_pydatetime()
+        if isinstance(ts, datetime):
+            return ts
+    except Exception:
+        return None
+    return None
+
+
+def _safe_text(value: Any, fallback: str = "--") -> str:
+    if value is None:
+        return fallback
+    try:
+        if pd.isna(value):
+            return fallback
+    except Exception:
+        pass
+    text = str(value).strip()
+    if text in {"", "-", "--", "nan", "None"}:
+        return fallback
+    return text
+
+
+def _fetch_recent_news_titles(symbol: str, days: int = 3, limit: int = 8) -> List[Dict[str, str]]:
+    try:
+        df = retry_call(lambda: ak.stock_news_em(symbol=str(symbol)))
+    except Exception:
+        return []
+    if df is None or df.empty:
+        return []
+
+    frame = df.copy()
+    title_col = next((c for c in ["新闻标题", "标题", "title"] if c in frame.columns), "")
+    time_col = next((c for c in ["发布时间", "日期", "time", "date"] if c in frame.columns), "")
+    src_col = next((c for c in ["文章来源", "来源", "mediaName"] if c in frame.columns), "")
+    if not title_col:
+        return []
+
+    now = datetime.now()
+    out: List[Dict[str, str]] = []
+    seen: set[str] = set()
+    for _, row in frame.iterrows():
+        title = _safe_text(row.get(title_col), fallback="")
+        if not title or title in seen:
+            continue
+        dt = _to_datetime(row.get(time_col)) if time_col else None
+        if dt is not None:
+            if (now - dt).total_seconds() > max(1, int(days)) * 86400:
+                continue
+            published_at = dt.strftime("%Y-%m-%d %H:%M")
+        else:
+            published_at = "--"
+        source = _safe_text(row.get(src_col), fallback="未知来源") if src_col else "未知来源"
+        out.append({"title": title, "published_at": published_at, "source": source})
+        seen.add(title)
+        if len(out) >= max(1, int(limit)):
+            break
+    return out
+
+
+def _fetch_recent_research_summary(symbol: str, top_n: int = 2) -> List[Dict[str, str]]:
+    try:
+        df = retry_call(lambda: ak.stock_research_report_em(symbol=str(symbol)))
+    except Exception:
+        return []
+    if df is None or df.empty:
+        return []
+
+    frame = df.copy()
+    date_col = "日期" if "日期" in frame.columns else ""
+    title_col = "报告名称" if "报告名称" in frame.columns else ""
+    org_col = "机构" if "机构" in frame.columns else ""
+    rating_col = "东财评级" if "东财评级" in frame.columns else ""
+    if not title_col:
+        return []
+
+    if date_col:
+        frame["_report_date"] = pd.to_datetime(frame[date_col], errors="coerce")
+        frame = frame.sort_values("_report_date", ascending=False, na_position="last")
+
+    eps_cols = [c for c in frame.columns if "盈利预测-收益" in str(c)]
+    pe_cols = [c for c in frame.columns if "盈利预测-市盈率" in str(c)]
+    eps_col = eps_cols[0] if eps_cols else ""
+    pe_col = pe_cols[0] if pe_cols else ""
+
+    out: List[Dict[str, str]] = []
+    seen: set[str] = set()
+    for _, row in frame.iterrows():
+        title = _safe_text(row.get(title_col), fallback="")
+        if not title or title in seen:
+            continue
+        org = _safe_text(row.get(org_col), fallback="未知机构") if org_col else "未知机构"
+        rating = _safe_text(row.get(rating_col), fallback="未披露评级") if rating_col else "未披露评级"
+        date_text = "--"
+        if date_col:
+            dt = _to_datetime(row.get(date_col))
+            if dt:
+                date_text = dt.strftime("%Y-%m-%d")
+        eps_val = parse_cn_number(row.get(eps_col)) if eps_col else None
+        pe_val = parse_cn_number(row.get(pe_col)) if pe_col else None
+
+        summary_bits = [f"{org}发布《{title}》", f"评级{rating}"]
+        if eps_val is not None:
+            summary_bits.append(f"预测EPS {eps_val:.2f}")
+        if pe_val is not None:
+            summary_bits.append(f"预测PE {pe_val:.1f}x")
+        out.append(
+            {
+                "title": title,
+                "org": org,
+                "rating": rating,
+                "date": date_text,
+                "summary": "，".join(summary_bits),
+            }
+        )
+        seen.add(title)
+        if len(out) >= max(1, int(top_n)):
+            break
+    return out
+
+
+def _format_news_catalysts(news_items: List[Dict[str, str]]) -> str:
+    if not news_items:
+        return "近3天未抓取到可用新闻标题。"
+    lines = [
+        f"{idx}. [{item.get('published_at', '--')}] {item.get('title', '--')}（来源：{item.get('source', '未知')}）"
+        for idx, item in enumerate(news_items, start=1)
+    ]
+    return "\n".join(lines)
+
+
+def _format_research_summary(report_items: List[Dict[str, str]]) -> str:
+    if not report_items:
+        return "最近未抓取到可用机构研报。"
+    lines = [
+        f"{idx}. [{item.get('date', '--')}] {item.get('summary', '--')}"
+        for idx, item in enumerate(report_items, start=1)
+    ]
+    return "\n".join(lines)
+
+
+def _build_fund_deepseek_prompt(news_catalysts: str, research_summary: str) -> str:
+    return FUND_DEEPSEEK_PROMPT.format(
+        news_catalysts=(news_catalysts or "近3天未抓取到可用新闻标题。"),
+        research_summary=(research_summary or "最近未抓取到可用机构研报。"),
+    )
 
 
 def resolve_stock_identity(query: str) -> Tuple[str, str]:
@@ -514,6 +705,20 @@ def _fetch_metrics_from_eastmoney_direct(symbol: str) -> Dict[str, Optional[floa
 
 def _fetch_metrics_from_tencent(symbol: str) -> Dict[str, Optional[float]]:
     symbol_text = str(symbol).strip()
+
+    # 优先复用统一数据代理（QMT -> 免费源瀑布流降级）
+    try:
+        from apps.trading.fast_engine import get_market_data_provider
+
+        quote = get_market_data_provider().get_realtime_quote(symbol_text)
+        pe_dynamic = _normalize_pe_value(parse_cn_number(quote.get("pe_dynamic")))
+        pe_ttm = _normalize_pe_value(parse_cn_number(quote.get("pe_ttm")))
+        pb = _normalize_pb_value(parse_cn_number(quote.get("pb")))
+        if pe_dynamic is not None or pe_ttm is not None or pb is not None:
+            return {"pe_dynamic": pe_dynamic, "pe_ttm": pe_ttm, "pb": pb}
+    except Exception:
+        pass
+
     if _is_hk_symbol(symbol_text):
         exchange = "hk"
     elif symbol_text.startswith(("5", "6", "9")):
@@ -735,6 +940,7 @@ def _build_summary(code: str, name: str, total_score: float, conclusion: str, di
     return "\n".join(lines)
 
 
+@_cache_data(ttl=3600)
 def analyze_fundamental(code: str, name: str = "", force_refresh: bool = False, cache_ttl_hours: int = 12) -> Dict[str, Any]:
     ensure_dirs()
     code = normalize_code(code)
@@ -778,6 +984,8 @@ def analyze_fundamental(code: str, name: str = "", force_refresh: bool = False, 
     indicator_df = pd.DataFrame()
     profile: Optional[Dict[str, Any]] = None
     data_warnings: List[str] = []
+    news_items: List[Dict[str, str]] = []
+    research_items: List[Dict[str, str]] = []
 
     try:
         abstract_df = _read_abstract(code)
@@ -793,6 +1001,16 @@ def analyze_fundamental(code: str, name: str = "", force_refresh: bool = False, 
         profile = _read_profile(code)
     except Exception as e:
         data_warnings.append(f"个股资料抓取失败: {e}")
+
+    try:
+        news_items = _fetch_recent_news_titles(code, days=3, limit=8)
+    except Exception as e:
+        data_warnings.append(f"新闻抓取失败: {e}")
+
+    try:
+        research_items = _fetch_recent_research_summary(code, top_n=2)
+    except Exception as e:
+        data_warnings.append(f"研报抓取失败: {e}")
 
     if profile and not name:
         result["name"] = str(profile.get("股票简称", code))
@@ -953,6 +1171,9 @@ def analyze_fundamental(code: str, name: str = "", force_refresh: bool = False, 
         dividend_yield,
     ]
     coverage_ratio = sum(x is not None for x in available_fields) / len(available_fields)
+    news_catalysts = _format_news_catalysts(news_items)
+    research_summary = _format_research_summary(research_items)
+    fund_prompt = _build_fund_deepseek_prompt(news_catalysts, research_summary)
 
     result.update(
         {
@@ -996,6 +1217,11 @@ def analyze_fundamental(code: str, name: str = "", force_refresh: bool = False, 
                 for d in dimensions
             ],
             "summary_text": _build_summary(code, result["name"], total_score, conclusion, dimensions),
+            "news_catalysts": news_items,
+            "research_reports": research_items,
+            "news_catalysts_text": news_catalysts,
+            "research_summary": research_summary,
+            "fund_deepseek_prompt": fund_prompt,
             "data_warnings": data_warnings,
         }
     )

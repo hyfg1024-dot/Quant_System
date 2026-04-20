@@ -63,6 +63,20 @@ _SHELLS: dict[str, ShellMeta] = {
             ("工作方式", "围绕持仓/观察池"),
         ),
     ),
+    "portfolio": ShellMeta(
+        label="Portfolio Risk",
+        nav_title="仓位风控",
+        title="仓位风控台",
+        subtitle="把持仓、浮盈亏、仓位权重和 ATR 风险约束放进一个可执行的看板，减少只打标签却无法落地管理的问题。",
+        accent="#c06a52",
+        accent_soft="#efc1a5",
+        glow="rgba(192, 106, 82, 0.24)",
+        metrics=(
+            ("主视角", "持仓与风控"),
+            ("信息层级", "持仓 + PnL + 风险"),
+            ("工作方式", "仓位管理与约束"),
+        ),
+    ),
     "backtest": ShellMeta(
         label="Backtest Lab",
         nav_title="回测系统",
@@ -93,7 +107,7 @@ _SHELLS: dict[str, ShellMeta] = {
     ),
 }
 
-_NAV_ORDER = ("filter", "fundamental", "trading", "backtest", "paper")
+_NAV_ORDER = ("filter", "fundamental", "trading", "portfolio", "backtest", "paper")
 
 
 def _shell_style(meta: ShellMeta, active_page: str) -> str:
@@ -412,56 +426,62 @@ def _shell_style(meta: ShellMeta, active_page: str) -> str:
     }}
     .qs-top-nav {{
       display: flex;
-      gap: 1rem;
+      gap: 0.7rem;
       align-items: center;
-      margin: 1.05rem 0 0.95rem 0;
+      margin: 0.95rem 0 0.85rem 0;
       flex-wrap: wrap;
     }}
     .qs-top-nav-marker {{
       display: none;
     }}
     .qs-top-nav-reserve {{
-      height: 5.8rem;
+      height: 4.9rem;
     }}
     .st-key-qs_top_nav_row {{
       position: relative;
       z-index: 60;
       margin: 0;
-      padding: 0.7rem 0.75rem 0.8rem;
-      border-radius: 28px;
-      border: 1px solid rgba(255, 255, 255, 0.10);
+      padding: 0.55rem 0.65rem 0.62rem;
+      border-radius: 24px;
+      border: 1px solid rgba(255, 255, 255, 0.16);
       background:
-        linear-gradient(180deg, rgba(11, 21, 36, 0.84), rgba(8, 17, 29, 0.74)),
-        radial-gradient(circle at top left, rgba(255,255,255,0.08), transparent 28%);
+        linear-gradient(180deg, rgba(22, 37, 59, 0.78), rgba(12, 24, 40, 0.70)),
+        radial-gradient(circle at top left, rgba(255,255,255,0.12), transparent 30%);
       backdrop-filter: blur(18px);
       box-shadow:
-        0 14px 34px rgba(0, 0, 0, 0.20),
-        inset 0 1px 0 rgba(255,255,255,0.06);
+        0 14px 34px rgba(0, 0, 0, 0.14),
+        inset 0 1px 0 rgba(255,255,255,0.10);
       transition: left 140ms ease, width 140ms ease, top 140ms ease;
     }}
     .st-key-qs_top_nav_row > div[data-testid="stHorizontalBlock"] > div[data-testid="column"] {{
       display: flex;
       align-items: center;
     }}
+    .st-key-qs_top_nav_row > div[data-testid="stHorizontalBlock"] {{
+      gap: 0.55rem;
+    }}
     div[data-testid="column"]:has(.qs-top-nav-marker) div[data-testid="stButton"] {{
       margin: 0 !important;
     }}
     div[data-testid="column"]:has(.qs-top-nav-marker) div.stButton > button {{
-      min-height: 3.55rem !important;
+      min-height: 2.95rem !important;
       width: 100% !important;
       border-radius: 999px !important;
-      border: 1.5px solid rgba(255, 255, 255, 0.18) !important;
+      border: 1px solid rgba(255, 255, 255, 0.30) !important;
       box-shadow:
-        inset 0 1px 0 rgba(255,255,255,0.08),
-        0 8px 18px rgba(0,0,0,0.12) !important;
+        inset 0 1px 0 rgba(255,255,255,0.28),
+        0 8px 18px rgba(0,0,0,0.08) !important;
       color: #122033 !important;
       -webkit-text-fill-color: #122033 !important;
-      font-size: 0.98rem !important;
+      font-size: 1rem !important;
       font-weight: 800 !important;
       letter-spacing: 0.01em;
-      padding: 0 1.75rem !important;
-      opacity: 0.96;
-      transition: border-color 160ms ease, box-shadow 160ms ease, background 160ms ease, opacity 160ms ease;
+      padding: 0 1.15rem !important;
+      white-space: nowrap !important;
+      word-break: keep-all !important;
+      line-height: 1 !important;
+      opacity: 0.97;
+      transition: border-color 160ms ease, box-shadow 160ms ease, background 160ms ease, opacity 160ms ease, transform 160ms ease;
       transform: none !important;
     }}
     div[data-testid="column"]:has(.qs-top-nav-marker) div.stButton > button span,
@@ -469,63 +489,76 @@ def _shell_style(meta: ShellMeta, active_page: str) -> str:
     div[data-testid="column"]:has(.qs-top-nav-marker) div.stButton > button div {{
       color: #122033 !important;
       -webkit-text-fill-color: #122033 !important;
+      white-space: nowrap !important;
+      word-break: keep-all !important;
+      line-height: 1 !important;
     }}
     .st-key-qs_top_nav_filter div.stButton > button {{
       background:
-        linear-gradient(180deg, rgba(175, 193, 131, 0.98), rgba(145, 162, 106, 1)) !important;
-      border-color: rgba(218, 229, 188, 0.72) !important;
+        linear-gradient(180deg, rgba(184, 201, 131, 0.98), rgba(155, 174, 103, 1)) !important;
+      border-color: rgba(230, 240, 192, 0.78) !important;
     }}
     .st-key-qs_top_nav_fundamental div.stButton > button {{
       background:
-        linear-gradient(180deg, rgba(139, 198, 194, 0.98), rgba(101, 160, 157, 1)) !important;
-      border-color: rgba(196, 235, 232, 0.72) !important;
+        linear-gradient(180deg, rgba(151, 208, 206, 0.98), rgba(112, 175, 174, 1)) !important;
+      border-color: rgba(206, 239, 237, 0.82) !important;
     }}
     .st-key-qs_top_nav_trading div.stButton > button {{
       background:
-        linear-gradient(180deg, rgba(225, 193, 138, 0.98), rgba(195, 154, 93, 1)) !important;
-      border-color: rgba(245, 221, 180, 0.76) !important;
+        linear-gradient(180deg, rgba(232, 198, 136, 0.98), rgba(208, 166, 95, 1)) !important;
+      border-color: rgba(248, 225, 182, 0.82) !important;
+    }}
+    .st-key-qs_top_nav_portfolio div.stButton > button {{
+      background:
+        linear-gradient(180deg, rgba(205, 136, 108, 0.98), rgba(178, 105, 78, 1)) !important;
+      border-color: rgba(240, 189, 166, 0.82) !important;
     }}
     .st-key-qs_top_nav_backtest div.stButton > button {{
       background:
-        linear-gradient(180deg, rgba(31, 171, 99, 0.99), rgba(31, 171, 99, 0.99)) !important;
-      border-color: rgba(31, 171, 99, 0.86) !important;
+        linear-gradient(180deg, rgba(47, 197, 116, 0.98), rgba(28, 160, 92, 1)) !important;
+      border-color: rgba(144, 232, 181, 0.78) !important;
     }}
     .st-key-qs_top_nav_paper div.stButton > button {{
       background:
-        linear-gradient(180deg, rgba(209, 67, 67, 0.99), rgba(209, 67, 67, 0.99)) !important;
-      border-color: rgba(209, 67, 67, 0.86) !important;
+        linear-gradient(180deg, rgba(226, 90, 90, 0.98), rgba(203, 67, 67, 1)) !important;
+      border-color: rgba(247, 168, 168, 0.80) !important;
     }}
     div[data-testid="column"]:has(.qs-top-nav-marker) div.stButton > button:hover {{
       opacity: 1;
       box-shadow:
-        inset 0 1px 0 rgba(255,255,255,0.10),
-        0 12px 24px rgba(0,0,0,0.15) !important;
-      transform: none !important;
+        inset 0 1px 0 rgba(255,255,255,0.34),
+        0 12px 24px rgba(0,0,0,0.12) !important;
+      transform: translateY(-1px) !important;
     }}
     div[data-testid="column"]:has(.qs-top-nav-marker.is-active) div.stButton > button {{
-      border-color: rgba(255, 248, 236, 0.92) !important;
+      border-color: rgba(255, 250, 242, 0.96) !important;
       box-shadow:
-        inset 0 1px 0 rgba(255,255,255,0.12),
-        0 0 0 1px rgba(255,255,255,0.12),
-        0 14px 30px rgba(0,0,0,0.18) !important;
+        inset 0 1px 0 rgba(255,255,255,0.42),
+        0 0 0 1px rgba(255,255,255,0.14),
+        0 14px 30px rgba(0,0,0,0.14) !important;
       opacity: 1;
     }}
     div[data-testid="column"]:has(.qs-top-nav-marker.is-active) div.stButton > button span,
     div[data-testid="column"]:has(.qs-top-nav-marker.is-active) div.stButton > button p,
     div[data-testid="column"]:has(.qs-top-nav-marker.is-active) div.stButton > button div {{
-      color: #122033 !important;
-      -webkit-text-fill-color: #122033 !important;
+      color: #101b2d !important;
+      -webkit-text-fill-color: #101b2d !important;
     }}
     @media (max-width: 900px) {{
       .qs-title {{
         white-space: normal;
       }}
       .qs-top-nav-reserve {{
-        height: 5.1rem;
+        height: 4.7rem;
       }}
       .st-key-qs_top_nav_row {{
-        padding: 0.45rem 0.45rem 0.55rem;
+        padding: 0.38rem 0.4rem 0.45rem;
         border-radius: 22px;
+      }}
+      div[data-testid="column"]:has(.qs-top-nav-marker) div.stButton > button {{
+        min-height: 2.7rem !important;
+        padding: 0 0.9rem !important;
+        font-size: 0.92rem !important;
       }}
       .st-key-qs_top_nav_row.qs-floating-ready {{
         top: 0.45rem;
@@ -996,7 +1029,8 @@ def render_top_nav(active_page: str) -> str:
     selected = active_page
     st.markdown("<div class='qs-top-nav-reserve'></div>", unsafe_allow_html=True)
     with st.container(key="qs_top_nav_row"):
-        cols = st.columns([1.0] * len(_NAV_ORDER) + [2.8], vertical_alignment="center")
+        nav_widths = [max(1.05, min(1.7, 0.78 + len(_SHELLS[key].nav_title) * 0.17)) for key in _NAV_ORDER]
+        cols = st.columns(nav_widths, vertical_alignment="center")
         for idx, key in enumerate(_NAV_ORDER):
             with cols[idx]:
                 marker_class = "qs-top-nav-marker is-active" if key == active_page else "qs-top-nav-marker"

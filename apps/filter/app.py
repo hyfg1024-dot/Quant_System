@@ -18,7 +18,6 @@ if str(PROJECT_ROOT) not in sys.path:
 from filter_engine import (
     APP_VERSION,
     DISPLAY_COLUMNS,
-    apply_filters,
     build_ai_quick_config,
     default_filter_config,
     export_snapshot_health_excel,
@@ -32,9 +31,19 @@ from filter_engine import (
     refresh_market_snapshot,
     save_template,
 )
+from shared.db_manager import init_db as init_duckdb
+from shared.db_manager import run_filter_query, sync_snapshot_to_duckdb
 from shared.ui_shell import render_app_shell, render_section_intro, render_status_row
 
 st.set_page_config(page_title="大过滤器", page_icon="🧪", layout="wide")
+
+DUCKDB_READY = True
+DUCKDB_ERROR = ""
+try:
+    init_duckdb()
+except Exception as exc:
+    DUCKDB_READY = False
+    DUCKDB_ERROR = str(exc)
 
 st.markdown(
     """
@@ -154,6 +163,14 @@ def _safe_int(v: object) -> int:
         return 0
 
 
+def _sync_snapshot_into_duckdb(snapshot_df: pd.DataFrame) -> dict:
+    if snapshot_df is None or snapshot_df.empty:
+        return {"stock_basic": 0, "daily_kline": 0, "daily_fundamental": 0}
+    if not DUCKDB_READY:
+        raise RuntimeError(f"DuckDB 不可用: {DUCKDB_ERROR}")
+    return sync_snapshot_to_duckdb(snapshot_df)
+
+
 def _render_ops_panel() -> None:
     render_section_intro(
         "数据运维台",
@@ -196,6 +213,16 @@ def _render_ops_panel() -> None:
                         f"更新完成：{stats.get('row_count', 0)} 只，深补 {stats.get('enriched_count', 0)} 只（区间 {int(stats.get('enrich_start', 0) or 0)} -> {int(stats.get('enrich_end', 0) or 0)}）"
                     )
                     st.caption(f"缓存命中: {int(stats.get('cache_hit', 0) or 0)} ｜ 重抓: {int(stats.get('cache_miss', 0) or 0)}")
+                try:
+                    sync_stats = _sync_snapshot_into_duckdb(load_snapshot())
+                    st.caption(
+                        "DuckDB 同步: "
+                        f"basic {int(sync_stats.get('stock_basic', 0))} / "
+                        f"kline {int(sync_stats.get('daily_kline', 0))} / "
+                        f"fund {int(sync_stats.get('daily_fundamental', 0))}"
+                    )
+                except Exception as sync_exc:
+                    st.warning(f"DuckDB 同步失败: {sync_exc}")
             except Exception as exc:
                 st.error(f"更新失败: {exc}")
 
@@ -219,6 +246,17 @@ def _render_ops_panel() -> None:
                     st.success(
                         f"周更完成：{stats.get('row_count', 0)} 只，深补 {stats.get('enriched_count', 0)} 只（区间 {int(stats.get('enrich_start', 0) or 0)} -> {int(stats.get('enrich_end', 0) or 0)}）"
                     )
+                if not bool(stats.get("skipped", False)):
+                    try:
+                        sync_stats = _sync_snapshot_into_duckdb(load_snapshot())
+                        st.caption(
+                            "DuckDB 同步: "
+                            f"basic {int(sync_stats.get('stock_basic', 0))} / "
+                            f"kline {int(sync_stats.get('daily_kline', 0))} / "
+                            f"fund {int(sync_stats.get('daily_fundamental', 0))}"
+                        )
+                    except Exception as sync_exc:
+                        st.warning(f"DuckDB 同步失败: {sync_exc}")
             except Exception as exc:
                 st.error(f"周更失败: {exc}")
 
@@ -268,6 +306,8 @@ render_status_row(
         ("深度补充", f"{int(meta.get('enriched_count', 0) or 0)} 只" if meta else "0 只"),
     )
 )
+if not DUCKDB_READY:
+    st.warning(f"DuckDB 初始化失败，SQL筛选不可用：{DUCKDB_ERROR}")
 
 if st.session_state["show_ops_panel"]:
     _render_ops_panel()
@@ -297,6 +337,16 @@ if st.sidebar.button("更新全市场数据", use_container_width=True):
                 end_pos = int(stats.get("enrich_end", 0) or 0)
                 extra = f"（{mode_label}区间 {start_pos} -> {end_pos}）" if int(stats.get("enriched_count", 0) or 0) > 0 else ""
                 st.sidebar.success(f"更新完成：{stats['row_count']} 只，深度补充 {stats['enriched_count']} 只{extra}")
+            try:
+                sync_stats = _sync_snapshot_into_duckdb(load_snapshot())
+                st.sidebar.caption(
+                    "DuckDB 同步: "
+                    f"basic {int(sync_stats.get('stock_basic', 0))} / "
+                    f"kline {int(sync_stats.get('daily_kline', 0))} / "
+                    f"fund {int(sync_stats.get('daily_fundamental', 0))}"
+                )
+            except Exception as sync_exc:
+                st.sidebar.warning(f"DuckDB 同步失败: {sync_exc}")
             meta = get_snapshot_meta()
         except Exception as exc:
             st.sidebar.error(f"更新失败: {exc}")
@@ -544,15 +594,28 @@ if run_now:
     snap = load_snapshot()
     if snap.empty:
         st.error("还没有市场快照。请先在左侧点击“更新全市场数据”。")
+    elif not DUCKDB_READY:
+        st.error(f"DuckDB 不可用，无法执行 SQL 筛选：{DUCKDB_ERROR}")
     else:
         with st.spinner("正在执行筛选..."):
+            try:
+                _sync_snapshot_into_duckdb(snap)
+            except Exception as sync_exc:
+                st.error(f"快照同步至 DuckDB 失败：{sync_exc}")
+                st.stop()
+
             if two_stage:
                 stage1_cfg = _build_stage1_config(cfg)
-                p1, r1, m1, s1 = apply_filters(snap, stage1_cfg)
+                p1, r1, m1, s1 = run_filter_query(stage1_cfg, include_rearview=True)
 
                 if _has_rearview_enabled(cfg):
                     stage2_cfg = _build_stage2_config(cfg)
-                    p2, r2, m2, _s2 = apply_filters(p1, stage2_cfg)
+                    candidate_df = p1[["market", "code"]].copy() if not p1.empty else pd.DataFrame(columns=["market", "code"])
+                    p2, r2, m2, _s2 = run_filter_query(
+                        stage2_cfg,
+                        include_rearview=True,
+                        candidate_codes=candidate_df,
+                    )
                     passed_df = p2
                     rejected_df = _concat_dedup(r1, r2)
                     missing_df = _concat_dedup(m1, m2)
@@ -569,7 +632,7 @@ if run_now:
                     "stage_mode": "two",
                 }
             else:
-                passed_df, rejected_df, missing_df, stats = apply_filters(snap, cfg)
+                passed_df, rejected_df, missing_df, stats = run_filter_query(cfg, include_rearview=True)
                 stats["stage_mode"] = "single"
 
             st.session_state["flt_result"] = {

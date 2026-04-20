@@ -1,4 +1,5 @@
 import base64
+import asyncio
 import copy
 import hashlib
 import json
@@ -46,7 +47,7 @@ except Exception as _exc:  # pragma: no cover - 依赖缺失时兜底
     class RateLimitError(Exception):
         pass
 
-from fast_engine import fetch_fast_panel
+from fast_engine import fetch_fast_panel, fetch_realtime_quotes_batch
 from slow_engine import (
     add_stock_by_query,
     fetch_live_valuation_snapshot,
@@ -94,6 +95,9 @@ from filter_engine import (
     refresh_market_snapshot as filter_refresh_market_snapshot,
     save_template as filter_save_template,
 )
+from apps.portfolio.app import APP_VERSION as PORTFOLIO_APP_VERSION
+from apps.portfolio.app import render_portfolio_page as _render_portfolio_page
+from shared.multi_agent_analyzer import MultiAgentAnalyzer
 from shared.ui_shell import render_app_shell, render_section_intro, render_status_row, render_top_nav
 
 st.set_page_config(page_title="Quant Dashboard", page_icon="📊", layout="wide")
@@ -708,7 +712,7 @@ if _curr_user != _last.get("deepseek_user", "") or _curr_key != _last.get("deeps
         "deepseek_api_key": _curr_key,
     }
 
-_allowed_pages = {"trading", "fundamental", "filter", "backtest", "paper"}
+_allowed_pages = {"trading", "fundamental", "filter", "portfolio", "backtest", "paper"}
 try:
     _qp_page = str(st.query_params.get("page", "")).strip().lower()
 except Exception:
@@ -733,6 +737,7 @@ try:
         st.query_params["page"] = _active_page
 except Exception:
     pass
+
 _group_map = get_stock_group_map()
 _holding_count = sum(1 for code, _name in pool_rows_for_sidebar if _group_map.get(code) == "holding")
 _watch_count = sum(1 for code, _name in pool_rows_for_sidebar if _group_map.get(code) != "holding")
@@ -742,6 +747,7 @@ render_app_shell(
         "fundamental": FUND_APP_VERSION,
         "trading": APP_VERSION,
         "filter": FILTER_APP_VERSION,
+        "portfolio": PORTFOLIO_APP_VERSION,
         "backtest": BACKTEST_APP_VERSION,
         "paper": PAPER_APP_VERSION,
     }.get(_active_page, APP_VERSION),
@@ -749,6 +755,7 @@ render_app_shell(
         "fundamental": ("八维评分", "观察名单", "结构化结论"),
         "trading": ("实时盘口", "分时结构", "DeepSeek 分析"),
         "filter": ("两段筛选", "快照更新", "结果导出"),
+        "portfolio": ("持仓台账", "浮盈亏", "ATR风控"),
         "backtest": ("多空回测", "成本建模", "HTML报告"),
         "paper": ("策略入口", "逐日更新", "模拟看板"),
     }.get(_active_page, ("实时盘口", "分时结构", "DeepSeek 分析")),
@@ -767,6 +774,11 @@ render_app_shell(
             ("股票池联动", f"{len(pool_rows_for_sidebar)} 只"),
             ("筛选方式", "两段排雷"),
             ("工作流", "快照 -> 条件 -> 导出"),
+        ),
+        "portfolio": (
+            ("风险口径", "单笔 1%"),
+            ("组合对象", "真实持仓"),
+            ("工作流", "录入 -> 监控 -> 调整"),
         ),
         "backtest": (
             ("策略配置", "YAML可编辑"),
@@ -1013,6 +1025,34 @@ def _validate_api_key(key: str) -> None:
         raise RuntimeError("API Key 包含非法字符（可能混入中文符号/空格）。请重新粘贴纯 key。")
 
 
+def _run_async(coro):
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+
+    import threading
+
+    box: Dict[str, Any] = {"value": None, "error": None}
+
+    def _runner() -> None:
+        loop = asyncio.new_event_loop()
+        try:
+            asyncio.set_event_loop(loop)
+            box["value"] = loop.run_until_complete(coro)
+        except Exception as exc:  # pragma: no cover
+            box["error"] = exc
+        finally:
+            loop.close()
+
+    th = threading.Thread(target=_runner, daemon=True)
+    th.start()
+    th.join()
+    if box["error"] is not None:
+        raise box["error"]
+    return box["value"]
+
+
 def _call_deepseek_with_prompt(
     user_content: str,
     system_prompt: str,
@@ -1142,6 +1182,47 @@ def _call_deepseek_analysis(json_text: str) -> tuple[str, dict, float, float]:
         temperature=0.3,
         top_p=0.9,
     )
+
+
+def _call_multi_agent_analysis(json_text: str, stock_code: str, stock_name: str) -> tuple[str, dict, float, float]:
+    if (not OPENAI_AVAILABLE) or (OpenAI is None):
+        hint = "缺少 openai 依赖，请先安装：cd /Users/wellthen/Desktop/TEST/Quant_System/apps/trading && source venv/bin/activate && pip install -r requirements.txt"
+        if OPENAI_IMPORT_ERROR is not None:
+            raise RuntimeError(f"{hint}；原始错误: {OPENAI_IMPORT_ERROR}")
+        raise RuntimeError(hint)
+
+    api_key = _resolve_deepseek_api_key()
+    _validate_api_key(api_key)
+    t0 = pytime.time()
+    analyzer = MultiAgentAnalyzer(
+        api_key=api_key,
+        base_url="https://api.deepseek.com/v1",
+        model="deepseek-chat",
+        timeout_sec=90.0,
+        max_retries=0,
+    )
+    result = _run_async(
+        analyzer.analyze(
+            payload_json=json_text,
+            stock_code=str(stock_code or ""),
+            stock_name=str(stock_name or ""),
+        )
+    )
+    final_report = str(result.get("final_markdown", "") or "").strip()
+    if not final_report:
+        raise RuntimeError("多智能体分析未返回有效文本")
+
+    usage_total = (result.get("usage") or {}).copy()
+    usage_breakdown = result.get("usage_breakdown") or {}
+    expert_usage = usage_breakdown.get("experts") or {}
+    judge_usage = usage_breakdown.get("judge") or {}
+    usage_total["expert_prompt_tokens"] = int(expert_usage.get("prompt_tokens", 0) or 0)
+    usage_total["expert_completion_tokens"] = int(expert_usage.get("completion_tokens", 0) or 0)
+    usage_total["judge_prompt_tokens"] = int(judge_usage.get("prompt_tokens", 0) or 0)
+    usage_total["judge_completion_tokens"] = int(judge_usage.get("completion_tokens", 0) or 0)
+    cost = float(result.get("cost", 0.0) or 0.0)
+    elapsed = float(result.get("elapsed", 0.0) or (pytime.time() - t0))
+    return final_report, usage_total, cost, elapsed
 
 
 def _sanitize_deepseek_report(text: str) -> str:
@@ -2832,7 +2913,7 @@ def _create_analysis_job(
         "created_at": datetime.now().strftime("%m-%d %H:%M:%S"),
         "stock_code": str(stock_code),
         "stock_name": str(stock_name),
-        "analysis_engine": "deep_only_v2",
+        "analysis_engine": "multi_agent_v1",
         "mode": str(mode),
         "status": "pending",
         "quick_json": quick_json,
@@ -2865,8 +2946,8 @@ def _upsert_live_analysis_job(
         current["quick_hash"] = quick_hash
         current["deep_hash"] = deep_hash
         current["updated_at"] = now_text
-        if str(current.get("analysis_engine", "")) != "deep_only_v2":
-            current["analysis_engine"] = "deep_only_v2"
+        if str(current.get("analysis_engine", "")) != "multi_agent_v1":
+            current["analysis_engine"] = "multi_agent_v1"
             current["mode"] = "idle"
             current["status"] = "pending"
             current.pop("final_text", None)
@@ -2887,7 +2968,7 @@ def _upsert_live_analysis_job(
         "updated_at": now_text,
         "stock_code": str(stock_code),
         "stock_name": str(stock_name),
-        "analysis_engine": "deep_only_v2",
+        "analysis_engine": "multi_agent_v1",
         "mode": "idle",
         "status": "pending",
         "quick_json": quick_json,
@@ -2931,7 +3012,36 @@ def _normalize_quick_result(quick_raw: str) -> dict:
     }
 
 
-def _render_final_report_block(job_id: str, job_obj: dict, key_suffix: str, height: int = 560) -> None:
+def _markdown_stream_chunks(text: str, chunk_size: int = 220):
+    content = str(text or "")
+    if not content:
+        return
+    for line in content.splitlines(keepends=True):
+        if len(line) <= chunk_size:
+            yield line
+            continue
+        for i in range(0, len(line), chunk_size):
+            yield line[i : i + chunk_size]
+
+
+def _render_markdown_stream(text: str) -> None:
+    content = str(text or "").strip()
+    if not content:
+        st.info("暂无分析文本。")
+        return
+    chunks = _markdown_stream_chunks(content)
+    stream_fn = getattr(st, "markdown_stream", None)
+    if callable(stream_fn):
+        stream_fn(chunks)
+        return
+    write_stream_fn = getattr(st, "write_stream", None)
+    if callable(write_stream_fn):
+        write_stream_fn(chunks)
+        return
+    st.markdown(str(text or ""))
+
+
+def _render_final_report_block(job_id: str, job_obj: dict, key_suffix: str, height: int = 560, stream_output: bool = False) -> None:
     final_text = str(job_obj.get("final_text", "") or "")
     done_mark = str(job_obj.get("done_at", "") or "")
     text_key = f"job_text_{job_id}_{key_suffix}_{hashlib.md5((final_text + done_mark).encode('utf-8')).hexdigest()[:10]}"
@@ -2941,13 +3051,27 @@ def _render_final_report_block(job_id: str, job_obj: dict, key_suffix: str, heig
         f"<div class='analysis-time-badge'>分析时间: {analyzed_at}</div>",
         unsafe_allow_html=True,
     )
-    st.caption(
-        f"深析输入: {stats.get('deep_prompt_tokens', 0)} | 深析输出: {stats.get('deep_completion_tokens', 0)} | "
-        f"预估总成本: {float(stats.get('total_cost', 0) or 0):.4f} 元"
-    )
+    caption_bits = [
+        f"总输入: {stats.get('deep_prompt_tokens', 0)}",
+        f"总输出: {stats.get('deep_completion_tokens', 0)}",
+    ]
+    if int(stats.get("expert_prompt_tokens", 0) or 0) > 0 or int(stats.get("judge_prompt_tokens", 0) or 0) > 0:
+        caption_bits.extend(
+            [
+                f"专家输入: {stats.get('expert_prompt_tokens', 0)}",
+                f"专家输出: {stats.get('expert_completion_tokens', 0)}",
+                f"法官输入: {stats.get('judge_prompt_tokens', 0)}",
+                f"法官输出: {stats.get('judge_completion_tokens', 0)}",
+            ]
+        )
+    caption_bits.append(f"预估总成本: {float(stats.get('total_cost', 0) or 0):.4f} 元")
+    st.caption(" | ".join(caption_bits))
     report_text = _sanitize_deepseek_report(final_text)
     if report_text:
-        st.markdown(report_text)
+        if stream_output:
+            _render_markdown_stream(report_text)
+        else:
+            st.markdown(report_text)
     else:
         st.info("暂无分析文本。")
     st.text_area("分析文本（可复制）", value=report_text, height=min(height, 280), key=text_key)
@@ -3009,12 +3133,17 @@ def _execute_analysis_job(job_id: str, mode: str, ui_prefix: str = "", force_ref
 
     try:
         if force_refresh:
-            progress.progress(36, text=f"{ui_prefix}强制刷新分析...")
-            deep_report, d_usage, d_cost, _ = _call_deepseek_analysis(json_text=deep_json)
+            progress.progress(36, text=f"{ui_prefix}强制刷新多智能体分析...")
+            deep_report, d_usage, d_cost, _ = _call_multi_agent_analysis(
+                json_text=deep_json,
+                stock_code=stock_code,
+                stock_name=stock_name,
+            )
             deep_usage = d_usage
             total_cost += float(d_cost or 0.0)
             deep_source = "手动刷新"
             cache_store[deep_hash] = {
+                "engine": "multi_agent_v1",
                 "stage": "deep",
                 "result": deep_report,
                 "usage": deep_usage,
@@ -3032,7 +3161,11 @@ def _execute_analysis_job(job_id: str, mode: str, ui_prefix: str = "", force_ref
         else:
             progress.progress(28, text=f"{ui_prefix}检查缓存...")
             d_cached = cache_store.get(deep_hash) if deep_hash else None
-            if d_cached and isinstance(d_cached, dict):
+            if (
+                d_cached
+                and isinstance(d_cached, dict)
+                and str(d_cached.get("engine", "")) == "multi_agent_v1"
+            ):
                 deep_report = str(d_cached.get("result", "") or "")
                 deep_usage = d_cached.get("usage", {}) or deep_usage
                 deep_source = "同快照复用"
@@ -3043,17 +3176,26 @@ def _execute_analysis_job(job_id: str, mode: str, ui_prefix: str = "", force_ref
                 cached_hash = str(deep_cd.get("last_deep_hash", ""))
                 if in_cooldown and cached_hash:
                     cd_cached = cache_store.get(cached_hash)
-                    if cd_cached and isinstance(cd_cached, dict):
+                    if (
+                        cd_cached
+                        and isinstance(cd_cached, dict)
+                        and str(cd_cached.get("engine", "")) == "multi_agent_v1"
+                    ):
                         deep_report = str(cd_cached.get("result", "") or "")
                         deep_usage = cd_cached.get("usage", {}) or deep_usage
                         deep_source = f"冷却期复用({DEEP_COOLDOWN_MINUTES}分钟)"
 
                 if not deep_report:
-                    progress.progress(75, text=f"{ui_prefix}执行深析...")
-                    deep_report, d_usage, d_cost, _ = _call_deepseek_analysis(json_text=deep_json)
+                    progress.progress(75, text=f"{ui_prefix}并行执行专家与法官审判...")
+                    deep_report, d_usage, d_cost, _ = _call_multi_agent_analysis(
+                        json_text=deep_json,
+                        stock_code=stock_code,
+                        stock_name=stock_name,
+                    )
                     deep_usage = d_usage
                     total_cost += float(d_cost or 0.0)
                     cache_store[deep_hash] = {
+                        "engine": "multi_agent_v1",
                         "stage": "deep",
                         "result": deep_report,
                         "usage": deep_usage,
@@ -3077,6 +3219,10 @@ def _execute_analysis_job(job_id: str, mode: str, ui_prefix: str = "", force_ref
         stats = {
             "deep_prompt_tokens": int(deep_usage.get("prompt_tokens", 0) or 0),
             "deep_completion_tokens": int(deep_usage.get("completion_tokens", 0) or 0),
+            "expert_prompt_tokens": int(deep_usage.get("expert_prompt_tokens", 0) or 0),
+            "expert_completion_tokens": int(deep_usage.get("expert_completion_tokens", 0) or 0),
+            "judge_prompt_tokens": int(deep_usage.get("judge_prompt_tokens", 0) or 0),
+            "judge_completion_tokens": int(deep_usage.get("judge_completion_tokens", 0) or 0),
             "total_cost": float(total_cost),
             "deep_source": deep_source,
         }
@@ -3125,7 +3271,7 @@ def _render_analysis_window(job_id: str, embedded: bool = False, auto_mode: str 
         st.title(f"DeepSeek 分析窗口 · {stock_name} ({stock_code})")
         st.caption(f"任务ID: {job_id} | 上次模式: {mode} | 创建时间: {job.get('created_at', '--')}")
     else:
-        st.subheader(f"DeepSeek分析文档 · {stock_name} ({stock_code})")
+        st.subheader(f"多智能体分析文档 · {stock_name} ({stock_code})")
         st.caption(f"任务ID: {job_id} | 上次模式: {mode}")
 
     run_mode = ""
@@ -3134,7 +3280,7 @@ def _render_analysis_window(job_id: str, embedded: bool = False, auto_mode: str 
         run_mode = "deep" if auto_mode else ""
     else:
         btn_cols = st.columns(2)
-        if btn_cols[0].button("DeepSeek分析", key=f"analysis_window_deep_{job_id}", use_container_width=True):
+        if btn_cols[0].button("多智能体分析", key=f"analysis_window_deep_{job_id}", use_container_width=True):
             run_mode = "deep"
         if btn_cols[1].button("刷新", key=f"analysis_window_refresh_{job_id}", use_container_width=True):
             run_mode = "deep"
@@ -3150,7 +3296,7 @@ def _render_analysis_window(job_id: str, embedded: bool = False, auto_mode: str 
             if not embedded:
                 st.info("请点击上方按钮重新执行。")
         else:
-            st.info("点击“DeepSeek分析”开始执行。")
+            st.info("点击“多智能体分析”开始执行。")
         return
 
     try:
@@ -3164,7 +3310,7 @@ def _render_analysis_window(job_id: str, embedded: bool = False, auto_mode: str 
             st.success("深析已完成。")
         else:
             st.success("分析完成。")
-        _render_final_report_block(job_id, done_job, "new", height=420 if embedded else 560)
+        _render_final_report_block(job_id, done_job, "new", height=420 if embedded else 560, stream_output=True)
     except Exception as exc:
         st.error(f"分析失败: {type(exc).__name__}: {exc}")
 
@@ -3193,6 +3339,9 @@ if st.session_state.get("active_page") == "fundamental":
     st.stop()
 if st.session_state.get("active_page") == "filter":
     _render_filter_page()
+    st.stop()
+if st.session_state.get("active_page") == "portfolio":
+    _render_portfolio_page(embedded=True)
     st.stop()
 if st.session_state.get("active_page") == "backtest":
     _render_backtest_page()
@@ -3237,6 +3386,31 @@ render_status_row(
 group_map = get_stock_group_map()
 holding_rows = [r for r in rows if group_map.get(str(r["code"]), "watch") == "holding"]
 watch_rows = [r for r in rows if group_map.get(str(r["code"]), "watch") != "holding"]
+
+all_pool_codes = [str(r.get("code", "")).strip() for r in rows if str(r.get("code", "")).strip()]
+pool_quote_cache = st.session_state.get("fast_pool_quote_cache", {})
+pool_quote_latency_ms = float(st.session_state.get("fast_pool_quote_latency_ms", 0.0) or 0.0)
+should_refresh_pool_quote = bool(auto_refresh_on and market_open_for_ctrl)
+if (not isinstance(pool_quote_cache, dict)) or should_refresh_pool_quote or (not pool_quote_cache):
+    t0_pool = pytime.perf_counter()
+    try:
+        pool_quote_cache = fetch_realtime_quotes_batch(all_pool_codes, timeout_sec=1.0)
+        st.session_state["fast_pool_quote_cache"] = pool_quote_cache
+        pool_quote_latency_ms = (pytime.perf_counter() - t0_pool) * 1000.0
+        st.session_state["fast_pool_quote_latency_ms"] = pool_quote_latency_ms
+    except Exception:
+        pool_quote_cache = st.session_state.get("fast_pool_quote_cache", {})
+
+
+def _format_stock_button_label(name: str, code: str, quote_map: dict) -> str:
+    quote = quote_map.get(str(code), {}) if isinstance(quote_map, dict) else {}
+    px = quote.get("current_price") if isinstance(quote, dict) else None
+    cp = quote.get("change_pct") if isinstance(quote, dict) else None
+    if px is None:
+        return f"{name}\n{code}"
+    if cp is None:
+        return f"{name} {float(px):.2f}\n{code}"
+    return f"{name} {float(px):.2f} ({float(cp):+.2f}%)\n{code}"
 
 
 def _stock_grid_cols(total: int) -> int:
@@ -3333,12 +3507,12 @@ def _render_fast_panel(selected_code: str, selected_name: str, panel=None):
     pe_static_live = (
         (live_val.get("pe_static") if isinstance(live_val, dict) else None)
         if (isinstance(live_val, dict) and live_val.get("pe_static") is not None)
-        else (quote_pe_ttm if quote_pe_ttm is not None else selected_slow.get("pe_static"))
+        else selected_slow.get("pe_static")
     )
     pe_rolling_live = (
         (live_val.get("pe_rolling") if isinstance(live_val, dict) else None)
         if (isinstance(live_val, dict) and live_val.get("pe_rolling") is not None)
-        else (quote_pe_ttm if quote_pe_ttm is not None else selected_slow.get("pe_rolling"))
+        else (selected_slow.get("pe_rolling") if selected_slow.get("pe_rolling") is not None else quote_pe_ttm)
     )
     pb_live = (
         quote_pb
@@ -3819,7 +3993,7 @@ def _render_fast_panel(selected_code: str, selected_name: str, panel=None):
     analysis_json = json.dumps(analysis_payload, ensure_ascii=True, separators=(",", ":"))
     json_b64 = base64.b64encode(export_json.encode("utf-8")).decode("ascii")
     deep_json = analysis_json
-    deep_hash = hashlib.sha256(f"deep:{deep_json}".encode("utf-8")).hexdigest()
+    deep_hash = hashlib.sha256(f"multi_agent_v1:deep:{deep_json}".encode("utf-8")).hexdigest()
     live_job_id = _upsert_live_analysis_job(
         stock_code=selected_code,
         stock_name=selected_name,
@@ -3860,7 +4034,7 @@ def _render_fast_panel(selected_code: str, selected_name: str, panel=None):
                 height=96,
             )
             st.markdown('<div style="margin-top:0.22rem;"></div>', unsafe_allow_html=True)
-            run_analysis_now = st.button("DeepSeek分析", key=f"run_inline_analysis_{selected_code}", use_container_width=True)
+            run_analysis_now = st.button("多智能体分析", key=f"run_inline_analysis_{selected_code}", use_container_width=True)
 
     render_section_intro(
         "快照矩阵",
@@ -3956,7 +4130,7 @@ def _render_fast_panel(selected_code: str, selected_name: str, panel=None):
     st.markdown('<div class="subsection-divider"></div>', unsafe_allow_html=True)
     doc_cols = st.columns([5, 1], vertical_alignment="center")
     with doc_cols[0]:
-        st.subheader(f"DeepSeek分析文档 · {selected_name} ({selected_code})")
+        st.subheader(f"多智能体分析文档 · {selected_name} ({selected_code})")
     with doc_cols[1]:
         refresh_analysis_now = st.button("刷新", key=f"refresh_inline_analysis_{selected_code}", use_container_width=True)
 
@@ -3968,7 +4142,7 @@ def _render_fast_panel(selected_code: str, selected_name: str, panel=None):
                 ui_prefix=f"{selected_name} ",
                 force_refresh=bool(refresh_analysis_now),
             )
-            _render_final_report_block(live_job_id, done_job, f"inline_new_{selected_code}", height=520)
+            _render_final_report_block(live_job_id, done_job, f"inline_new_{selected_code}", height=520, stream_output=True)
         else:
             live_job_obj = _load_json_file(_analysis_job_file(live_job_id))
             if isinstance(live_job_obj, dict) and live_job_obj.get("status") == "done":
@@ -3976,7 +4150,7 @@ def _render_fast_panel(selected_code: str, selected_name: str, panel=None):
             elif isinstance(live_job_obj, dict) and live_job_obj.get("status") == "failed":
                 st.error(f"上次分析失败: {live_job_obj.get('error', '未知错误')}")
             else:
-                st.caption("点击上方“DeepSeek分析”开始生成文档。")
+                st.caption("点击上方“多智能体分析”开始生成文档。")
     except Exception as exc:
         st.error(f"分析失败: {type(exc).__name__}: {exc}")
 

@@ -386,6 +386,21 @@ def _fetch_metrics_from_eastmoney_direct(symbol: str) -> Dict[str, Optional[floa
 
 def _fetch_metrics_from_tencent(symbol: str) -> Dict[str, Optional[float]]:
     symbol_text = str(symbol).strip()
+
+    # 优先复用统一数据代理（QMT -> 免费源瀑布流降级）
+    try:
+        from fast_engine import get_market_data_provider
+
+        quote = get_market_data_provider().get_realtime_quote(symbol_text)
+        pe_dynamic = _to_float(quote.get("pe_dynamic"))
+        pe_ttm = _to_float(quote.get("pe_ttm"))
+        pb = _to_float(quote.get("pb"))
+        if pe_dynamic is not None or pe_ttm is not None or pb is not None:
+            return {"pe_dynamic": pe_dynamic, "pe_rolling": pe_ttm, "pb": pb}
+    except Exception:
+        pass
+
+    # 本地兜底：仍保留腾讯直连逻辑，避免代理层异常时全空
     if _is_hk_symbol(symbol_text):
         exchange = "hk"
     elif symbol_text.startswith(("5", "6", "9")):
@@ -399,10 +414,9 @@ def _fetch_metrics_from_tencent(symbol: str) -> Dict[str, Optional[float]]:
         resp.encoding = "gbk"
         text = resp.text
         if '"' not in text or "~" not in text:
-            return {"pe": None, "pb": None}
+            return {"pe_dynamic": None, "pe_rolling": None, "pb": None}
         payload = text.split('"', 1)[1].rsplit('"', 1)[0]
         fields = payload.split("~")
-        # 腾讯字段: 46=PB, 52=动态PE, 53=TTM PE
         pe_dynamic = _to_float(fields[52]) if len(fields) > 52 else None
         pe_ttm = _to_float(fields[53]) if len(fields) > 53 else None
         pb = _to_float(fields[46]) if len(fields) > 46 else None
