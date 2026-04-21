@@ -124,6 +124,75 @@ streamlit run app.py
 streamlit run app.py --server.port 8510
 ```
 
+## 后台预警 Worker
+
+后台预警进程入口：
+
+- `daemon/alert_worker.py`
+- 规则文件：`config/alert_rules.yaml`
+
+### 依赖
+
+当前交易模块依赖文件已经包含告警 worker 所需包：
+
+- `APScheduler`
+- `PyYAML`
+- `requests`
+
+### 配置推送环境变量
+
+以 Telegram Bot 为例，在本机 shell 中配置：
+
+```bash
+export TELEGRAM_BOT_TOKEN="你的 bot token"
+export TELEGRAM_CHAT_ID="你的 chat id"
+```
+
+PushPlus / ServerChan 也支持，环境变量名见：
+
+- `config/alert_rules.yaml`
+
+### 手工运行
+
+只跑一轮并打印，不真实推送：
+
+```bash
+python3 daemon/alert_worker.py --once --dry-run
+```
+
+只跑一轮并真实推送：
+
+```bash
+python3 daemon/alert_worker.py --once
+```
+
+常驻调度运行：
+
+```bash
+python3 daemon/alert_worker.py
+```
+
+### macOS 常驻启动
+
+安装 `launchd` 后台任务：
+
+```bash
+chmod +x daemon/install_launch_agent.command
+./daemon/install_launch_agent.command
+```
+
+卸载：
+
+```bash
+chmod +x daemon/uninstall_launch_agent.command
+./daemon/uninstall_launch_agent.command
+```
+
+日志输出位置：
+
+- `data/logs/alert_worker.out.log`
+- `data/logs/alert_worker.err.log`
+
 ## macOS 安全提示
 
 如果首次执行脚本时遇到“Apple 无法验证开发者”或系统拦截，通常是 macOS 的隔离属性导致。可以执行：
@@ -146,6 +215,7 @@ chmod +x ~/Desktop/启动Quant_System.command
 - DeepSeek 用户名与 API Key 仅保存在本地
 - 本地偏好文件默认位于 `data/local_user_prefs.json`
 - DuckDB 数据库默认位于 `data/quant_system.duckdb`
+- Telegram / PushPlus / ServerChan 推送凭证建议仅保存在本机环境变量
 - 分析缓存、任务文件、回测产物和模拟实盘快照都保存在本地目录，不会自动上传到 GitHub
 
 建议将以下内容视为本地运行态数据，而不是源码的一部分：

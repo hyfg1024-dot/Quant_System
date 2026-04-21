@@ -1,0 +1,51 @@
+schedule:
+  timezone: Asia/Shanghai
+  trading_windows:
+  - 09:30-11:30
+  - 13:00-15:00
+  interval_minutes: 3
+push:
+  channels:
+  - telegram
+  cooldown_minutes: 30
+  request_timeout_sec: 8
+  telegram:
+    bot_token_env: TELEGRAM_BOT_TOKEN
+    chat_id_env: TELEGRAM_CHAT_ID
+  pushplus:
+    token_env: PUSHPLUS_TOKEN
+  serverchan:
+    sendkey_env: SERVERCHAN_SENDKEY
+symbols:
+  '600007':
+    psychological_price: 21.0
+  '603871':
+    psychological_price: 13.2
+  '002121':
+    psychological_price: 7.3
+price_break:
+  enabled: true
+  default_psychological_price: null
+order_book_dump:
+  enabled: true
+  ask_volume_threshold_lot: 10000
+  recent_volume_multiplier: 8.0
+  recent_lookback_bars: 20
+technical_extreme:
+  enabled: true
+  oversold_rsi: 28.0
+  overbought_rsi: 72.0
+position_risk:
+  enabled: true
+  warn_near_stop_pct: 0.8
+  warn_near_take_pct: 2.0
+intraday_change:
+  enabled: true
+  lookback_bars: 5
+  up_pct: 1.5
+  down_pct: 1.5
+breakout_volume:
+  enabled: true
+  lookback_bars: 20
+  volume_multiplier: 4.0
+  breakout_buffer_pct: 0.0

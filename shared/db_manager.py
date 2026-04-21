@@ -164,7 +164,16 @@ def get_connection(db_path: Path | str = DEFAULT_DB_PATH, read_only: bool = Fals
     _ensure_duckdb()
     p = Path(db_path)
     p.parent.mkdir(parents=True, exist_ok=True)
-    return duckdb.connect(str(p), read_only=read_only)
+    try:
+        return duckdb.connect(str(p), read_only=read_only)
+    except Exception as exc:
+        # DuckDB 不允许同一数据库文件在同一进程里混用只读/读写连接。
+        # Streamlit 页面会并发复用多个查询入口，这里自动降级到普通连接，
+        # 避免 portfolio/filter 等页面因为 read_only 标志差异直接崩掉。
+        msg = str(exc)
+        if read_only and "same database file with a different configuration" in msg:
+            return duckdb.connect(str(p), read_only=False)
+        raise
 
 
 def init_db(db_path: Path | str = DEFAULT_DB_PATH) -> None:
