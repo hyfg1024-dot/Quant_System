@@ -68,9 +68,9 @@ _SHELLS: dict[str, ShellMeta] = {
         nav_title="仓位风控",
         title="仓位风控台",
         subtitle="把持仓、浮盈亏、仓位权重和 ATR 风险约束放进一个可执行的看板，减少只打标签却无法落地管理的问题。",
-        accent="#c06a52",
-        accent_soft="#efc1a5",
-        glow="rgba(192, 106, 82, 0.24)",
+        accent="#56a8ff",
+        accent_soft="#d7ebff",
+        glow="rgba(86, 168, 255, 0.26)",
         metrics=(
             ("主视角", "持仓与风控"),
             ("信息层级", "持仓 + PnL + 风险"),
@@ -510,8 +510,8 @@ def _shell_style(meta: ShellMeta, active_page: str) -> str:
     }}
     .st-key-qs_top_nav_portfolio div.stButton > button {{
       background:
-        linear-gradient(180deg, rgba(205, 136, 108, 0.98), rgba(178, 105, 78, 1)) !important;
-      border-color: rgba(240, 189, 166, 0.82) !important;
+        linear-gradient(180deg, rgba(129, 198, 255, 0.98), rgba(77, 154, 236, 1)) !important;
+      border-color: rgba(207, 234, 255, 0.88) !important;
     }}
     .st-key-qs_top_nav_backtest div.stButton > button {{
       background:
