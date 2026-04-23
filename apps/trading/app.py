@@ -12,6 +12,7 @@ import sys
 import time as pytime
 from datetime import datetime, time
 from pathlib import Path
+from typing import List
 from zoneinfo import ZoneInfo
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -83,16 +84,24 @@ from filter_engine import (
     DISPLAY_COLUMNS as FILTER_DISPLAY_COLUMNS,
     apply_filters as filter_apply_filters,
     build_ai_quick_config as filter_build_ai_quick_config,
+    check_market_data_source_status as filter_check_market_data_source_status,
     default_filter_config as filter_default_filter_config,
     export_snapshot_health_excel as filter_export_snapshot_health_excel,
     export_results_excel as filter_export_results_excel,
+    get_a_enrich_segments as filter_get_a_enrich_segments,
+    get_a_enrich_segment_counts as filter_get_a_enrich_segment_counts,
+    get_a_enrich_segment_status as filter_get_a_enrich_segment_status,
+    get_enrichment_governance_summary as filter_get_enrichment_governance_summary,
+    get_snapshot_backup_status as filter_get_snapshot_backup_status,
     get_snapshot_health_report as filter_get_snapshot_health_report,
     get_snapshot_meta as filter_get_snapshot_meta,
+    get_stock_enrichment_store_summary as filter_get_stock_enrichment_store_summary,
     get_template_config as filter_get_template_config,
     get_weekly_update_status as filter_get_weekly_update_status,
     load_snapshot as filter_load_snapshot,
     load_templates as filter_load_templates,
     refresh_market_snapshot as filter_refresh_market_snapshot,
+    restore_snapshot_from_backup as filter_restore_snapshot_from_backup,
     save_template as filter_save_template,
 )
 from apps.portfolio.app import APP_VERSION as PORTFOLIO_APP_VERSION
@@ -1607,98 +1616,418 @@ def _display_df(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def _render_filter_ops_panel() -> None:
-    c1, c2, c3, c4 = st.columns([1, 1, 1, 1], vertical_alignment="bottom")
-    market_scope = c1.selectbox(
-        "市场范围",
-        options=["A", "HK", "AH"],
-        index=2,
-        format_func=lambda x: {"A": "A股", "HK": "港股", "AH": "A+H"}[x],
-        key="flt_ops_market_scope",
-    )
-    max_stocks = c2.number_input("更新股票数（0=全部）", min_value=0, max_value=12000, value=0, step=200, key="flt_ops_max_stocks")
-    enrich_n = c3.number_input("深度补充（A股）", min_value=0, max_value=2000, value=800, step=100, key="flt_ops_enrich_n")
-    safe_mode = c4.checkbox("安全模式（防封）", value=True, key="flt_ops_safe_mode")
-    rotate_enrich = st.checkbox("深度补充采用轮转增量（推荐）", value=True, key="flt_ops_rotate")
-    force_refresh = st.checkbox("忽略缓存强制重抓", value=False, key="flt_ops_force")
+def _flt_filter_snapshot_by_market(snapshot_df: pd.DataFrame, scope: str) -> pd.DataFrame:
+    if snapshot_df is None or snapshot_df.empty or "market" not in snapshot_df.columns:
+        return pd.DataFrame()
+    market = str(scope or "").strip().upper()
+    return snapshot_df[snapshot_df["market"].astype(str).str.upper() == market].copy().reset_index(drop=True)
 
-    weekly = filter_get_weekly_update_status("AH")
+
+def _flt_market_snapshot_summary(scope: str) -> dict:
+    market_df = _flt_filter_snapshot_by_market(filter_load_snapshot(), scope)
+    total = int(len(market_df))
+    quality_counts = {"full": 0, "partial": 0, "missing": 0}
+    if total > 0 and "data_quality" in market_df.columns:
+        vc = market_df["data_quality"].value_counts(dropna=False).to_dict()
+        quality_counts = {
+            "full": int(vc.get("full", 0)),
+            "partial": int(vc.get("partial", 0)),
+            "missing": int(vc.get("missing", 0)),
+        }
+    covered = int(quality_counts["full"] + quality_counts["partial"])
+    coverage_ratio = (covered / total) if total > 0 else 0.0
+    return {"scope": str(scope or "").upper(), "total": total, "quality_counts": quality_counts, "coverage_ratio": coverage_ratio}
+
+
+def _flt_format_governance_line(counts: dict, order: List[str]) -> str:
+    parts = [f"{key} {int(counts.get(key, 0) or 0)}" for key in order]
+    return " / ".join(parts)
+
+
+def _flt_render_governance_cards(governance: dict) -> None:
+    st.markdown(
+        """
+        <style>
+        .qs-governance-row {
+          display: grid;
+          grid-template-columns: repeat(4, minmax(0, 1fr));
+          gap: 1rem;
+          margin-top: 0.25rem;
+        }
+        .qs-governance-card {
+          border: 1px solid rgba(255,255,255,0.10);
+          border-radius: 22px;
+          padding: 1.15rem 1.25rem 1rem;
+          background: linear-gradient(180deg, rgba(255,255,255,0.06), rgba(255,255,255,0.03));
+          box-shadow: inset 0 1px 0 rgba(255,255,255,0.04);
+        }
+        .qs-governance-title {
+          color: rgba(235, 226, 214, 0.78);
+          font-size: 0.72rem;
+          font-weight: 800;
+          text-transform: uppercase;
+          letter-spacing: 0.12em;
+          margin-bottom: 0.8rem;
+        }
+        .qs-governance-item {
+          display: flex;
+          align-items: baseline;
+          justify-content: space-between;
+          gap: 0.8rem;
+          padding: 0.14rem 0;
+        }
+        .qs-governance-key {
+          color: rgba(222, 214, 202, 0.74);
+          font-size: 0.98rem;
+          font-weight: 700;
+          letter-spacing: 0.01em;
+        }
+        .qs-governance-val {
+          color: rgba(255, 249, 242, 0.96);
+          font-family: var(--qs-display);
+          font-size: 1.08rem;
+          font-weight: 700;
+          white-space: nowrap;
+        }
+        @media (max-width: 980px) {
+          .qs-governance-row { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    label_map = {
+        "covered": "已覆盖",
+        "missing": "缺失",
+        "complete": "完整",
+        "partial": "部分",
+        "sparse": "稀疏",
+        "fresh": "新鲜",
+        "aging": "渐旧",
+        "stale": "过期",
+        "unknown": "未知",
+        "ready": "可用",
+        "usable": "可参考",
+    }
+
+    def _rows(title: str, counts: dict, order: List[str]) -> str:
+        items = "".join(
+            f"<div class='qs-governance-item'><span class='qs-governance-key'>{label_map.get(label, label)}</span><span class='qs-governance-val'>{int(counts.get(label, 0) or 0)}</span></div>"
+            for label in order
+        )
+        return f"<div class='qs-governance-card'><div class='qs-governance-title'>{title}</div>{items}</div>"
+
+    cards = "".join(
+        [
+            _rows("覆盖", governance.get("coverage", {}), ["covered", "missing"]),
+            _rows("完整度", governance.get("completeness", {}), ["complete", "partial", "sparse"]),
+            _rows("新鲜度", governance.get("freshness", {}), ["fresh", "aging", "stale", "unknown"]),
+            _rows("状态", governance.get("status", {}), ["ready", "usable", "stale", "missing"]),
+        ]
+    )
+    st.markdown(f"<div class='qs-governance-row'>{cards}</div>", unsafe_allow_html=True)
+
+
+def _flt_all_market_snapshot_summary() -> dict:
+    snapshot_df = filter_load_snapshot()
+    total = int(len(snapshot_df)) if isinstance(snapshot_df, pd.DataFrame) else 0
+    a_total = int(len(_flt_filter_snapshot_by_market(snapshot_df, "A")))
+    hk_total = int(len(_flt_filter_snapshot_by_market(snapshot_df, "HK")))
+    return {"total": total, "a_total": a_total, "hk_total": hk_total}
+
+
+def _flt_format_ops_fallback_warning(label: str, stats: dict, *, weekly: bool = False) -> str:
+    error_text = _safe_str(stats.get("error", "")).strip()
+    prefix = f"{label}{'周更' if weekly else '本次'}未连通接口，已回退本地快照。"
+    return f"{prefix} 原因：{error_text}" if error_text else prefix
+
+
+def _flt_format_source_summary(stats: dict) -> str:
+    text = _safe_str(stats.get("source_summary", "")).strip()
+    return f"来源：{text}" if text else ""
+
+
+def _flt_segment_choice_map() -> dict:
+    return {key: label for key, label in filter_get_a_enrich_segments()}
+
+
+def _flt_a_segment_status() -> List[dict]:
+    return filter_get_a_enrich_segment_status(filter_load_snapshot())
+
+
+def _flt_run_source_check(scope: str) -> None:
+    label = {"A": "A股", "HK": "港股", "ALL": "全市场"}.get(scope, scope)
+    with st.spinner(f"正在检测{label}数据源..."):
+        result = filter_check_market_data_source_status(scope)
+    store = st.session_state.setdefault("flt_ops_source_check_result", {})
+    store[str(scope).upper()] = result
+
+
+def _flt_render_source_check_result(scope: str) -> None:
+    result_map = st.session_state.get("flt_ops_source_check_result", {}) or {}
+    result = result_map.get(str(scope).upper())
+    if not result:
+        return
+    if bool(result.get("all_ok")):
+        st.success(f"数据源检测完成：{result.get('checked_at', '--')}，全部可用。")
+    else:
+        st.warning(f"数据源检测完成：{result.get('checked_at', '--')}，存在不可用源。")
+    rows = []
+    for item in result.get("sources", []):
+        rows.append(
+            {
+                "数据源": _safe_str(item.get("source")),
+                "状态": "可用" if bool(item.get("ok")) else "失败",
+                "耗时(秒)": float(item.get("elapsed_sec", 0.0) or 0.0),
+                "返回行数": int(item.get("rows", 0) or 0),
+                "原因": _safe_str(item.get("detail")),
+            }
+        )
+    if rows:
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+
+def _flt_run_market_update(scope: str, *, max_stocks: int, enrich_n: int, enrich_segment: str, force_refresh: bool, rotate_enrich: bool, safe_mode: bool) -> None:
+    label = {"A": "A股", "HK": "港股"}.get(scope, scope)
+    with st.spinner(f"正在执行{label}更新..."):
+        try:
+            stats = filter_refresh_market_snapshot(
+                max_stocks=int(max_stocks),
+                enrich_top_n=int(enrich_n if scope == "A" else 0),
+                force_refresh=bool(force_refresh),
+                rotate_enrich=bool(rotate_enrich),
+                market_scope=str(scope),
+                enrich_segment=str(enrich_segment),
+                weekly_mode=False,
+                safe_mode=bool(safe_mode),
+            )
+            if bool(stats.get("fallback", False)):
+                st.warning(_flt_format_ops_fallback_warning(label, stats, weekly=False))
+            else:
+                st.success(
+                    f"{label}更新完成：{stats.get('row_count', 0)} 只，"
+                    f"深补 {stats.get('enriched_count', 0)} 只 ｜ "
+                    f"{_safe_str(stats.get('enrich_segment_label', ''))} / 共 {int(stats.get('segment_total', 0) or 0)} 只"
+                    f"（区间 {int(stats.get('enrich_start', 0) or 0)} -> {int(stats.get('enrich_end', 0) or 0)}）"
+                )
+                st.caption(
+                    f"{_flt_format_source_summary(stats)} ｜ "
+                    f"缓存命中: {int(stats.get('cache_hit', 0) or 0)} ｜ "
+                    f"重抓: {int(stats.get('cache_miss', 0) or 0)}"
+                )
+            st.session_state["flt_result"] = None
+        except Exception as exc:
+            st.error(f"{label}更新失败: {exc}")
+
+
+def _flt_run_market_weekly(scope: str, *, enrich_n: int, enrich_segment: str) -> None:
+    label = {"A": "A股", "HK": "港股"}.get(scope, scope)
+    with st.spinner(f"正在执行{label}周更..."):
+        try:
+            stats = filter_refresh_market_snapshot(
+                max_stocks=0,
+                enrich_top_n=int(enrich_n if scope == "A" else 0),
+                force_refresh=False,
+                rotate_enrich=True,
+                market_scope=str(scope),
+                enrich_segment=str(enrich_segment),
+                weekly_mode=True,
+                safe_mode=True,
+            )
+            if bool(stats.get("skipped", False)):
+                st.info(_safe_str(stats.get("reason", "周更间隔未到，本次跳过")))
+            elif bool(stats.get("fallback", False)):
+                st.warning(_flt_format_ops_fallback_warning(label, stats, weekly=True))
+            else:
+                st.success(
+                    f"{label}周更完成：{stats.get('row_count', 0)} 只，"
+                    f"深补 {stats.get('enriched_count', 0)} 只 ｜ "
+                    f"{_safe_str(stats.get('enrich_segment_label', ''))} / 共 {int(stats.get('segment_total', 0) or 0)} 只"
+                    f"（区间 {int(stats.get('enrich_start', 0) or 0)} -> {int(stats.get('enrich_end', 0) or 0)}）"
+                )
+                source_caption = _flt_format_source_summary(stats)
+                if source_caption:
+                    st.caption(source_caption)
+            st.session_state["flt_result"] = None
+        except Exception as exc:
+            st.error(f"{label}周更失败: {exc}")
+
+
+def _flt_run_a_segment_enrich(segment_key: str, segment_label: str, segment_count: int, *, force_refresh: bool, safe_mode: bool) -> None:
+    if int(segment_count or 0) <= 0:
+        st.info(f"{segment_label} 当前没有可深补股票。")
+        return
+    status_rows = _flt_a_segment_status()
+    status_map = {str(row.get("key")): row for row in status_rows}
+    current_row = status_map.get(str(segment_key), {})
+    persisted_count = int(current_row.get("persisted_count", 0) or 0)
+    pending_count = max(0, int(segment_count or 0) - persisted_count)
+    if (not force_refresh) and pending_count <= 0:
+        st.info(f"{segment_label} 已全部深补完成；当前没有待补股票。")
+        return
+    with st.spinner(f"正在深补 {segment_label} ..."):
+        try:
+            stats = filter_refresh_market_snapshot(
+                max_stocks=0,
+                enrich_top_n=int(pending_count if (not force_refresh and pending_count > 0) else segment_count),
+                force_refresh=bool(force_refresh),
+                rotate_enrich=False,
+                market_scope="A",
+                enrich_segment=str(segment_key),
+                weekly_mode=False,
+                safe_mode=bool(safe_mode),
+                only_missing_enrich=True,
+            )
+            if bool(stats.get("fallback", False)):
+                st.warning(_flt_format_ops_fallback_warning("A股", stats, weekly=False))
+            else:
+                mode_label = "补缺" if bool(stats.get("only_missing_enrich", False)) else "全量重补"
+                base_total = int(stats.get("segment_pending", 0) or 0) if bool(stats.get("only_missing_enrich", False)) else int(stats.get('segment_total', 0) or 0)
+                st.success(
+                    f"{segment_label} {mode_label}完成：{int(stats.get('enriched_count', 0) or 0)} / {base_total}"
+                )
+                st.caption(
+                    f"{_flt_format_source_summary(stats)} ｜ "
+                    f"缓存命中: {int(stats.get('cache_hit', 0) or 0)} ｜ "
+                    f"重抓: {int(stats.get('cache_miss', 0) or 0)}"
+                )
+            st.session_state["flt_result"] = None
+        except Exception as exc:
+            st.error(f"{segment_label} 深补失败: {exc}")
+
+
+def _render_filter_market_ops_tab(scope: str, *, key_prefix: str) -> None:
+    label = {"A": "A股", "HK": "港股"}.get(scope, scope)
+    summary = _flt_market_snapshot_summary(scope)
+    weekly = filter_get_weekly_update_status(scope)
     weekly_state = "已到期可执行" if bool(weekly.get("due")) else f"未到期（剩余{float(weekly.get('remaining_hours', 0.0)):.1f}小时）"
+
+    st.markdown("### 基础快照")
+    st.caption("维护当前市场的基础行情底座，负责更新、周更和数据源连通性检测。")
+    render_status_row(
+        (
+            ("样本数量", f"{summary['total']} 只"),
+            ("上次周更", weekly.get("last") or "--"),
+            ("周更状态", weekly_state),
+        )
+    )
+    c1, c2, c3 = st.columns([1, 1, 1], vertical_alignment="bottom")
+    max_stocks = c1.number_input(f"{label}更新股票数（0=全部）", min_value=0, max_value=12000, value=0, step=200, key=f"{key_prefix}_max_stocks")
+    if scope == "A":
+        enrich_n = 0
+        enrich_segment = "sz_main"
+    else:
+        enrich_n = 0
+        enrich_segment = "sz_main"
+        c2.markdown("**港股深度补充**")
+        c2.caption("当前未接入港股逐股基本面深补，港股这里只更新行情快照。")
+    safe_mode = c3.checkbox("安全模式（防封）", value=True, key=f"{key_prefix}_safe_mode")
+    force_refresh = st.checkbox("忽略缓存强制重抓", value=False, key=f"{key_prefix}_force")
     st.caption(
-        f"周更(A+H)上次: {weekly.get('last') or '--'} ｜ 下次到期: {weekly.get('next_due') or '立即可执行'} ｜ 当前状态: {weekly_state}"
+        f"{label}周更上次: {weekly.get('last') or '--'} ｜ "
+        f"下次到期: {weekly.get('next_due') or '立即可执行'} ｜ "
+        f"当前状态: {weekly_state}"
     )
+    b1, b2, b3 = st.columns(3)
+    if b1.button(f"运行{label}更新", use_container_width=True, key=f"{key_prefix}_run_once"):
+        _flt_run_market_update(scope, max_stocks=int(max_stocks), enrich_n=int(enrich_n), enrich_segment=str(enrich_segment), force_refresh=bool(force_refresh), rotate_enrich=False, safe_mode=bool(safe_mode))
+    if b2.button(f"执行{label}周更（7天一次）", use_container_width=True, key=f"{key_prefix}_weekly"):
+        _flt_run_market_weekly(scope, enrich_n=int(enrich_n), enrich_segment=str(enrich_segment))
+    if b3.button(f"检测{label}数据源", use_container_width=True, key=f"{key_prefix}_source_check"):
+        _flt_run_source_check(scope)
+    _flt_render_source_check_result(scope)
 
-    u1, u2 = st.columns(2)
-    if u1.button("运行一次更新（运维台）", use_container_width=True, key="flt_ops_run_once"):
-        with st.spinner("正在执行运维更新..."):
-            try:
-                stats = filter_refresh_market_snapshot(
-                    max_stocks=int(max_stocks),
-                    enrich_top_n=int(enrich_n),
-                    force_refresh=bool(force_refresh),
-                    rotate_enrich=bool(rotate_enrich),
-                    market_scope=str(market_scope),
-                    weekly_mode=False,
-                    safe_mode=bool(safe_mode),
-                )
-                if bool(stats.get("fallback", False)):
-                    st.warning("本次未连通接口，已回退本地快照。")
-                else:
-                    st.success(
-                        f"更新完成：{stats.get('row_count', 0)} 只，深补 {stats.get('enriched_count', 0)} 只（区间 {int(stats.get('enrich_start', 0) or 0)} -> {int(stats.get('enrich_end', 0) or 0)}）"
+    if scope == "A":
+        st.markdown("<div style='height:1.4rem'></div>", unsafe_allow_html=True)
+        st.markdown("### 深补覆盖")
+        st.caption("按数据库治理口径展示当前 A股 深补资产的覆盖、有字段完整度、时间新鲜度和最终可用状态。")
+        governance = filter_get_enrichment_governance_summary("A")
+        _flt_render_governance_cards(governance)
+        st.caption(
+            f"覆盖：有无记录 ｜ 完整度：关键字段完备程度 ｜ 新鲜度：距上次深补的时间状态 ｜ "
+            f"状态：综合后的最终等级 ｜ 覆盖率 {float(governance.get('coverage_ratio', 0.0) or 0.0) * 100:.1f}%"
+        )
+
+        st.markdown("<div style='height:1.2rem'></div>", unsafe_allow_html=True)
+        st.markdown("### A股板块深补")
+        st.caption("点击下方板块按钮，直接深补该板块全部股票。")
+        segment_rows = _flt_a_segment_status()
+        store_summary = filter_get_stock_enrichment_store_summary()
+        completed_segments = sum(1 for row in segment_rows if _safe_str(row.get("status")) == "已完成")
+        st.caption(
+            f"持久化深补资产：A股 {int(store_summary.get('a_total', 0) or 0)} 条 ｜ "
+            f"已完成板块 {completed_segments}/{len(segment_rows)} ｜ "
+            f"最近深补 {_safe_str(store_summary.get('latest_enriched_at', '')) or '--'}"
+        )
+        for start in range(0, len(segment_rows), 4):
+            cols = st.columns(4)
+            for col, row in zip(cols, segment_rows[start : start + 4]):
+                label_text = f"{row['label']}（{int(row['count'])}）"
+                if col.button(label_text, use_container_width=True, key=f"{key_prefix}_seg_{row['key']}"):
+                    _flt_run_a_segment_enrich(
+                        segment_key=str(row["key"]),
+                        segment_label=str(row["label"]),
+                        segment_count=int(row["count"]),
+                        force_refresh=bool(force_refresh),
+                        safe_mode=bool(safe_mode),
                     )
-                    st.caption(f"缓存命中: {int(stats.get('cache_hit', 0) or 0)} ｜ 重抓: {int(stats.get('cache_miss', 0) or 0)}")
-                st.session_state["flt_result"] = None
-            except Exception as exc:
-                st.error(f"更新失败: {exc}")
+                persisted = int(row.get("persisted_count", 0) or 0)
+                total_count = int(row.get("count", 0) or 0)
+                col.caption(f"{_safe_str(row.get('status'))} ｜ 已深补 {persisted}/{total_count}")
+                last_text = _safe_str(row.get("last_enriched_at", ""))
+                col.caption(f"上次深补：{last_text}" if last_text else "上次深补：未深补")
 
-    if u2.button("执行周更（A+H，7天一次）", use_container_width=True, key="flt_ops_weekly"):
-        with st.spinner("正在执行周更..."):
+
+def _render_filter_ops_panel() -> None:
+    tab_a, tab_hk, tab_all = st.tabs(["A股", "港股", "总览"])
+    with tab_a:
+        _render_filter_market_ops_tab("A", key_prefix="flt_ops_a")
+    with tab_hk:
+        _render_filter_market_ops_tab("HK", key_prefix="flt_ops_hk")
+    with tab_all:
+        report = filter_get_snapshot_health_report(days=7, top_n=20)
+        backup_status = filter_get_snapshot_backup_status()
+        qc = report.get("quality_counts", {})
+        total = int(report.get("total", 0) or 0)
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("总样本", total)
+        m2.metric("full", int(qc.get("full", 0) or 0))
+        m3.metric("partial", int(qc.get("partial", 0) or 0))
+        m4.metric("missing", int(qc.get("missing", 0) or 0))
+        coverage_ratio = float(report.get("coverage_ratio", 0.0) or 0.0)
+        st.progress(coverage_ratio, text=f"覆盖率 {coverage_ratio * 100:.1f}%")
+
+        diag_xlsx = filter_export_snapshot_health_excel(days=30, top_n=50)
+        action_col1, action_col2 = st.columns(2)
+        action_col1.download_button(
+            "导出体检报告（Excel）",
+            data=diag_xlsx,
+            file_name=f"filter_health_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="flt_ops_export_health",
+        )
+        if action_col2.button("从备份恢复快照", use_container_width=True, disabled=not bool(backup_status.get("exists")), key="flt_ops_restore_backup"):
             try:
-                stats = filter_refresh_market_snapshot(
-                    max_stocks=0,
-                    enrich_top_n=int(enrich_n),
-                    force_refresh=False,
-                    rotate_enrich=True,
-                    market_scope="AH",
-                    weekly_mode=True,
-                    safe_mode=True,
+                restored = filter_restore_snapshot_from_backup()
+                st.success(
+                    f"已从备份恢复快照：{int(restored.get('row_count', 0) or 0)} 行，"
+                    f"恢复时间 {restored.get('restored_at', '--')}"
                 )
-                if bool(stats.get("skipped", False)):
-                    st.info(_safe_str(stats.get("reason", "周更间隔未到，本次跳过")))
-                elif bool(stats.get("fallback", False)):
-                    st.warning("周更回退到本地快照。")
-                else:
-                    st.success(
-                        f"周更完成：{stats.get('row_count', 0)} 只，深补 {stats.get('enriched_count', 0)} 只（区间 {int(stats.get('enrich_start', 0) or 0)} -> {int(stats.get('enrich_end', 0) or 0)}）"
-                    )
-                st.session_state["flt_result"] = None
+                st.rerun()
             except Exception as exc:
-                st.error(f"周更失败: {exc}")
+                st.error(f"恢复失败: {exc}")
+        if bool(backup_status.get("exists")):
+            st.caption(
+                f"当前备份：{int(backup_status.get('row_count', 0) or 0)} 行 ｜ "
+                f"备份时间 {backup_status.get('backup_at', '--') or '--'}"
+            )
+        else:
+            st.caption("当前没有可恢复的快照备份。")
 
-    report = filter_get_snapshot_health_report(days=7, top_n=20)
-    qc = report.get("quality_counts", {})
-    total = int(report.get("total", 0) or 0)
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("总样本", total)
-    m2.metric("full", int(qc.get("full", 0) or 0))
-    m3.metric("partial", int(qc.get("partial", 0) or 0))
-    m4.metric("missing", int(qc.get("missing", 0) or 0))
-    coverage_ratio = float(report.get("coverage_ratio", 0.0) or 0.0)
-    st.progress(coverage_ratio, text=f"覆盖率 {coverage_ratio * 100:.1f}%")
-
-    diag_xlsx = filter_export_snapshot_health_excel(days=30, top_n=50)
-    st.download_button(
-        "导出体检报告（Excel）",
-        data=diag_xlsx,
-        file_name=f"filter_health_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        key="flt_ops_export_health",
-    )
-
-    with st.expander("查看体检详情", expanded=False):
-        st.dataframe(report.get("trend_df", pd.DataFrame()), use_container_width=True, hide_index=True)
-        st.dataframe(report.get("runs_df", pd.DataFrame()), use_container_width=True, hide_index=True)
+        with st.expander("查看体检详情", expanded=False):
+            st.dataframe(report.get("trend_df", pd.DataFrame()), use_container_width=True, hide_index=True)
+            st.dataframe(report.get("runs_df", pd.DataFrame()), use_container_width=True, hide_index=True)
 
 
 def _render_filter_page():
@@ -1706,6 +2035,7 @@ def _render_filter_page():
 
     cfg = st.session_state.get("flt_cfg", filter_default_filter_config())
     meta = filter_get_snapshot_meta()
+    overall = _flt_all_market_snapshot_summary()
     render_section_intro(
         "数据运维台",
         "统一处理更新、周更与体检。点击下方按钮即可展开运维区；不展开时保持页面简洁。",
@@ -1732,64 +2062,13 @@ def _render_filter_page():
     render_status_row(
         (
             ("快照状态", meta.get("last_update", "尚未更新") if meta else "尚未更新"),
-            ("样本数量", f"{int(meta.get('row_count', 0) or 0)} 只" if meta else "0 只"),
-            ("深度补充", f"{int(meta.get('enriched_count', 0) or 0)} 只" if meta else "0 只"),
+            ("总样本", f"{int(overall.get('total', 0) or 0)} 只"),
+            ("A/H分布", f"A {int(overall.get('a_total', 0) or 0)} / HK {int(overall.get('hk_total', 0) or 0)}"),
         )
     )
     if bool(st.session_state.get("flt_show_ops_panel", False)):
         _render_filter_ops_panel()
         st.markdown("---")
-
-    if bool(st.session_state.get("flt_show_ops_panel", False)):
-        st.subheader("过滤器参数")
-        top_cols = st.columns([1.1, 1.1, 0.8, 1.0], vertical_alignment="bottom")
-        max_stocks = top_cols[0].number_input("本次更新股票数（0=全部）", min_value=0, max_value=6000, value=2000, step=100, key="flt_max_stocks_main")
-        enrich_n = top_cols[1].number_input("深度补充数量（调用基本面引擎）", min_value=0, max_value=2000, value=300, step=50, key="flt_enrich_n_main")
-        force_refresh = top_cols[2].checkbox("忽略缓存强制重抓", value=False, key="flt_force_refresh_main")
-        if top_cols[3].button("更新全市场数据", use_container_width=True, key="flt_refresh_market_main"):
-            with st.spinner("正在更新市场数据，请稍候..."):
-                try:
-                    stats = filter_refresh_market_snapshot(
-                        max_stocks=int(max_stocks),
-                        enrich_top_n=int(enrich_n),
-                        force_refresh=bool(force_refresh),
-                    )
-                    if bool(stats.get("fallback", False)):
-                        st.warning(
-                            "本次未连通东财接口，已回退为本地快照（未覆盖旧数据）。"
-                            "请检查系统代理/VPN后再重试。"
-                        )
-                    else:
-                        st.success(f"更新完成：{stats['row_count']} 只，深度补充 {stats['enriched_count']} 只")
-                    st.session_state["flt_result"] = None
-                    st.rerun()
-                except Exception as exc:
-                    st.error(f"更新失败: {exc}")
-
-        if meta:
-            st.caption(
-                f"最近更新: {meta.get('last_update', '--')} ｜ "
-                f"样本数量: {meta.get('row_count', '--')} ｜ "
-                f"深度补充: {meta.get('enriched_count', '--')}"
-            )
-
-        tpl_cols = st.columns([1.1, 0.65, 1.0, 0.65], vertical_alignment="bottom")
-        all_tpl = filter_load_templates()
-        tpl_names = sorted(all_tpl.keys())
-        selected_tpl = tpl_cols[0].selectbox("模板", options=["(无)"] + tpl_names, key="flt_tpl_select_main")
-        if tpl_cols[1].button("读取模板", use_container_width=True, key="flt_tpl_load_main"):
-            if selected_tpl and selected_tpl != "(无)":
-                st.session_state["flt_cfg"] = filter_get_template_config(selected_tpl)
-                st.success(f"已加载模板: {selected_tpl}")
-                st.rerun()
-
-        save_tpl_name = tpl_cols[2].text_input("保存为模板名", value="", key="flt_tpl_save_main")
-        if tpl_cols[3].button("保存模板", use_container_width=True, key="flt_tpl_save_btn_main"):
-            try:
-                filter_save_template(save_tpl_name, cfg)
-                st.success("模板已保存")
-            except Exception as exc:
-                st.error(str(exc))
 
     render_section_intro(
         "条件矩阵",
@@ -1820,7 +2099,7 @@ def _render_filter_page():
         """,
         unsafe_allow_html=True,
     )
-    mode = st.radio("筛选模式", options=["手动筛选", "AI辅助设定"], horizontal=True, key="flt_mode_main")
+    mode = st.radio("筛选模式", options=["手动筛选", "AI辅助设定", "模板筛选"], horizontal=True, key="flt_mode_main")
     if mode == "AI辅助设定":
         render_section_intro(
             "AI 条件草拟",
@@ -1834,6 +2113,29 @@ def _render_filter_page():
             st.session_state["flt_cfg"] = cfg
             st.success("已根据描述生成条件，你可继续微调后执行筛选。")
             st.rerun()
+    elif mode == "模板筛选":
+        render_section_intro(
+            "模板筛选",
+            "直接加载现成模板后执行筛选，适合重复使用固定风格的条件集。",
+            kicker="Template",
+            pills=("读取模板", "保存模板", "快速复用"),
+        )
+        tpl_cols = st.columns([1.1, 0.65, 1.0, 0.65], vertical_alignment="bottom")
+        all_tpl = filter_load_templates()
+        tpl_names = sorted(all_tpl.keys())
+        selected_tpl = tpl_cols[0].selectbox("模板", options=["(无)"] + tpl_names, key="flt_tpl_select_main")
+        if tpl_cols[1].button("读取模板", use_container_width=True, key="flt_tpl_load_main"):
+            if selected_tpl and selected_tpl != "(无)":
+                st.session_state["flt_cfg"] = filter_get_template_config(selected_tpl)
+                st.success(f"已加载模板: {selected_tpl}")
+                st.rerun()
+        save_tpl_name = tpl_cols[2].text_input("保存为模板名", value="", key="flt_tpl_save_main")
+        if tpl_cols[3].button("保存模板", use_container_width=True, key="flt_tpl_save_btn_main"):
+            try:
+                filter_save_template(save_tpl_name, cfg)
+                st.success("模板已保存")
+            except Exception as exc:
+                st.error(str(exc))
     st.subheader("筛选条件（支持手动开关，像电商筛选一样）")
 
     with st.expander("A. 财务健康度与硬排除", expanded=True):

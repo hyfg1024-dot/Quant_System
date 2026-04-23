@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import contextlib
 import io
 import json
 import os
@@ -24,7 +25,7 @@ if str(FUNDAMENTAL_DIR) not in sys.path:
 
 from fundamental_engine import analyze_fundamental
 
-APP_VERSION = "FLT-20260327-02"
+APP_VERSION = "FLT-20260423-06"
 DATA_DIR = CURRENT_DIR / "data"
 CACHE_DIR = DATA_DIR / "cache"
 DB_PATH = DATA_DIR / "filter_market.db"
@@ -161,6 +162,413 @@ DISPLAY_COLUMNS = [
     "missing_fields",
 ]
 
+ENRICHMENT_FIELD_COLUMNS: List[str] = [
+    "pe_dynamic",
+    "pe_static",
+    "pe_ttm",
+    "pb",
+    "dividend_yield",
+    "total_mv",
+    "roe",
+    "gross_margin",
+    "net_margin",
+    "asset_liability_ratio",
+    "current_ratio",
+    "operating_cashflow_3y",
+    "receivable_revenue_ratio",
+    "goodwill_equity_ratio",
+    "interest_debt_asset_ratio",
+    "ev_ebitda",
+    "revenue_growth",
+    "profit_growth",
+    "revenue_cagr_5y",
+    "profit_cagr_5y",
+    "roe_avg_5y",
+    "debt_ratio_avg_5y",
+    "gross_margin_avg_5y",
+    "debt_ratio_change_5y",
+    "gross_margin_change_5y",
+    "ocf_positive_years_5y",
+    "total_score",
+    "conclusion",
+    "coverage_ratio",
+    "audit_opinion",
+    "enriched_at",
+    "source_note",
+]
+
+ENRICHMENT_NUMERIC_COLUMNS: List[str] = [
+    "pe_dynamic",
+    "pe_static",
+    "pe_ttm",
+    "pb",
+    "dividend_yield",
+    "total_mv",
+    "roe",
+    "gross_margin",
+    "net_margin",
+    "asset_liability_ratio",
+    "current_ratio",
+    "operating_cashflow_3y",
+    "receivable_revenue_ratio",
+    "goodwill_equity_ratio",
+    "interest_debt_asset_ratio",
+    "ev_ebitda",
+    "revenue_growth",
+    "profit_growth",
+    "revenue_cagr_5y",
+    "profit_cagr_5y",
+    "roe_avg_5y",
+    "debt_ratio_avg_5y",
+    "gross_margin_avg_5y",
+    "debt_ratio_change_5y",
+    "gross_margin_change_5y",
+    "ocf_positive_years_5y",
+    "total_score",
+    "coverage_ratio",
+]
+
+ENRICHMENT_STORE_COLUMNS: List[str] = [
+    "market",
+    "code",
+    "name",
+    *ENRICHMENT_FIELD_COLUMNS,
+    "app_version",
+    "persisted_at",
+]
+ENRICHMENT_COMPLETENESS_FIELDS: List[str] = [
+    "pe_ttm",
+    "pb",
+    "roe",
+    "gross_margin",
+    "net_margin",
+    "asset_liability_ratio",
+    "operating_cashflow_3y",
+    "revenue_cagr_5y",
+    "profit_cagr_5y",
+    "total_score",
+]
+
+FRESH_WINDOW_DAYS = 7
+AGING_WINDOW_DAYS = 30
+
+
+A_ENRICH_SEGMENTS: List[Tuple[str, str]] = [
+    ("sz_main", "000/001 深主板"),
+    ("sme", "002 中小盘"),
+    ("gem_300", "300 创业板"),
+    ("gem_301", "301 创业板"),
+    ("sh_main_600_601", "600/601 沪主板"),
+    ("sh_main_603_605", "603/605 沪主板"),
+    ("star", "688 科创板"),
+    ("bse", "北交所"),
+]
+
+
+def get_a_enrich_segments() -> List[Tuple[str, str]]:
+    return list(A_ENRICH_SEGMENTS)
+
+
+def get_a_enrich_segment_counts(snapshot_df: Optional[pd.DataFrame] = None) -> List[Dict[str, Any]]:
+    if snapshot_df is None:
+        snapshot_df = load_snapshot()
+    if snapshot_df is None or snapshot_df.empty or "market" not in snapshot_df.columns:
+        source_df = pd.DataFrame(columns=["market", "code"])
+    else:
+        source_df = snapshot_df.copy()
+    source_df["market"] = source_df.get("market", pd.Series(dtype=object)).astype(str).str.upper()
+    a_df = source_df[source_df["market"] == "A"].copy()
+    codes = a_df.get("code", pd.Series(dtype=object)).astype(str).tolist()
+    rows: List[Dict[str, Any]] = []
+    for key, label in A_ENRICH_SEGMENTS:
+        count = sum(1 for code in codes if _match_a_enrich_segment(code, key))
+        rows.append({"key": key, "label": label, "count": int(count)})
+    return rows
+
+
+def get_a_enrich_segment_status(snapshot_df: Optional[pd.DataFrame] = None) -> List[Dict[str, Any]]:
+    meta = get_snapshot_meta()
+    rows = get_a_enrich_segment_counts(snapshot_df=snapshot_df)
+    enrich_df = _load_stock_enrichment_latest()
+    if enrich_df is None or enrich_df.empty:
+        enrich_df = pd.DataFrame(columns=["market", "code", "enriched_at", "persisted_at"])
+    enrich_df = enrich_df.copy()
+    enrich_df["market"] = enrich_df.get("market", pd.Series(dtype=object)).astype(str).str.upper()
+    enrich_df = enrich_df[enrich_df["market"] == "A"].copy()
+    for row in rows:
+        seg_key = _safe_str(row.get("key"))
+        seg_df = enrich_df[enrich_df.get("code", pd.Series(dtype=object)).astype(str).map(lambda x: _match_a_enrich_segment(x, seg_key))].copy()
+        persisted_count = int(len(seg_df))
+        last_text = _safe_str(meta.get(f"last_enrich_segment_at_{seg_key}", ""))
+        if not last_text and not seg_df.empty:
+            last_candidates = pd.Series(dtype=object)
+            if "enriched_at" in seg_df.columns:
+                last_candidates = seg_df["enriched_at"].astype(str).str.strip()
+                last_candidates = last_candidates[(last_candidates != "") & (last_candidates.str.lower() != "none")]
+            if last_candidates.empty and "persisted_at" in seg_df.columns:
+                last_candidates = seg_df["persisted_at"].astype(str).str.strip()
+                last_candidates = last_candidates[(last_candidates != "") & (last_candidates.str.lower() != "none")]
+            if not last_candidates.empty:
+                last_text = _safe_str(last_candidates.max())
+        row["persisted_count"] = persisted_count
+        row["last_enriched_at"] = last_text
+        total_count = int(row.get("count") or 0)
+        if persisted_count <= 0:
+            row["status"] = "未深补"
+        elif total_count > 0 and persisted_count >= total_count:
+            row["status"] = "已完成"
+        else:
+            row["status"] = "部分完成"
+    return rows
+
+
+def get_stock_enrichment_store_summary() -> Dict[str, Any]:
+    enrich_df = _load_stock_enrichment_latest()
+    if enrich_df is None or enrich_df.empty:
+        return {
+            "total": 0,
+            "a_total": 0,
+            "hk_total": 0,
+            "latest_enriched_at": "",
+            "latest_persisted_at": "",
+        }
+    work_df = enrich_df.copy()
+    work_df["market"] = work_df.get("market", pd.Series(dtype=object)).astype(str).str.upper()
+    latest_enriched = ""
+    if "enriched_at" in work_df.columns:
+        enriched_series = work_df["enriched_at"].astype(str).str.strip()
+        enriched_series = enriched_series[(enriched_series != "") & (enriched_series.str.lower() != "none")]
+        if not enriched_series.empty:
+            latest_enriched = _safe_str(enriched_series.max())
+    latest_persisted = ""
+    if "persisted_at" in work_df.columns:
+        persisted_series = work_df["persisted_at"].astype(str).str.strip()
+        persisted_series = persisted_series[(persisted_series != "") & (persisted_series.str.lower() != "none")]
+        if not persisted_series.empty:
+            latest_persisted = _safe_str(persisted_series.max())
+    return {
+        "total": int(len(work_df)),
+        "a_total": int((work_df["market"] == "A").sum()),
+        "hk_total": int((work_df["market"] == "HK").sum()),
+        "latest_enriched_at": latest_enriched,
+        "latest_persisted_at": latest_persisted,
+    }
+
+
+def _parse_datetime_value(v: Any) -> Optional[datetime]:
+    text = _safe_str(v)
+    if not text:
+        return None
+    for parser in (datetime.fromisoformat, lambda x: datetime.strptime(x, "%Y-%m-%d %H:%M:%S")):
+        try:
+            return parser(text)
+        except Exception:
+            continue
+    return None
+
+
+def _classify_enrichment_completeness(row: pd.Series) -> str:
+    total_fields = len(ENRICHMENT_COMPLETENESS_FIELDS)
+    if total_fields <= 0:
+        return "sparse"
+    filled = sum(1 for col in ENRICHMENT_COMPLETENESS_FIELDS if _to_float(row.get(col)) is not None)
+    ratio = filled / total_fields
+    if ratio >= 0.8:
+        return "complete"
+    if ratio >= 0.3:
+        return "partial"
+    return "sparse"
+
+
+def _classify_enrichment_freshness(row: pd.Series) -> str:
+    dt_val = _parse_datetime_value(row.get("enriched_at")) or _parse_datetime_value(row.get("persisted_at"))
+    if dt_val is None:
+        return "unknown"
+    age_days = (datetime.now() - dt_val).total_seconds() / 86400.0
+    if age_days <= FRESH_WINDOW_DAYS:
+        return "fresh"
+    if age_days <= AGING_WINDOW_DAYS:
+        return "aging"
+    return "stale"
+
+
+def _classify_enrichment_status(*, covered: bool, completeness: str, freshness: str) -> str:
+    if not covered:
+        return "missing"
+    if freshness in {"stale", "unknown"}:
+        return "stale"
+    if completeness == "complete" and freshness == "fresh":
+        return "ready"
+    return "usable"
+
+
+def get_enrichment_governance_summary(
+    scope: str = "all",
+    snapshot_df: Optional[pd.DataFrame] = None,
+) -> Dict[str, Any]:
+    if snapshot_df is None:
+        snapshot_df = load_snapshot()
+    if snapshot_df is None or snapshot_df.empty:
+        return {
+            "scope": _safe_str(scope).upper() or "ALL",
+            "total": 0,
+            "coverage": {"covered": 0, "missing": 0},
+            "completeness": {"complete": 0, "partial": 0, "sparse": 0},
+            "freshness": {"fresh": 0, "aging": 0, "stale": 0, "unknown": 0},
+            "status": {"ready": 0, "usable": 0, "stale": 0, "missing": 0},
+            "coverage_ratio": 0.0,
+            "latest_enriched_at": "",
+            "latest_persisted_at": "",
+        }
+
+    scope_norm = _safe_str(scope).upper()
+    work_df = snapshot_df.copy()
+    if "market" in work_df.columns:
+        work_df["market"] = work_df["market"].astype(str).str.upper()
+        if scope_norm in {"A", "HK"}:
+            work_df = work_df[work_df["market"] == scope_norm].copy()
+    else:
+        work_df["market"] = "A"
+    key_df = work_df[["market", "code"]].copy() if "code" in work_df.columns else pd.DataFrame(columns=["market", "code"])
+    key_df["code"] = key_df.get("code", pd.Series(dtype=object)).astype(str)
+    total = int(len(key_df))
+
+    enrich_df = _load_stock_enrichment_latest()
+    if enrich_df is None or enrich_df.empty:
+        enrich_df = pd.DataFrame(columns=["market", "code", *ENRICHMENT_COMPLETENESS_FIELDS, "enriched_at", "persisted_at"])
+    enrich_df = enrich_df.copy()
+    enrich_df["market"] = enrich_df.get("market", pd.Series(dtype=object)).astype(str).str.upper()
+    enrich_df["code"] = enrich_df.get("code", pd.Series(dtype=object)).astype(str)
+    if scope_norm in {"A", "HK"}:
+        enrich_df = enrich_df[enrich_df["market"] == scope_norm].copy()
+    enrich_df["__covered"] = 1
+    sort_cols = [col for col in ["enriched_at", "persisted_at"] if col in enrich_df.columns]
+    if sort_cols:
+        enrich_df = enrich_df.sort_values(by=sort_cols, ascending=False, na_position="last")
+    enrich_df = enrich_df.drop_duplicates(subset=["market", "code"], keep="first")
+
+    merge_cols = ["market", "code"]
+    attach_cols = [col for col in ["__covered", *ENRICHMENT_COMPLETENESS_FIELDS, "enriched_at", "persisted_at"] if col in enrich_df.columns]
+    merged = key_df.merge(enrich_df[merge_cols + attach_cols], on=merge_cols, how="left")
+    if merged.empty:
+        return {
+            "scope": scope_norm or "ALL",
+            "total": total,
+            "coverage": {"covered": 0, "missing": total},
+            "completeness": {"complete": 0, "partial": 0, "sparse": 0},
+            "freshness": {"fresh": 0, "aging": 0, "stale": 0, "unknown": 0},
+            "status": {"ready": 0, "usable": 0, "stale": 0, "missing": total},
+            "coverage_ratio": 0.0,
+            "latest_enriched_at": "",
+            "latest_persisted_at": "",
+        }
+
+    merged["coverage_flag"] = merged["__covered"].fillna(0).astype(int)
+    merged["coverage_label"] = merged["coverage_flag"].map(lambda x: "covered" if int(x) == 1 else "missing")
+
+    covered_df = merged[merged["coverage_flag"] == 1].copy()
+    if covered_df.empty:
+        completeness_counts = {"complete": 0, "partial": 0, "sparse": 0}
+        freshness_counts = {"fresh": 0, "aging": 0, "stale": 0, "unknown": 0}
+        latest_enriched = ""
+        latest_persisted = ""
+    else:
+        covered_df["completeness_label"] = covered_df.apply(_classify_enrichment_completeness, axis=1)
+        covered_df["freshness_label"] = covered_df.apply(_classify_enrichment_freshness, axis=1)
+        comp_vc = covered_df["completeness_label"].value_counts(dropna=False).to_dict()
+        completeness_counts = {
+            "complete": int(comp_vc.get("complete", 0)),
+            "partial": int(comp_vc.get("partial", 0)),
+            "sparse": int(comp_vc.get("sparse", 0)),
+        }
+        fresh_vc = covered_df["freshness_label"].value_counts(dropna=False).to_dict()
+        freshness_counts = {
+            "fresh": int(fresh_vc.get("fresh", 0)),
+            "aging": int(fresh_vc.get("aging", 0)),
+            "stale": int(fresh_vc.get("stale", 0)),
+            "unknown": int(fresh_vc.get("unknown", 0)),
+        }
+        enriched_series = covered_df["enriched_at"].astype(str).str.strip()
+        enriched_series = enriched_series[(enriched_series != "") & (enriched_series.str.lower() != "none")]
+        latest_enriched = _safe_str(enriched_series.max()) if not enriched_series.empty else ""
+        persisted_series = covered_df["persisted_at"].astype(str).str.strip()
+        persisted_series = persisted_series[(persisted_series != "") & (persisted_series.str.lower() != "none")]
+        latest_persisted = _safe_str(persisted_series.max()) if not persisted_series.empty else ""
+
+    merged["completeness_label"] = "sparse"
+    merged["freshness_label"] = "unknown"
+    if not covered_df.empty:
+        merged.loc[covered_df.index, "completeness_label"] = covered_df["completeness_label"]
+        merged.loc[covered_df.index, "freshness_label"] = covered_df["freshness_label"]
+    merged["status_label"] = merged.apply(
+        lambda row: _classify_enrichment_status(
+            covered=bool(int(row.get("coverage_flag", 0) or 0)),
+            completeness=_safe_str(row.get("completeness_label")) or "sparse",
+            freshness=_safe_str(row.get("freshness_label")) or "unknown",
+        ),
+        axis=1,
+    )
+    cov_vc = merged["coverage_label"].value_counts(dropna=False).to_dict()
+    status_vc = merged["status_label"].value_counts(dropna=False).to_dict()
+    coverage_counts = {
+        "covered": int(cov_vc.get("covered", 0)),
+        "missing": int(cov_vc.get("missing", 0)),
+    }
+    status_counts = {
+        "ready": int(status_vc.get("ready", 0)),
+        "usable": int(status_vc.get("usable", 0)),
+        "stale": int(status_vc.get("stale", 0)),
+        "missing": int(status_vc.get("missing", 0)),
+    }
+    coverage_ratio = (coverage_counts["covered"] / total) if total > 0 else 0.0
+    return {
+        "scope": scope_norm or "ALL",
+        "total": total,
+        "coverage": coverage_counts,
+        "completeness": completeness_counts,
+        "freshness": freshness_counts,
+        "status": status_counts,
+        "coverage_ratio": coverage_ratio,
+        "latest_enriched_at": latest_enriched,
+        "latest_persisted_at": latest_persisted,
+    }
+
+
+def _normalize_enrich_segment(segment: Any) -> str:
+    seg = _safe_str(segment).lower()
+    valid = {key for key, _ in A_ENRICH_SEGMENTS}
+    return seg if seg in valid else "sz_main"
+
+
+def _get_enrich_segment_label(segment: Any) -> str:
+    seg = _normalize_enrich_segment(segment)
+    mapping = {key: label for key, label in A_ENRICH_SEGMENTS}
+    return mapping.get(seg, "000/001 深主板")
+
+
+def _match_a_enrich_segment(code: Any, segment: Any) -> bool:
+    code_text = _safe_str(code)
+    seg = _normalize_enrich_segment(segment)
+    if not re.fullmatch(r"\d{6}", code_text):
+        return False
+    if seg == "sz_main":
+        return code_text.startswith(("000", "001"))
+    if seg == "sme":
+        return code_text.startswith("002")
+    if seg == "gem_300":
+        return code_text.startswith("300")
+    if seg == "gem_301":
+        return code_text.startswith("301")
+    if seg == "sh_main_600_601":
+        return code_text.startswith(("600", "601"))
+    if seg == "sh_main_603_605":
+        return code_text.startswith(("603", "605"))
+    if seg == "star":
+        return code_text.startswith("688")
+    if seg == "bse":
+        return code_text.startswith(("4", "8", "92"))
+    return False
+
 
 def ensure_dirs() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -218,10 +626,65 @@ _PROXY_ENV_KEYS = (
 )
 
 
+def _get_explicit_http_proxy() -> str:
+    for key in ("FILTER_HTTP_PROXY", "SURGE_HTTP_PROXY", "HTTP_PROXY", "http_proxy"):
+        value = _safe_str(os.environ.get(key))
+        if value:
+            return value
+    return "http://127.0.0.1:6152"
+
+
+def _build_request_session(*, use_system_proxy: bool = False) -> requests.Session:
+    ses = requests.Session()
+    if use_system_proxy:
+        proxy_url = _get_explicit_http_proxy()
+        ses.trust_env = False
+        ses.proxies.update({"http": proxy_url, "https": proxy_url})
+    else:
+        ses.trust_env = False
+    return ses
+
+
+@contextlib.contextmanager
+def _temporary_proxy_env(proxy_url: Optional[str] = None, *, disable: bool = False):
+    backup = {k: os.environ.get(k, _ENV_MISSING) for k in _PROXY_ENV_KEYS}
+    try:
+        for k in _PROXY_ENV_KEYS:
+            os.environ.pop(k, None)
+        if disable:
+            os.environ["NO_PROXY"] = "*"
+            os.environ["no_proxy"] = "*"
+        elif proxy_url:
+            os.environ["HTTP_PROXY"] = proxy_url
+            os.environ["HTTPS_PROXY"] = proxy_url
+            os.environ["ALL_PROXY"] = proxy_url
+            os.environ["http_proxy"] = proxy_url
+            os.environ["https_proxy"] = proxy_url
+            os.environ["all_proxy"] = proxy_url
+        yield
+    finally:
+        for k, v in backup.items():
+            if v is _ENV_MISSING:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = str(v)
+
+
 def _ak_call_with_proxy_fallback(func, *args, **kwargs):
     last_exc: Optional[Exception] = None
 
-    # 第一轮：按当前环境直接请求
+    explicit_proxy = _get_explicit_http_proxy()
+
+    # 第一轮：显式走本机代理（适配 Surge）
+    for _ in range(2):
+        with _temporary_proxy_env(explicit_proxy):
+            try:
+                return func(*args, **kwargs)
+            except Exception as exc:
+                last_exc = exc
+        time.sleep(0.8)
+
+    # 第二轮：按当前环境直接请求
     for _ in range(2):
         try:
             return func(*args, **kwargs)
@@ -229,26 +692,14 @@ def _ak_call_with_proxy_fallback(func, *args, **kwargs):
             last_exc = exc
             time.sleep(0.8)
 
-    # 第二轮：临时关闭代理环境变量后重试
-    backup = {k: os.environ.get(k, _ENV_MISSING) for k in _PROXY_ENV_KEYS}
-    try:
-        for k in _PROXY_ENV_KEYS:
-            os.environ.pop(k, None)
-        os.environ["NO_PROXY"] = "*"
-        os.environ["no_proxy"] = "*"
-
+    # 第三轮：临时关闭代理环境变量后重试
+    with _temporary_proxy_env(disable=True):
         for _ in range(2):
             try:
                 return func(*args, **kwargs)
             except Exception as exc:
                 last_exc = exc
-                time.sleep(0.8)
-    finally:
-        for k, v in backup.items():
-            if v is _ENV_MISSING:
-                os.environ.pop(k, None)
-            else:
-                os.environ[k] = str(v)
+            time.sleep(0.8)
 
     if last_exc is not None:
         raise last_exc
@@ -420,7 +871,214 @@ def init_db() -> None:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS market_snapshot_backup AS
+            SELECT *, '' AS backup_at
+            FROM market_snapshot
+            WHERE 0
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS stock_enrichment_latest (
+                market TEXT NOT NULL,
+                code TEXT NOT NULL,
+                name TEXT,
+                pe_dynamic REAL,
+                pe_static REAL,
+                pe_ttm REAL,
+                pb REAL,
+                dividend_yield REAL,
+                total_mv REAL,
+                roe REAL,
+                gross_margin REAL,
+                net_margin REAL,
+                asset_liability_ratio REAL,
+                current_ratio REAL,
+                operating_cashflow_3y REAL,
+                receivable_revenue_ratio REAL,
+                goodwill_equity_ratio REAL,
+                interest_debt_asset_ratio REAL,
+                ev_ebitda REAL,
+                revenue_growth REAL,
+                profit_growth REAL,
+                revenue_cagr_5y REAL,
+                profit_cagr_5y REAL,
+                roe_avg_5y REAL,
+                debt_ratio_avg_5y REAL,
+                gross_margin_avg_5y REAL,
+                debt_ratio_change_5y REAL,
+                gross_margin_change_5y REAL,
+                ocf_positive_years_5y REAL,
+                total_score REAL,
+                conclusion TEXT,
+                coverage_ratio REAL,
+                audit_opinion TEXT,
+                enriched_at TEXT,
+                source_note TEXT,
+                app_version TEXT,
+                persisted_at TEXT,
+                PRIMARY KEY (market, code)
+            )
+            """
+        )
         conn.commit()
+    _migrate_snapshot_enrichment_to_latest()
+
+
+def _has_meaningful_enrichment(row: pd.Series) -> bool:
+    enriched_text = _safe_str(row.get("enriched_at", ""))
+    if enriched_text:
+        return True
+    for col in [
+        "total_score",
+        "coverage_ratio",
+        "revenue_cagr_5y",
+        "profit_cagr_5y",
+        "roe_avg_5y",
+        "debt_ratio_avg_5y",
+        "gross_margin_avg_5y",
+        "operating_cashflow_3y",
+    ]:
+        if _to_float(row.get(col)) is not None:
+            return True
+    return False
+
+
+def _normalize_enrichment_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {
+        "market": _safe_str(row.get("market")).upper(),
+        "code": _safe_str(row.get("code")),
+        "name": _safe_str(row.get("name")),
+        "conclusion": _safe_str(row.get("conclusion")) or "观察",
+        "audit_opinion": _safe_str(row.get("audit_opinion")) or "标准无保留意见",
+        "enriched_at": _safe_str(row.get("enriched_at")),
+        "source_note": _safe_str(row.get("source_note")),
+        "app_version": _safe_str(row.get("app_version")) or APP_VERSION,
+        "persisted_at": _safe_str(row.get("persisted_at")) or datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    for col in ENRICHMENT_NUMERIC_COLUMNS:
+        out[col] = _to_float(row.get(col))
+    return out
+
+
+def _upsert_stock_enrichment_latest(rows: List[Dict[str, Any]]) -> int:
+    if not rows:
+        return 0
+    normalized_rows = [_normalize_enrichment_row(row) for row in rows if _safe_str(row.get("market")) and _safe_str(row.get("code"))]
+    if not normalized_rows:
+        return 0
+    placeholders = ", ".join(["?"] * len(ENRICHMENT_STORE_COLUMNS))
+    updates = ", ".join(
+        [
+            f"{col}=excluded.{col}"
+            for col in ENRICHMENT_STORE_COLUMNS
+            if col not in {"market", "code"}
+        ]
+    )
+    sql = (
+        f"INSERT INTO stock_enrichment_latest ({', '.join(ENRICHMENT_STORE_COLUMNS)}) "
+        f"VALUES ({placeholders}) "
+        f"ON CONFLICT(market, code) DO UPDATE SET {updates}"
+    )
+    values = [tuple(row.get(col) for col in ENRICHMENT_STORE_COLUMNS) for row in normalized_rows]
+    with _connect() as conn:
+        conn.executemany(sql, values)
+        conn.commit()
+    return len(values)
+
+
+def _migrate_snapshot_enrichment_to_latest() -> int:
+    try:
+        with _connect() as conn:
+            snapshot_df = pd.read_sql_query("SELECT * FROM market_snapshot", conn)
+    except Exception:
+        return 0
+    if snapshot_df is None or snapshot_df.empty:
+        return 0
+    rows: List[Dict[str, Any]] = []
+    for _, row in snapshot_df.iterrows():
+        if not _has_meaningful_enrichment(row):
+            continue
+        item = {col: row.get(col) for col in ["market", "code", "name", *ENRICHMENT_FIELD_COLUMNS]}
+        item["app_version"] = APP_VERSION
+        item["persisted_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        rows.append(item)
+    return _upsert_stock_enrichment_latest(rows)
+
+
+def _load_stock_enrichment_latest() -> pd.DataFrame:
+    init_db()
+    with _connect() as conn:
+        try:
+            return pd.read_sql_query("SELECT * FROM stock_enrichment_latest", conn)
+        except Exception:
+            return pd.DataFrame()
+
+
+def _apply_data_quality(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+    key_cols = [
+        "pe_ttm",
+        "pb",
+        "dividend_yield",
+        "roe",
+        "gross_margin",
+        "net_margin",
+        "asset_liability_ratio",
+        "operating_cashflow_3y",
+    ]
+
+    def _quality(row: pd.Series) -> str:
+        cnt = sum(1 for c in key_cols if _to_float(row.get(c)) is not None)
+        if cnt >= 6:
+            return "full"
+        if cnt >= 3:
+            return "partial"
+        return "missing"
+
+    out = df.copy()
+    out["data_quality"] = out.apply(_quality, axis=1)
+    return out
+
+
+def _overlay_latest_enrichment(snapshot_df: pd.DataFrame) -> pd.DataFrame:
+    if snapshot_df is None or snapshot_df.empty:
+        return snapshot_df
+    enrich_df = _load_stock_enrichment_latest()
+    if enrich_df is None or enrich_df.empty:
+        return _apply_data_quality(snapshot_df)
+    merge_cols = ["market", "code"]
+    enrich_cols = [col for col in ENRICHMENT_FIELD_COLUMNS if col in enrich_df.columns]
+    merge_df = enrich_df[merge_cols + enrich_cols].copy()
+    merge_df = merge_df.rename(columns={col: f"{col}__latest" for col in enrich_cols})
+    out = snapshot_df.merge(merge_df, on=merge_cols, how="left")
+    for col in enrich_cols:
+        latest_col = f"{col}__latest"
+        if latest_col not in out.columns:
+            continue
+        if col not in out.columns:
+            out[col] = out[latest_col]
+        else:
+            out[col] = out[latest_col].where(out[latest_col].notna(), out[col])
+        out = out.drop(columns=[latest_col])
+    return _apply_data_quality(out)
+
+
+def _build_enrichment_persist_row(row: pd.Series, *, source_note: str = "") -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "market": _safe_str(row.get("market")).upper(),
+        "code": _safe_str(row.get("code")),
+        "name": _safe_str(row.get("name")),
+        "app_version": APP_VERSION,
+        "persisted_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "source_note": _safe_str(source_note) or _safe_str(row.get("source_note")),
+    }
+    for col in ENRICHMENT_FIELD_COLUMNS:
+        payload[col] = row.get(col)
+    return payload
 
 
 def default_filter_config() -> Dict[str, Any]:
@@ -545,14 +1203,15 @@ def _enrich_one(code: str, name: str, force_refresh: bool = False) -> Tuple[Dict
     return payload, "live", datetime.now().isoformat(timespec="seconds")
 
 
-def _build_universe_from_spot(spot_df: pd.DataFrame, market: str) -> pd.DataFrame:
+def _build_universe_from_spot(spot_df: pd.DataFrame, market: str, source_note: Optional[str] = None) -> pd.DataFrame:
     mkt = _safe_str(market).upper()
     if mkt == "HK":
         raw_code = _pick_series(spot_df, ["代码", "证券代码", "symbol", "Symbol"]).astype(str).str.extract(r"(\d+)")[0].fillna("")
         code = raw_code.map(_normalize_hk_company_code)
     else:
-        code = _pick_series(spot_df, ["代码"]).astype(str).str.strip().str.zfill(6)
-    name = _clean_text_series(_pick_series(spot_df, ["名称", "股票名称", "简称"]))
+        raw_code = _pick_series(spot_df, ["代码", "symbol", "Symbol"]).astype(str).str.extract(r"(\d{6})")[0].fillna("")
+        code = raw_code.str.zfill(6)
+    name = _clean_text_series(_pick_series(spot_df, ["名称", "中文名称", "股票名称", "简称"]))
     industry = _clean_text_series(_pick_series(spot_df, ["所处行业", "所属行业", "行业", "industry"]))
 
     df = pd.DataFrame(
@@ -621,18 +1280,75 @@ def _build_universe_from_spot(spot_df: pd.DataFrame, market: str) -> pd.DataFram
     df["audit_opinion"] = "标准无保留意见"
 
     df["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    df["source_note"] = f"ak.spot_{mkt.lower()} + fundamental_enrich"
+    df["source_note"] = _safe_str(source_note) or f"ak.spot_{mkt.lower()} + fundamental_enrich"
     return df
 
 
+def _retry_hk_fetch(fetcher, *, label: str, attempts: int = 3) -> pd.DataFrame:
+    last_exc: Optional[Exception] = None
+    for attempt in range(attempts):
+        try:
+            df = fetcher()
+            if df is None or df.empty:
+                raise RuntimeError(f"{label}结果为空")
+            return df
+        except Exception as exc:
+            last_exc = exc
+            if attempt < attempts - 1:
+                time.sleep(0.8 + attempt * 0.4)
+    if last_exc is not None:
+        raise RuntimeError(f"{label}失败: {last_exc}") from last_exc
+    raise RuntimeError(f"{label}失败")
+
+
 def _fetch_hk_spot_ak() -> pd.DataFrame:
-    # 港股口径固定为“主板+GEM公司”，直连失败时由上层走快照回退，不降级为全证券口径。
-    return _fetch_hk_spot_em_direct()
+    # 港股优先走主板+GEM直连；若本机启用了 Surge 等系统代理，再补试一次走系统代理的直连请求；
+    # 最后再回退到 AK 的东财/新浪口径。
+    errors: List[str] = []
+
+    try:
+        return _retry_hk_fetch(
+            lambda: _fetch_hk_spot_em_direct(use_system_proxy=False),
+            label="港股东财直连",
+            attempts=3,
+        )
+    except Exception as exc:
+        errors.append(str(exc))
+
+    try:
+        return _retry_hk_fetch(
+            lambda: _fetch_hk_spot_em_direct(use_system_proxy=True),
+            label="港股东财直连(系统代理)",
+            attempts=2,
+        )
+    except Exception as exc:
+        errors.append(str(exc))
+
+    try:
+        return _retry_hk_fetch(
+            lambda: _ak_call_with_proxy_fallback(ak.stock_hk_main_board_spot_em),
+            label="港股AK主板行情",
+            attempts=2,
+        )
+    except Exception as exc:
+        errors.append(str(exc))
+
+    try:
+        return _retry_hk_fetch(
+            lambda: _ak_call_with_proxy_fallback(ak.stock_hk_spot),
+            label="港股AK新浪行情",
+            attempts=2,
+        )
+    except Exception as exc:
+        errors.append(str(exc))
+
+    raise RuntimeError("；".join([e for e in errors if e]) or "港股行情抓取失败")
 
 
-def _fetch_hk_spot_em_direct() -> pd.DataFrame:
+def _fetch_hk_spot_em_direct(use_system_proxy: bool = False) -> pd.DataFrame:
     """
-    港股东方财富直连（禁用系统代理），优先获取市值等字段，避免 AKShare 精简字段导致大量空值。
+    港股东方财富直连；默认禁用系统代理，必要时可显式允许走系统代理（适配 Surge 等环境）。
+    优先获取市值等字段，避免 AKShare 精简字段导致大量空值。
     """
     hosts = [
         "https://72.push2.eastmoney.com/api/qt/clist/get",
@@ -676,8 +1392,7 @@ def _fetch_hk_spot_em_direct() -> pd.DataFrame:
                 rows: List[Dict[str, Any]] = []
                 seen_codes: set[str] = set()
                 total_hint: Optional[int] = None
-                ses = requests.Session()
-                ses.trust_env = False
+                ses = _build_request_session(use_system_proxy=use_system_proxy)
 
                 for page in range(1, 120):
                     params = dict(base_params)
@@ -739,31 +1454,58 @@ def _fetch_hk_spot_em_direct() -> pd.DataFrame:
     raise RuntimeError("港股直连失败")
 
 
-def _build_base_universe(market_scope: str = "A") -> pd.DataFrame:
+def _build_base_universe(market_scope: str = "A") -> Tuple[pd.DataFrame, List[str]]:
     scope = _safe_str(market_scope).upper() or "A"
     use_a = scope in {"A", "AH", "ALL"}
     use_hk = scope in {"HK", "AH", "ALL"}
     frames: List[pd.DataFrame] = []
     errors: List[str] = []
+    source_notes: List[str] = []
 
     if use_a:
         try:
-            # 优先走直连端点，速度更稳定，也避免 AKShare 分页进度阻塞。
-            spot_a = _fetch_a_spot_em_direct()
+            # 优先走直连端点；若本机处于 Surge 等系统代理环境，再补试一轮允许系统代理的请求。
+            spot_a = _fetch_a_spot_em_direct(use_system_proxy=False)
+            a_source = "A股东财直连"
         except Exception:
-            spot_a = _ak_call_with_proxy_fallback(ak.stock_zh_a_spot_em)
+            try:
+                spot_a = _fetch_a_spot_em_direct(use_system_proxy=True)
+                a_source = "A股东财直连(系统代理)"
+            except Exception:
+                try:
+                    spot_a = _ak_call_with_proxy_fallback(ak.stock_zh_a_spot_em)
+                    a_source = "A股AK东财"
+                except Exception:
+                    spot_a = _ak_call_with_proxy_fallback(ak.stock_zh_a_spot)
+                    a_source = "A股AK新浪"
         if spot_a is None or spot_a.empty:
             errors.append("A股快照为空")
         else:
-            frames.append(_build_universe_from_spot(spot_a, market="A"))
+            frames.append(_build_universe_from_spot(spot_a, market="A", source_note=a_source))
+            source_notes.append(a_source)
 
     if use_hk:
         try:
-            spot_hk = _fetch_hk_spot_ak()
+            hk_source = ""
+            try:
+                spot_hk = _fetch_hk_spot_em_direct(use_system_proxy=False)
+                hk_source = "港股东财直连"
+            except Exception:
+                try:
+                    spot_hk = _fetch_hk_spot_em_direct(use_system_proxy=True)
+                    hk_source = "港股东财直连(系统代理)"
+                except Exception:
+                    try:
+                        spot_hk = _ak_call_with_proxy_fallback(ak.stock_hk_main_board_spot_em)
+                        hk_source = "港股AK主板"
+                    except Exception:
+                        spot_hk = _ak_call_with_proxy_fallback(ak.stock_hk_spot)
+                        hk_source = "港股AK新浪"
             if spot_hk is None or spot_hk.empty:
                 errors.append("港股快照为空")
             else:
-                frames.append(_build_universe_from_spot(spot_hk, market="HK"))
+                frames.append(_build_universe_from_spot(spot_hk, market="HK", source_note=hk_source))
+                source_notes.append(hk_source)
         except Exception as exc:
             errors.append(f"港股拉取失败: {exc}")
 
@@ -772,7 +1514,82 @@ def _build_base_universe(market_scope: str = "A") -> pd.DataFrame:
         raise RuntimeError(err)
 
     out = pd.concat(frames, ignore_index=True)
-    return out
+    return out, source_notes
+
+
+def _probe_data_source(label: str, fetcher) -> Dict[str, Any]:
+    started = time.perf_counter()
+    try:
+        df = fetcher()
+        elapsed = round(time.perf_counter() - started, 2)
+        rows = int(len(df)) if df is not None else 0
+        if df is None or df.empty:
+            return {
+                "source": label,
+                "ok": False,
+                "rows": rows,
+                "elapsed_sec": elapsed,
+                "detail": "结果为空",
+            }
+        return {
+            "source": label,
+            "ok": True,
+            "rows": rows,
+            "elapsed_sec": elapsed,
+            "detail": "",
+        }
+    except Exception as exc:
+        return {
+            "source": label,
+            "ok": False,
+            "rows": 0,
+            "elapsed_sec": round(time.perf_counter() - started, 2),
+            "detail": str(exc),
+        }
+
+
+def check_market_data_source_status(market_scope: str = "ALL") -> Dict[str, Any]:
+    scope = _safe_str(market_scope).upper() or "ALL"
+    sources: List[Dict[str, Any]] = []
+
+    if scope in {"A", "AH", "ALL"}:
+        sources.append(_probe_data_source("A股东财直连", lambda: _fetch_a_spot_em_direct(use_system_proxy=False)))
+        sources.append(_probe_data_source("A股东财直连(系统代理)", lambda: _fetch_a_spot_em_direct(use_system_proxy=True)))
+        sources.append(
+            _probe_data_source(
+                "A股AK东财",
+                lambda: _ak_call_with_proxy_fallback(ak.stock_zh_a_spot_em),
+            )
+        )
+        sources.append(
+            _probe_data_source(
+                "A股AK新浪",
+                lambda: _ak_call_with_proxy_fallback(ak.stock_zh_a_spot),
+            )
+        )
+
+    if scope in {"HK", "AH", "ALL"}:
+        sources.append(_probe_data_source("港股东财直连", lambda: _fetch_hk_spot_em_direct(use_system_proxy=False)))
+        sources.append(_probe_data_source("港股东财直连(系统代理)", lambda: _fetch_hk_spot_em_direct(use_system_proxy=True)))
+        sources.append(
+            _probe_data_source(
+                "港股AK主板",
+                lambda: _ak_call_with_proxy_fallback(ak.stock_hk_main_board_spot_em),
+            )
+        )
+        sources.append(
+            _probe_data_source(
+                "港股AK新浪",
+                lambda: _ak_call_with_proxy_fallback(ak.stock_hk_spot),
+            )
+        )
+
+    return {
+        "scope": scope,
+        "checked_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "all_ok": all(bool(item.get("ok")) for item in sources) if sources else False,
+        "sources": sources,
+    }
 
 
 def _build_base_universe_legacy() -> pd.DataFrame:
@@ -846,9 +1663,9 @@ def _build_base_universe_legacy() -> pd.DataFrame:
     return df
 
 
-def _fetch_a_spot_em_direct() -> pd.DataFrame:
+def _fetch_a_spot_em_direct(use_system_proxy: bool = False) -> pd.DataFrame:
     """
-    东方财富直连兜底（禁用系统代理），避免 ProxyError 导致整次更新失败。
+    东方财富直连兜底；默认禁用系统代理，必要时允许走系统代理（适配 Surge 等环境）。
     仅提供筛选所需核心字段。
     """
     hosts = [
@@ -892,8 +1709,7 @@ def _fetch_a_spot_em_direct() -> pd.DataFrame:
                 rows: List[Dict[str, Any]] = []
                 seen_codes: set[str] = set()
                 total_hint: Optional[int] = None
-                ses = requests.Session()
-                ses.trust_env = False
+                ses = _build_request_session(use_system_proxy=use_system_proxy)
 
                 for page in range(1, 120):
                     params = dict(base_params)
@@ -998,6 +1814,112 @@ def _log_snapshot_run(
         conn.commit()
 
 
+def _backup_current_snapshot(conn: sqlite3.Connection) -> Dict[str, Any]:
+    try:
+        current_df = pd.read_sql_query("SELECT * FROM market_snapshot", conn)
+    except Exception:
+        return {"backed_up": False, "row_count": 0, "backup_at": ""}
+    if current_df is None or current_df.empty:
+        return {"backed_up": False, "row_count": 0, "backup_at": ""}
+    backup_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    backup_df = current_df.copy()
+    backup_df["backup_at"] = backup_at
+    backup_df.to_sql("market_snapshot_backup", conn, if_exists="replace", index=False)
+    return {"backed_up": True, "row_count": int(len(backup_df)), "backup_at": backup_at}
+
+
+def _merge_scope_snapshot(
+    conn: sqlite3.Connection,
+    scope: str,
+    scope_df: pd.DataFrame,
+) -> pd.DataFrame:
+    scope_norm = _safe_str(scope).upper() or "A"
+    if scope_df is None or scope_df.empty:
+        return pd.DataFrame()
+    merged_df = scope_df.copy()
+    try:
+        current_df = pd.read_sql_query("SELECT * FROM market_snapshot", conn)
+    except Exception:
+        current_df = pd.DataFrame()
+    if current_df is None or current_df.empty or "market" not in current_df.columns:
+        return merged_df.reset_index(drop=True)
+    current_df = current_df.copy()
+    current_df["market"] = current_df["market"].astype(str).str.upper()
+    keep_df = current_df[current_df["market"] != scope_norm].copy()
+    if keep_df.empty:
+        return merged_df.reset_index(drop=True)
+    all_cols = list(scope_df.columns)
+    for col in all_cols:
+        if col not in keep_df.columns:
+            keep_df[col] = None
+    keep_df = keep_df[all_cols]
+    merged_df = pd.concat([keep_df, scope_df], ignore_index=True)
+    return merged_df.reset_index(drop=True)
+
+
+def _replace_market_snapshot_atomically(conn: sqlite3.Connection, save_df: pd.DataFrame) -> None:
+    staging_table = "market_snapshot_staging"
+    save_df.to_sql(staging_table, conn, if_exists="replace", index=False)
+    staged_count = conn.execute(f"SELECT COUNT(*) FROM {staging_table}").fetchone()[0]
+    if int(staged_count or 0) <= 0:
+        raise RuntimeError("staging 快照为空，已取消覆盖主表")
+
+    col_list = ", ".join([f'"{col}"' for col in save_df.columns])
+    try:
+        conn.execute("BEGIN")
+        conn.execute("DELETE FROM market_snapshot")
+        conn.execute(f'INSERT INTO market_snapshot ({col_list}) SELECT {col_list} FROM {staging_table}')
+        conn.execute(f"DROP TABLE IF EXISTS {staging_table}")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        conn.execute(f"DROP TABLE IF EXISTS {staging_table}")
+        conn.commit()
+        raise
+
+
+def get_snapshot_backup_status() -> Dict[str, Any]:
+    init_db()
+    with _connect() as conn:
+        try:
+            backup_df = pd.read_sql_query("SELECT * FROM market_snapshot_backup", conn)
+        except Exception:
+            return {"exists": False, "row_count": 0, "backup_at": ""}
+    if backup_df is None or backup_df.empty:
+        return {"exists": False, "row_count": 0, "backup_at": ""}
+    backup_at = _safe_str(backup_df.get("backup_at", pd.Series(dtype=str)).iloc[0] if "backup_at" in backup_df.columns else "")
+    return {"exists": True, "row_count": int(len(backup_df)), "backup_at": backup_at}
+
+
+def restore_snapshot_from_backup() -> Dict[str, Any]:
+    init_db()
+    now_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with _connect() as conn:
+        try:
+            backup_df = pd.read_sql_query("SELECT * FROM market_snapshot_backup", conn)
+        except Exception as exc:
+            raise RuntimeError(f"读取备份失败: {exc}") from exc
+        if backup_df is None or backup_df.empty:
+            raise RuntimeError("当前没有可恢复的快照备份")
+        restore_df = backup_df.drop(columns=["backup_at"], errors="ignore").copy()
+        if restore_df.empty:
+            raise RuntimeError("备份表为空，无法恢复")
+        _replace_market_snapshot_atomically(conn, restore_df)
+
+    _snapshot_meta_set("last_update", now_text)
+    _snapshot_meta_set("row_count", str(int(len(restore_df))))
+    _snapshot_meta_set("last_refresh_fallback", "0")
+    _snapshot_meta_set("last_refresh_error", "")
+    _snapshot_meta_set("last_refresh_error_at", "")
+    _snapshot_meta_set("last_restore_at", now_text)
+    _snapshot_meta_set("last_restore_row_count", str(int(len(restore_df))))
+    return {
+        "restored": True,
+        "row_count": int(len(restore_df)),
+        "restored_at": now_text,
+    }
+
+
 def _classify_error_type(text: Any) -> str:
     t = _safe_str(text).lower()
     if not t:
@@ -1023,11 +1945,16 @@ def refresh_market_snapshot(
     force_refresh: bool = False,
     rotate_enrich: bool = True,
     market_scope: str = "A",
+    enrich_segment: str = "sz_main",
     weekly_mode: bool = False,
     safe_mode: bool = True,
+    only_missing_enrich: bool = False,
 ) -> Dict[str, Any]:
     init_db()
     scope = _safe_str(market_scope).upper() or "A"
+    segment_key = _normalize_enrich_segment(enrich_segment)
+    segment_label = _get_enrich_segment_label(segment_key)
+    source_summary = ""
     meta0 = get_snapshot_meta()
     if weekly_mode:
         last_weekly = _safe_str(meta0.get(f"last_weekly_update_{scope}", ""))
@@ -1048,42 +1975,78 @@ def refresh_market_snapshot(
                         "row_count": int(_to_float(meta0.get("row_count")) or 0),
                         "enriched_count": 0,
                         "market_scope": scope,
+                        "enrich_segment": segment_key,
+                        "enrich_segment_label": segment_label,
+                        "segment_total": 0,
+                        "segment_pending": 0,
+                        "only_missing_enrich": bool(only_missing_enrich and not force_refresh),
                     }
     enrich_mode = "rotate" if rotate_enrich else "top"
-    try:
-        df = _build_base_universe(market_scope=scope).copy()
-    except Exception as exc:
-        # 网络/代理异常时兜底：如果本地已有快照，不让更新动作直接失败
-        existed = load_snapshot()
-        if existed is not None and not existed.empty:
-            now_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            _snapshot_meta_set("last_refresh_error", str(exc))
-            _snapshot_meta_set("last_refresh_error_at", now_text)
-            _snapshot_meta_set("last_refresh_fallback", "1")
-            _log_snapshot_run(
-                row_count=int(len(existed)),
-                enriched_count=0,
-                enrich_start=0,
-                enrich_end=0,
-                fallback=True,
-                error_brief=str(exc),
-                cache_hit=0,
-                cache_miss=0,
-                enrich_mode=enrich_mode,
-            )
-            return {
-                "row_count": int(len(existed)),
-                "enriched_count": 0,
-                "updated_at": now_text,
-                "fallback": True,
-                "error": str(exc),
-                "enrich_mode": enrich_mode,
-                "enrich_start": 0,
-                "enrich_end": 0,
-            }
-        raise RuntimeError(
-            f"未能拉取市场快照（可能是代理/VPN导致连接被拒绝）：{exc}"
-        ) from exc
+    if only_missing_enrich:
+        enrich_mode = f"{enrich_mode}_missing"
+
+    local_snapshot_first = bool(scope == "A" and only_missing_enrich and not force_refresh)
+    if local_snapshot_first:
+        existing_snapshot = load_snapshot()
+        if existing_snapshot is not None and not existing_snapshot.empty and "market" in existing_snapshot.columns:
+            existing_snapshot = existing_snapshot[existing_snapshot["market"].astype(str).str.upper() == "A"].copy()
+        if existing_snapshot is not None and not existing_snapshot.empty:
+            df = existing_snapshot.copy()
+            source_summary = "本地快照"
+        else:
+            local_snapshot_first = False
+
+    if not local_snapshot_first:
+        try:
+            df, source_notes = _build_base_universe(market_scope=scope)
+            df = df.copy()
+            source_summary = " / ".join([_safe_str(item) for item in source_notes if _safe_str(item)])
+        except Exception as exc:
+            # 网络/代理异常时兜底：如果本地已有快照，不让更新动作直接失败
+            existed = load_snapshot()
+            if existed is not None and not existed.empty:
+                now_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                _snapshot_meta_set("last_refresh_error", str(exc))
+                _snapshot_meta_set("last_refresh_error_at", now_text)
+                _snapshot_meta_set("last_refresh_fallback", "1")
+                fallback_total = 0
+                fallback_pending = 0
+                if scope == "A":
+                    for row in get_a_enrich_segment_status(existed):
+                        if _safe_str(row.get("key")) == segment_key:
+                            fallback_total = int(row.get("count", 0) or 0)
+                            fallback_pending = max(0, fallback_total - int(row.get("persisted_count", 0) or 0))
+                            break
+                _log_snapshot_run(
+                    row_count=int(len(existed)),
+                    enriched_count=0,
+                    enrich_start=0,
+                    enrich_end=0,
+                    fallback=True,
+                    error_brief=str(exc),
+                    cache_hit=0,
+                    cache_miss=0,
+                    enrich_mode=enrich_mode,
+                )
+                return {
+                    "row_count": int(len(existed)),
+                    "enriched_count": 0,
+                    "updated_at": now_text,
+                    "fallback": True,
+                    "error": str(exc),
+                    "enrich_mode": enrich_mode,
+                    "enrich_start": 0,
+                    "enrich_end": 0,
+                    "enrich_segment": segment_key,
+                    "enrich_segment_label": segment_label,
+                    "segment_total": fallback_total,
+                    "segment_pending": fallback_pending,
+                    "only_missing_enrich": bool(only_missing_enrich and not force_refresh),
+                    "source_summary": "本地快照",
+                }
+            raise RuntimeError(
+                f"未能拉取市场快照（可能是代理/VPN导致连接被拒绝）：{exc}"
+            ) from exc
     if "market" not in df.columns:
         df["market"] = "A"
     df["market"] = df["market"].astype(str).str.upper()
@@ -1091,6 +2054,7 @@ def refresh_market_snapshot(
         ((df["market"] == "A") & df["code"].astype(str).str.fullmatch(r"\d{6}", na=False))
         | ((df["market"] == "HK") & df["code"].astype(str).str.fullmatch(r"\d{5}", na=False))
     ].copy()
+    df = _overlay_latest_enrichment(df)
     df = df.sort_values(by=["total_mv", "code"], ascending=[False, True], na_position="last").reset_index(drop=True)
 
     if max_stocks and max_stocks > 0:
@@ -1099,31 +2063,43 @@ def refresh_market_snapshot(
     manual_flags = _load_manual_flags()
 
     enrich_n = max(0, min(int(enrich_top_n), len(df)))
-    total_count = len(df)
     start_idx = 0
     target_indices: List[int] = []
     cache_hit = 0
     cache_miss = 0
 
     # 基本面深补目前仅对A股执行，港股先走行情快照，避免接口无效调用与过度请求
-    eligible_indices = [int(i) for i, m in enumerate(df["market"].tolist()) if _safe_str(m).upper() == "A"]
+    if scope == "A":
+        eligible_indices = [
+            int(i)
+            for i, row in df.iterrows()
+            if _safe_str(row.get("market")).upper() == "A" and _match_a_enrich_segment(row.get("code"), segment_key)
+        ]
+    else:
+        eligible_indices = [int(i) for i, m in enumerate(df["market"].tolist()) if _safe_str(m).upper() == "A"]
     eligible_total = len(eligible_indices)
-    enrich_n = max(0, min(enrich_n, eligible_total))
-    cursor_key = f"enrich_cursor_index_{scope}"
+    pending_indices = eligible_indices
+    if only_missing_enrich and not force_refresh:
+        pending_indices = [idx for idx in eligible_indices if not _safe_str(df.at[idx, "enriched_at"])]
+    pending_total = len(pending_indices)
+    enrich_n = max(0, min(enrich_n, pending_total if (only_missing_enrich and not force_refresh) else eligible_total))
+    cursor_key = f"enrich_cursor_index_{scope}_{segment_key}" if scope == "A" else f"enrich_cursor_index_{scope}"
 
-    if enrich_n > 0 and eligible_total > 0:
+    active_indices = pending_indices if (only_missing_enrich and not force_refresh) else eligible_indices
+
+    if enrich_n > 0 and active_indices:
         if rotate_enrich:
             meta = get_snapshot_meta()
             try:
-                start_idx = int(meta.get(cursor_key, meta.get("enrich_cursor_index", "0")))
+                start_idx = int(meta.get(cursor_key, "0" if scope == "A" else meta.get("enrich_cursor_index", "0")))
             except Exception:
                 start_idx = 0
-            start_idx = start_idx % eligible_total
-            target_indices = [eligible_indices[int((start_idx + step) % eligible_total)] for step in range(enrich_n)]
+            start_idx = start_idx % len(active_indices)
+            target_indices = [active_indices[int((start_idx + step) % len(active_indices))] for step in range(enrich_n)]
         else:
-            target_indices = eligible_indices[:enrich_n]
+            target_indices = active_indices[:enrich_n]
 
-    df["enriched_at"] = None
+    persist_rows: List[Dict[str, Any]] = []
     consecutive_fail = 0
     for idx in target_indices:
         code = str(df.at[idx, "code"])
@@ -1138,6 +2114,12 @@ def refresh_market_snapshot(
                 cache_hit += 1
             else:
                 cache_miss += 1
+            persist_rows.append(
+                _build_enrichment_persist_row(
+                    df.loc[idx],
+                    source_note=f"deep_enrich:{source}",
+                )
+            )
             consecutive_fail = 0
         except Exception:
             consecutive_fail += 1
@@ -1189,6 +2171,10 @@ def refresh_market_snapshot(
         return "missing"
 
     df["data_quality"] = df.apply(_quality, axis=1)
+
+    if persist_rows:
+        _upsert_stock_enrichment_latest(persist_rows)
+        df = _overlay_latest_enrichment(df)
 
     cols = [
         "market",
@@ -1246,12 +2232,63 @@ def refresh_market_snapshot(
         "source_note",
     ]
     save_df = df[cols].copy()
+    if save_df.empty:
+        existed = load_snapshot()
+        if existed is not None and not existed.empty:
+            now_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            empty_err = "更新结果为空，已阻止空快照覆盖旧数据"
+            _snapshot_meta_set("last_refresh_error", empty_err)
+            _snapshot_meta_set("last_refresh_error_at", now_text)
+            _snapshot_meta_set("last_refresh_fallback", "1")
+            fallback_total = 0
+            fallback_pending = 0
+            if scope == "A":
+                for row in get_a_enrich_segment_status(existed):
+                    if _safe_str(row.get("key")) == segment_key:
+                        fallback_total = int(row.get("count", 0) or 0)
+                        fallback_pending = max(0, fallback_total - int(row.get("persisted_count", 0) or 0))
+                        break
+            _log_snapshot_run(
+                row_count=int(len(existed)),
+                enriched_count=0,
+                enrich_start=0,
+                enrich_end=0,
+                fallback=True,
+                error_brief=empty_err,
+                cache_hit=cache_hit,
+                cache_miss=cache_miss,
+                enrich_mode=enrich_mode,
+            )
+            return {
+                "row_count": int(len(existed)),
+                "enriched_count": 0,
+                "updated_at": now_text,
+                "fallback": True,
+                "error": empty_err,
+                "enrich_mode": enrich_mode,
+                "enrich_start": 0,
+                "enrich_end": 0,
+                "market_scope": scope,
+                "enrich_segment": segment_key,
+                "enrich_segment_label": segment_label,
+                "segment_total": fallback_total,
+                "segment_pending": fallback_pending,
+                "only_missing_enrich": bool(only_missing_enrich and not force_refresh),
+                "weekly_mode": bool(weekly_mode),
+                "source_summary": "本地快照",
+            }
+        raise RuntimeError("更新结果为空，未写入 market_snapshot")
 
+    backup_info = {"backed_up": False, "row_count": 0, "backup_at": ""}
     with _connect() as conn:
-        save_df.to_sql("market_snapshot", conn, if_exists="replace", index=False)
-        conn.commit()
+        backup_info = _backup_current_snapshot(conn)
+        merged_df = _merge_scope_snapshot(conn, scope, save_df)
+        if merged_df is None or merged_df.empty:
+            raise RuntimeError(f"{scope} 市场合并写入结果为空，已取消覆盖主表")
+        _replace_market_snapshot_atomically(conn, merged_df)
 
-    _snapshot_meta_set("last_update", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    now_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    _snapshot_meta_set("last_update", now_text)
     _snapshot_meta_set("row_count", str(len(save_df)))
     _snapshot_meta_set("enriched_count", str(enrich_n))
     _snapshot_meta_set("app_version", APP_VERSION)
@@ -1259,14 +2296,21 @@ def refresh_market_snapshot(
     _snapshot_meta_set("last_refresh_error", "")
     _snapshot_meta_set("last_refresh_error_at", "")
     _snapshot_meta_set("last_scope", scope)
-    if rotate_enrich and enrich_n > 0 and eligible_total > 0:
-        _snapshot_meta_set(cursor_key, str((start_idx + enrich_n) % eligible_total))
-        _snapshot_meta_set("enrich_cursor_index", str((start_idx + enrich_n) % eligible_total))
+    if scope == "A":
+        _snapshot_meta_set("last_enrich_segment_A", segment_key)
+        if enrich_n > 0:
+            _snapshot_meta_set(f"last_enrich_segment_at_{segment_key}", now_text)
+    _snapshot_meta_set("last_backup_at", _safe_str(backup_info.get("backup_at", "")))
+    _snapshot_meta_set("last_backup_row_count", str(int(backup_info.get("row_count", 0) or 0)))
+    if rotate_enrich and enrich_n > 0 and active_indices:
+        _snapshot_meta_set(cursor_key, str((start_idx + enrich_n) % len(active_indices)))
+        if scope != "A":
+            _snapshot_meta_set("enrich_cursor_index", str((start_idx + enrich_n) % len(active_indices)))
     if weekly_mode:
-        _snapshot_meta_set(f"last_weekly_update_{scope}", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        _snapshot_meta_set(f"last_weekly_update_{scope}", now_text)
 
     enrich_start = int(start_idx + 1) if enrich_n > 0 else 0
-    enrich_end = int(((start_idx + enrich_n - 1) % eligible_total) + 1) if enrich_n > 0 and eligible_total > 0 else 0
+    enrich_end = int(((start_idx + enrich_n - 1) % len(active_indices)) + 1) if enrich_n > 0 and active_indices else 0
     _log_snapshot_run(
         row_count=len(save_df),
         enriched_count=enrich_n,
@@ -1282,14 +2326,22 @@ def refresh_market_snapshot(
     return {
         "row_count": len(save_df),
         "enriched_count": enrich_n,
-        "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "updated_at": now_text,
         "enrich_mode": enrich_mode,
         "enrich_start": enrich_start,
         "enrich_end": enrich_end,
         "cache_hit": cache_hit,
         "cache_miss": cache_miss,
         "market_scope": scope,
+        "enrich_segment": segment_key,
+        "enrich_segment_label": segment_label,
+        "segment_total": eligible_total,
+        "segment_pending": pending_total,
+        "only_missing_enrich": bool(only_missing_enrich and not force_refresh),
         "weekly_mode": bool(weekly_mode),
+        "source_summary": source_summary,
+        "backup_at": _safe_str(backup_info.get("backup_at", "")),
+        "backup_row_count": int(backup_info.get("row_count", 0) or 0),
     }
 
 
@@ -1300,7 +2352,10 @@ def load_snapshot() -> pd.DataFrame:
             df = pd.read_sql_query("SELECT * FROM market_snapshot ORDER BY total_mv DESC, code ASC", conn)
         except Exception:
             return pd.DataFrame()
-    return df
+    df = _overlay_latest_enrichment(df)
+    if df is None or df.empty:
+        return pd.DataFrame()
+    return df.sort_values(by=["total_mv", "code"], ascending=[False, True], na_position="last").reset_index(drop=True)
 
 
 def get_snapshot_health_report(days: int = 7, top_n: int = 20) -> Dict[str, Any]:
