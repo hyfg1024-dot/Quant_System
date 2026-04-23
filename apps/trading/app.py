@@ -94,6 +94,7 @@ from filter_engine import (
     get_a_enrich_segment_counts as filter_get_a_enrich_segment_counts,
     get_a_enrich_segment_status as filter_get_a_enrich_segment_status,
     get_enrichment_governance_summary as filter_get_enrichment_governance_summary,
+    get_hk_enrich_segment_status as filter_get_hk_enrich_segment_status,
     get_snapshot_backup_status as filter_get_snapshot_backup_status,
     get_snapshot_health_report as filter_get_snapshot_health_report,
     get_snapshot_meta as filter_get_snapshot_meta,
@@ -1993,6 +1994,10 @@ def _flt_a_segment_status() -> List[dict]:
     return filter_get_a_enrich_segment_status(filter_load_snapshot())
 
 
+def _flt_hk_segment_status() -> List[dict]:
+    return filter_get_hk_enrich_segment_status(filter_load_snapshot())
+
+
 def _flt_run_source_check(scope: str) -> None:
     label = {"A": "A股", "HK": "港股", "ALL": "全市场"}.get(scope, scope)
     with st.spinner(f"正在检测{label}数据源..."):
@@ -2134,6 +2139,47 @@ def _flt_run_a_segment_enrich(segment_key: str, segment_label: str, segment_coun
             st.error(f"{segment_label} 深补失败: {exc}")
 
 
+def _flt_run_hk_segment_enrich(segment_key: str, segment_label: str, segment_count: int, *, force_refresh: bool, safe_mode: bool) -> None:
+    if int(segment_count or 0) <= 0:
+        st.info(f"{segment_label} 当前没有可深补股票。")
+        return
+    status_rows = _flt_hk_segment_status()
+    status_map = {str(row.get("key")): row for row in status_rows}
+    current_row = status_map.get(str(segment_key), {})
+    persisted_count = int(current_row.get("persisted_count", 0) or 0)
+    pending_count = max(0, int(segment_count or 0) - persisted_count)
+    if (not force_refresh) and pending_count <= 0:
+        st.info(f"{segment_label} 已全部深补完成；当前没有待补股票。")
+        return
+    with st.spinner(f"正在深补 {segment_label} ..."):
+        try:
+            stats = filter_refresh_market_snapshot(
+                max_stocks=0,
+                enrich_top_n=int(pending_count if (not force_refresh and pending_count > 0) else segment_count),
+                force_refresh=bool(force_refresh),
+                rotate_enrich=False,
+                market_scope="HK",
+                enrich_segment=str(segment_key),
+                weekly_mode=False,
+                safe_mode=bool(safe_mode),
+                only_missing_enrich=True,
+            )
+            if bool(stats.get("fallback", False)):
+                st.warning(_flt_format_ops_fallback_warning("港股", stats, weekly=False))
+            else:
+                mode_label = "补缺" if bool(stats.get("only_missing_enrich", False)) else "全量重补"
+                base_total = int(stats.get("segment_pending", 0) or 0) if bool(stats.get("only_missing_enrich", False)) else int(stats.get("segment_total", 0) or 0)
+                st.success(f"{segment_label} {mode_label}完成：{int(stats.get('enriched_count', 0) or 0)} / {base_total}")
+                st.caption(
+                    f"{_flt_format_source_summary(stats)} ｜ "
+                    f"缓存命中: {int(stats.get('cache_hit', 0) or 0)} ｜ "
+                    f"重抓: {int(stats.get('cache_miss', 0) or 0)}"
+                )
+            st.session_state["flt_result"] = None
+        except Exception as exc:
+            st.error(f"{segment_label} 深补失败: {exc}")
+
+
 def _render_filter_market_ops_tab(scope: str, *, key_prefix: str) -> None:
     label = {"A": "A股", "HK": "港股"}.get(scope, scope)
     summary = _flt_market_snapshot_summary(scope)
@@ -2154,11 +2200,12 @@ def _render_filter_market_ops_tab(scope: str, *, key_prefix: str) -> None:
     if scope == "A":
         enrich_n = 0
         enrich_segment = "sz_main"
+    elif scope == "HK":
+        enrich_n = 0
+        enrich_segment = "financials"
     else:
         enrich_n = 0
         enrich_segment = "sz_main"
-        c2.markdown("**港股深度补充**")
-        c2.caption("当前未接入港股逐股基本面深补，港股这里只更新行情快照。")
     safe_mode = c3.checkbox("安全模式（防封）", value=True, key=f"{key_prefix}_safe_mode")
     force_refresh = st.checkbox("忽略缓存强制重抓", value=False, key=f"{key_prefix}_force")
     st.caption(
@@ -2175,11 +2222,11 @@ def _render_filter_market_ops_tab(scope: str, *, key_prefix: str) -> None:
         _flt_run_source_check(scope)
     _flt_render_source_check_result(scope)
 
-    if scope == "A":
+    if scope in {"A", "HK"}:
         st.markdown("<div style='height:1.4rem'></div>", unsafe_allow_html=True)
         st.markdown("### 深补覆盖")
-        st.caption("按数据库治理口径展示当前 A股 深补资产的覆盖、有字段完整度、时间新鲜度和最终可用状态。")
-        governance = filter_get_enrichment_governance_summary("A")
+        st.caption(f"按数据库治理口径展示当前 {label} 深补资产的覆盖、字段完整度、时间新鲜度和最终可用状态。")
+        governance = filter_get_enrichment_governance_summary(scope)
         _flt_render_governance_cards(governance)
         st.caption(
             f"覆盖：有无记录 ｜ 完整度：关键字段完备程度 ｜ 新鲜度：距上次深补的时间状态 ｜ "
@@ -2187,13 +2234,13 @@ def _render_filter_market_ops_tab(scope: str, *, key_prefix: str) -> None:
         )
 
         st.markdown("<div style='height:1.2rem'></div>", unsafe_allow_html=True)
-        st.markdown("### A股板块深补")
+        st.markdown("### A股板块深补" if scope == "A" else "### 港股板块深补")
         st.caption("点击下方板块按钮，直接深补该板块全部股票。")
-        segment_rows = _flt_a_segment_status()
+        segment_rows = _flt_a_segment_status() if scope == "A" else _flt_hk_segment_status()
         store_summary = filter_get_stock_enrichment_store_summary()
         completed_segments = sum(1 for row in segment_rows if _safe_str(row.get("status")) == "已完成")
         st.caption(
-            f"持久化深补资产：A股 {int(store_summary.get('a_total', 0) or 0)} 条 ｜ "
+            f"持久化深补资产：{label} {int(store_summary.get('a_total', 0) if scope == 'A' else store_summary.get('hk_total', 0) or 0)} 条 ｜ "
             f"已完成板块 {completed_segments}/{len(segment_rows)} ｜ "
             f"最近深补 {_safe_str(store_summary.get('latest_enriched_at', '')) or '--'}"
         )
@@ -2202,13 +2249,22 @@ def _render_filter_market_ops_tab(scope: str, *, key_prefix: str) -> None:
             for col, row in zip(cols, segment_rows[start : start + 4]):
                 label_text = f"{row['label']}（{int(row['count'])}）"
                 if col.button(label_text, use_container_width=True, key=f"{key_prefix}_seg_{row['key']}"):
-                    _flt_run_a_segment_enrich(
-                        segment_key=str(row["key"]),
-                        segment_label=str(row["label"]),
-                        segment_count=int(row["count"]),
-                        force_refresh=bool(force_refresh),
-                        safe_mode=bool(safe_mode),
-                    )
+                    if scope == "A":
+                        _flt_run_a_segment_enrich(
+                            segment_key=str(row["key"]),
+                            segment_label=str(row["label"]),
+                            segment_count=int(row["count"]),
+                            force_refresh=bool(force_refresh),
+                            safe_mode=bool(safe_mode),
+                        )
+                    else:
+                        _flt_run_hk_segment_enrich(
+                            segment_key=str(row["key"]),
+                            segment_label=str(row["label"]),
+                            segment_count=int(row["count"]),
+                            force_refresh=bool(force_refresh),
+                            safe_mode=bool(safe_mode),
+                        )
                 persisted = int(row.get("persisted_count", 0) or 0)
                 total_count = int(row.get("count", 0) or 0)
                 col.caption(f"{_safe_str(row.get('status'))} ｜ 已深补 {persisted}/{total_count}")

@@ -25,7 +25,7 @@ if str(FUNDAMENTAL_DIR) not in sys.path:
 
 from fundamental_engine import analyze_fundamental
 
-APP_VERSION = "FLT-20260423-06"
+APP_VERSION = "FLT-20260423-07"
 DATA_DIR = CURRENT_DIR / "data"
 CACHE_DIR = DATA_DIR / "cache"
 DB_PATH = DATA_DIR / "filter_market.db"
@@ -254,15 +254,46 @@ AGING_WINDOW_DAYS = 30
 
 
 A_ENRICH_SEGMENTS: List[Tuple[str, str]] = [
-    ("sz_main", "000/001 深主板"),
+    ("sz_main", "000/001/003 深主板"),
     ("sme", "002 中小盘"),
     ("gem_300", "300 创业板"),
-    ("gem_301", "301 创业板"),
+    ("gem_301", "301/302 创业板"),
     ("sh_main_600_601", "600/601 沪主板"),
     ("sh_main_603_605", "603/605 沪主板"),
     ("star", "688 科创板"),
     ("bse", "北交所"),
 ]
+
+HK_ENRICH_SEGMENTS: List[Tuple[str, str]] = [
+    ("energy", "能源"),
+    ("materials", "原材料"),
+    ("industrials", "工业"),
+    ("consumer_discretionary", "可选消费"),
+    ("consumer_staples", "必需消费"),
+    ("healthcare", "医疗保健"),
+    ("telecom", "电讯"),
+    ("utilities", "公用事业"),
+    ("financials", "金融"),
+    ("properties_construction", "地产建筑"),
+    ("information_technology", "资讯科技"),
+    ("conglomerates", "综合企业"),
+    ("gem", "GEM 创业板"),
+]
+
+HK_HSICS_KEYWORDS: Dict[str, List[str]] = {
+    "energy": ["石油", "天然气", "煤炭", "油气", "能源", "新能源", "风电", "光伏", "太阳能", "电池", "核电"],
+    "materials": ["钢铁", "有色", "黄金", "铜", "铝", "矿业", "矿产", "化工", "水泥", "建材", "纸业", "材料"],
+    "industrials": ["工业", "机械", "设备", "工程", "物流", "运输", "航运", "航空", "铁路", "基建", "建筑设备", "制造"],
+    "consumer_discretionary": ["汽车", "服装", "纺织", "鞋", "奢侈品", "零售", "餐饮", "酒店", "旅游", "娱乐", "博彩", "教育", "家电", "家居", "电商", "互联网零售"],
+    "consumer_staples": ["食品", "饮料", "乳品", "农业", "农产品", "啤酒", "白酒", "包装食品", "家庭用品", "个人用品", "超市"],
+    "healthcare": ["医疗", "医药", "生物", "制药", "医院", "器械", "保健"],
+    "telecom": ["电讯", "通信", "通讯", "运营商", "宽带", "卫星"],
+    "utilities": ["公用事业", "电力", "燃气", "水务", "环保", "废物处理"],
+    "financials": ["银行", "保险", "证券", "金融", "资产管理", "信托", "租赁", "支付"],
+    "properties_construction": ["地产", "房地产", "物业", "建筑", "基建地产", "REIT", "REITS"],
+    "information_technology": ["软件", "半导体", "芯片", "计算机", "云", "互联网服务", "科技", "电子", "信息技术", "AI", "人工智能"],
+    "conglomerates": ["综合企业", "控股", "多元化", "投资控股"],
+}
 
 
 def get_a_enrich_segments() -> List[Tuple[str, str]]:
@@ -313,6 +344,306 @@ def get_a_enrich_segment_status(snapshot_df: Optional[pd.DataFrame] = None) -> L
         row["persisted_count"] = persisted_count
         row["last_enriched_at"] = last_text
         total_count = int(row.get("count") or 0)
+        if persisted_count <= 0:
+            row["status"] = "未深补"
+        elif total_count > 0 and persisted_count >= total_count:
+            row["status"] = "已完成"
+        else:
+            row["status"] = "部分完成"
+    return rows
+
+
+def get_hk_enrich_segments() -> List[Tuple[str, str]]:
+    return list(HK_ENRICH_SEGMENTS)
+
+
+def _normalize_hk_enrich_segment(segment: Any) -> str:
+    seg = _safe_str(segment)
+    valid = {key for key, _ in HK_ENRICH_SEGMENTS}
+    return seg if seg in valid else "financials"
+
+
+def _get_hk_enrich_segment_label(segment: Any) -> str:
+    seg = _normalize_hk_enrich_segment(segment)
+    mapping = {key: label for key, label in HK_ENRICH_SEGMENTS}
+    return mapping.get(seg, "金融")
+
+
+def _normalize_hk_code(code: Any) -> str:
+    text = re.sub(r"\D", "", _safe_str(code))
+    return text[-5:].zfill(5) if text else ""
+
+
+def _classify_hk_hsics(raw_industry: Any, name: Any = "") -> str:
+    text = f"{_safe_str(raw_industry)} {_safe_str(name)}".upper()
+    if not text.strip():
+        return "综合企业"
+    for key, keywords in HK_HSICS_KEYWORDS.items():
+        for kw in keywords:
+            if _safe_str(kw).upper() in text:
+                return _get_hk_enrich_segment_label(key)
+    return "综合企业"
+
+
+def _is_hk_gem_code(code: Any) -> bool:
+    return _normalize_hk_code(code).startswith("08")
+
+
+def _normalize_hk_board(board: Any, code: Any = "") -> str:
+    board_text = _safe_str(board)
+    if "创业板" in board_text or "GEM" in board_text.upper() or _is_hk_gem_code(code):
+        return "gem"
+    return "main"
+
+
+def _match_hk_enrich_segment_from_meta(code: Any, board: Any, hsics_sector: Any, segment: Any) -> bool:
+    seg = _normalize_hk_enrich_segment(segment)
+    board_norm = _normalize_hk_board(board, code)
+    sector_text = _safe_str(hsics_sector)
+    if seg == "gem":
+        return board_norm == "gem"
+    return board_norm == "main" and sector_text == _get_hk_enrich_segment_label(seg)
+
+
+def _match_hk_enrich_segment(code: Any, segment: Any, classification_df: Optional[pd.DataFrame] = None) -> bool:
+    code_norm = _normalize_hk_code(code)
+    if not code_norm:
+        return False
+    seg = _normalize_hk_enrich_segment(segment)
+    if seg == "gem":
+        return _is_hk_gem_code(code_norm)
+    if classification_df is None:
+        classification_df = _load_hk_classification()
+    if classification_df is None or classification_df.empty:
+        return False
+    work_df = classification_df.copy()
+    work_df["code"] = work_df.get("code", pd.Series(dtype=object)).astype(str).map(_normalize_hk_code)
+    matched = work_df[work_df["code"] == code_norm]
+    if matched.empty:
+        return False
+    row = matched.iloc[0]
+    return _match_hk_enrich_segment_from_meta(
+        code_norm,
+        row.get("board"),
+        row.get("hsics_sector"),
+        seg,
+    )
+
+
+def _load_hk_classification() -> pd.DataFrame:
+    init_db()
+    with _connect() as conn:
+        try:
+            df = pd.read_sql_query("SELECT * FROM hk_classification", conn)
+        except Exception:
+            return pd.DataFrame()
+    if df is None or df.empty:
+        return pd.DataFrame()
+    df = df.copy()
+    df["code"] = df.get("code", pd.Series(dtype=object)).astype(str).map(_normalize_hk_code)
+    return df
+
+
+def _upsert_hk_classification(rows: List[Dict[str, Any]]) -> int:
+    if not rows:
+        return 0
+    now_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    normalized: List[Dict[str, Any]] = []
+    for row in rows:
+        code = _normalize_hk_code(row.get("code"))
+        if not code:
+            continue
+        normalized.append(
+            {
+                "code": code,
+                "name": _safe_str(row.get("name")),
+                "board": _normalize_hk_board(row.get("board"), code),
+                "raw_industry": _safe_str(row.get("raw_industry")),
+                "hsics_sector": _safe_str(row.get("hsics_sector")) or _classify_hk_hsics(row.get("raw_industry"), row.get("name")),
+                "source_note": _safe_str(row.get("source_note")) or "东财公司资料",
+                "updated_at": _safe_str(row.get("updated_at")) or now_text,
+                "persisted_at": now_text,
+            }
+        )
+    if not normalized:
+        return 0
+    cols = ["code", "name", "board", "raw_industry", "hsics_sector", "source_note", "updated_at", "persisted_at"]
+    placeholders = ", ".join(["?"] * len(cols))
+    updates = ", ".join([f"{col}=excluded.{col}" for col in cols if col != "code"])
+    sql = (
+        f"INSERT INTO hk_classification ({', '.join(cols)}) "
+        f"VALUES ({placeholders}) "
+        f"ON CONFLICT(code) DO UPDATE SET {updates}"
+    )
+    values = [tuple(row.get(col) for col in cols) for row in normalized]
+    with _connect() as conn:
+        conn.executemany(sql, values)
+        conn.commit()
+    return len(values)
+
+
+def sync_hk_classification(
+    snapshot_df: Optional[pd.DataFrame] = None,
+    *,
+    force_refresh: bool = False,
+    safe_mode: bool = True,
+    max_codes: int = 0,
+) -> Dict[str, Any]:
+    if snapshot_df is None:
+        snapshot_df = load_snapshot()
+    if snapshot_df is None or snapshot_df.empty:
+        return {"requested": 0, "synced": 0, "skipped": 0, "errors": 0}
+    work_df = snapshot_df.copy()
+    work_df["market"] = work_df.get("market", pd.Series(dtype=object)).astype(str).str.upper()
+    hk_df = work_df[work_df["market"] == "HK"].copy()
+    if hk_df.empty:
+        return {"requested": 0, "synced": 0, "skipped": 0, "errors": 0}
+    hk_df["code"] = hk_df.get("code", pd.Series(dtype=object)).astype(str).map(_normalize_hk_code)
+    hk_df["name"] = hk_df.get("name", pd.Series(dtype=object)).astype(str)
+    existing = _load_hk_classification()
+    existing_codes = set(existing["code"].tolist()) if not existing.empty else set()
+    targets = hk_df[["code", "name"]].drop_duplicates().to_dict(orient="records")
+    if not force_refresh:
+        targets = [row for row in targets if row["code"] not in existing_codes]
+    if max_codes and max_codes > 0:
+        targets = targets[: int(max_codes)]
+    synced = 0
+    skipped = 0
+    errors = 0
+    rows_to_upsert: List[Dict[str, Any]] = []
+    ses = _build_request_session(use_system_proxy=True)
+    url = "https://datacenter.eastmoney.com/securities/api/data/v1/get"
+    for item in targets:
+        code = _normalize_hk_code(item.get("code"))
+        name = _safe_str(item.get("name"))
+        if not code:
+            continue
+        if _is_hk_gem_code(code):
+            rows_to_upsert.append(
+                {
+                    "code": code,
+                    "name": name,
+                    "board": "gem",
+                    "raw_industry": "",
+                    "hsics_sector": "GEM 创业板",
+                    "source_note": "代码段推断",
+                }
+            )
+            synced += 1
+            continue
+        try:
+            params = {
+                "reportName": "RPT_HKF10_INFO_ORGPROFILE",
+                "columns": "SECUCODE,SECURITY_CODE,ORG_NAME,BELONG_INDUSTRY",
+                "quoteColumns": "",
+                "filter": f'(SECUCODE="{code}.HK")',
+                "pageNumber": "1",
+                "pageSize": "50",
+                "sortTypes": "",
+                "sortColumns": "",
+                "source": "F10",
+                "client": "PC",
+                "v": "04748497219912483",
+            }
+            resp = ses.get(url, params=params, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+            resp.raise_for_status()
+            data_json = resp.json()
+            profile_df = pd.DataFrame(((data_json or {}).get("result") or {}).get("data") or [])
+            raw_industry = ""
+            board = "main"
+            if profile_df is not None and not profile_df.empty:
+                first_row = profile_df.iloc[0]
+                raw_industry = _safe_str(first_row.get("BELONG_INDUSTRY"))
+            rows_to_upsert.append(
+                {
+                    "code": code,
+                    "name": name,
+                    "board": board,
+                    "raw_industry": raw_industry,
+                    "hsics_sector": _classify_hk_hsics(raw_industry, name),
+                    "source_note": "东财公司资料",
+                }
+            )
+            synced += 1
+        except Exception:
+            errors += 1
+        if safe_mode:
+            time.sleep(random.uniform(0.08, 0.20))
+    inserted = _upsert_hk_classification(rows_to_upsert)
+    skipped = max(0, len(targets) - synced - errors)
+    return {
+        "requested": int(len(targets)),
+        "synced": int(inserted),
+        "skipped": int(skipped),
+        "errors": int(errors),
+    }
+
+
+def get_hk_enrich_segment_counts(snapshot_df: Optional[pd.DataFrame] = None) -> List[Dict[str, Any]]:
+    if snapshot_df is None:
+        snapshot_df = load_snapshot()
+    if snapshot_df is None or snapshot_df.empty or "market" not in snapshot_df.columns:
+        hk_df = pd.DataFrame(columns=["code"])
+    else:
+        hk_df = snapshot_df.copy()
+        hk_df["market"] = hk_df.get("market", pd.Series(dtype=object)).astype(str).str.upper()
+        hk_df = hk_df[hk_df["market"] == "HK"].copy()
+    hk_df["code"] = hk_df.get("code", pd.Series(dtype=object)).astype(str).map(_normalize_hk_code)
+    classification_df = _load_hk_classification()
+    if not classification_df.empty:
+        classification_df = classification_df[classification_df["code"].isin(hk_df["code"].tolist())].copy()
+    rows: List[Dict[str, Any]] = []
+    for key, label in HK_ENRICH_SEGMENTS:
+        if key == "gem":
+            count = int(hk_df["code"].astype(str).map(_is_hk_gem_code).sum())
+        else:
+            if classification_df.empty:
+                count = 0
+            else:
+                count = int(
+                    classification_df.apply(
+                        lambda r: _match_hk_enrich_segment_from_meta(
+                            r.get("code"),
+                            r.get("board"),
+                            r.get("hsics_sector"),
+                            key,
+                        ),
+                        axis=1,
+                    ).sum()
+                )
+        rows.append({"key": key, "label": label, "count": count})
+    return rows
+
+
+def get_hk_enrich_segment_status(snapshot_df: Optional[pd.DataFrame] = None) -> List[Dict[str, Any]]:
+    meta = get_snapshot_meta()
+    rows = get_hk_enrich_segment_counts(snapshot_df=snapshot_df)
+    enrich_df = _load_stock_enrichment_latest()
+    class_df = _load_hk_classification()
+    if enrich_df is None or enrich_df.empty:
+        enrich_df = pd.DataFrame(columns=["market", "code", "enriched_at", "persisted_at"])
+    enrich_df = enrich_df.copy()
+    enrich_df["market"] = enrich_df.get("market", pd.Series(dtype=object)).astype(str).str.upper()
+    enrich_df["code"] = enrich_df.get("code", pd.Series(dtype=object)).astype(str).map(_normalize_hk_code)
+    enrich_df = enrich_df[enrich_df["market"] == "HK"].copy()
+    for row in rows:
+        seg_key = _safe_str(row.get("key"))
+        seg_df = enrich_df[enrich_df.get("code", pd.Series(dtype=object)).astype(str).map(lambda x: _match_hk_enrich_segment(x, seg_key, class_df))].copy()
+        persisted_count = int(len(seg_df))
+        last_text = _safe_str(meta.get(f"last_enrich_segment_at_HK_{seg_key}", ""))
+        if not last_text and not seg_df.empty:
+            last_candidates = pd.Series(dtype=object)
+            if "enriched_at" in seg_df.columns:
+                last_candidates = seg_df["enriched_at"].astype(str).str.strip()
+                last_candidates = last_candidates[(last_candidates != "") & (last_candidates.str.lower() != "none")]
+            if last_candidates.empty and "persisted_at" in seg_df.columns:
+                last_candidates = seg_df["persisted_at"].astype(str).str.strip()
+                last_candidates = last_candidates[(last_candidates != "") & (last_candidates.str.lower() != "none")]
+            if not last_candidates.empty:
+                last_text = _safe_str(last_candidates.max())
+        total_count = int(row.get("count") or 0)
+        row["persisted_count"] = persisted_count
+        row["last_enriched_at"] = last_text
         if persisted_count <= 0:
             row["status"] = "未深补"
         elif total_count > 0 and persisted_count >= total_count:
@@ -543,7 +874,7 @@ def _normalize_enrich_segment(segment: Any) -> str:
 def _get_enrich_segment_label(segment: Any) -> str:
     seg = _normalize_enrich_segment(segment)
     mapping = {key: label for key, label in A_ENRICH_SEGMENTS}
-    return mapping.get(seg, "000/001 深主板")
+    return mapping.get(seg, "000/001/003 深主板")
 
 
 def _match_a_enrich_segment(code: Any, segment: Any) -> bool:
@@ -552,13 +883,13 @@ def _match_a_enrich_segment(code: Any, segment: Any) -> bool:
     if not re.fullmatch(r"\d{6}", code_text):
         return False
     if seg == "sz_main":
-        return code_text.startswith(("000", "001"))
+        return code_text.startswith(("000", "001", "003"))
     if seg == "sme":
         return code_text.startswith("002")
     if seg == "gem_300":
         return code_text.startswith("300")
     if seg == "gem_301":
-        return code_text.startswith("301")
+        return code_text.startswith(("301", "302"))
     if seg == "sh_main_600_601":
         return code_text.startswith(("600", "601"))
     if seg == "sh_main_603_605":
@@ -920,6 +1251,20 @@ def init_db() -> None:
                 app_version TEXT,
                 persisted_at TEXT,
                 PRIMARY KEY (market, code)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS hk_classification (
+                code TEXT PRIMARY KEY,
+                name TEXT,
+                board TEXT,
+                raw_industry TEXT,
+                hsics_sector TEXT,
+                source_note TEXT,
+                updated_at TEXT,
+                persisted_at TEXT
             )
             """
         )
@@ -1952,8 +2297,12 @@ def refresh_market_snapshot(
 ) -> Dict[str, Any]:
     init_db()
     scope = _safe_str(market_scope).upper() or "A"
-    segment_key = _normalize_enrich_segment(enrich_segment)
-    segment_label = _get_enrich_segment_label(segment_key)
+    if scope == "HK":
+        segment_key = _normalize_hk_enrich_segment(enrich_segment)
+        segment_label = _get_hk_enrich_segment_label(segment_key)
+    else:
+        segment_key = _normalize_enrich_segment(enrich_segment)
+        segment_label = _get_enrich_segment_label(segment_key)
     source_summary = ""
     meta0 = get_snapshot_meta()
     if weekly_mode:
@@ -1985,11 +2334,11 @@ def refresh_market_snapshot(
     if only_missing_enrich:
         enrich_mode = f"{enrich_mode}_missing"
 
-    local_snapshot_first = bool(scope == "A" and only_missing_enrich and not force_refresh)
+    local_snapshot_first = bool(scope in {"A", "HK"} and only_missing_enrich and not force_refresh)
     if local_snapshot_first:
         existing_snapshot = load_snapshot()
         if existing_snapshot is not None and not existing_snapshot.empty and "market" in existing_snapshot.columns:
-            existing_snapshot = existing_snapshot[existing_snapshot["market"].astype(str).str.upper() == "A"].copy()
+            existing_snapshot = existing_snapshot[existing_snapshot["market"].astype(str).str.upper() == scope].copy()
         if existing_snapshot is not None and not existing_snapshot.empty:
             df = existing_snapshot.copy()
             source_summary = "本地快照"
@@ -2013,6 +2362,12 @@ def refresh_market_snapshot(
                 fallback_pending = 0
                 if scope == "A":
                     for row in get_a_enrich_segment_status(existed):
+                        if _safe_str(row.get("key")) == segment_key:
+                            fallback_total = int(row.get("count", 0) or 0)
+                            fallback_pending = max(0, fallback_total - int(row.get("persisted_count", 0) or 0))
+                            break
+                elif scope == "HK":
+                    for row in get_hk_enrich_segment_status(existed):
                         if _safe_str(row.get("key")) == segment_key:
                             fallback_total = int(row.get("count", 0) or 0)
                             fallback_pending = max(0, fallback_total - int(row.get("persisted_count", 0) or 0))
@@ -2060,6 +2415,11 @@ def refresh_market_snapshot(
     if max_stocks and max_stocks > 0:
         df = df.head(int(max_stocks)).copy()
 
+    hk_classification_df = pd.DataFrame()
+    if scope == "HK" and int(enrich_top_n or 0) > 0:
+        sync_hk_classification(df, force_refresh=False, safe_mode=safe_mode)
+        hk_classification_df = _load_hk_classification()
+
     manual_flags = _load_manual_flags()
 
     enrich_n = max(0, min(int(enrich_top_n), len(df)))
@@ -2068,22 +2428,27 @@ def refresh_market_snapshot(
     cache_hit = 0
     cache_miss = 0
 
-    # 基本面深补目前仅对A股执行，港股先走行情快照，避免接口无效调用与过度请求
     if scope == "A":
         eligible_indices = [
             int(i)
             for i, row in df.iterrows()
             if _safe_str(row.get("market")).upper() == "A" and _match_a_enrich_segment(row.get("code"), segment_key)
         ]
+    elif scope == "HK":
+        eligible_indices = [
+            int(i)
+            for i, row in df.iterrows()
+            if _safe_str(row.get("market")).upper() == "HK" and _match_hk_enrich_segment(row.get("code"), segment_key, hk_classification_df)
+        ]
     else:
-        eligible_indices = [int(i) for i, m in enumerate(df["market"].tolist()) if _safe_str(m).upper() == "A"]
+        eligible_indices = []
     eligible_total = len(eligible_indices)
     pending_indices = eligible_indices
     if only_missing_enrich and not force_refresh:
         pending_indices = [idx for idx in eligible_indices if not _safe_str(df.at[idx, "enriched_at"])]
     pending_total = len(pending_indices)
     enrich_n = max(0, min(enrich_n, pending_total if (only_missing_enrich and not force_refresh) else eligible_total))
-    cursor_key = f"enrich_cursor_index_{scope}_{segment_key}" if scope == "A" else f"enrich_cursor_index_{scope}"
+    cursor_key = f"enrich_cursor_index_{scope}_{segment_key}"
 
     active_indices = pending_indices if (only_missing_enrich and not force_refresh) else eligible_indices
 
@@ -2091,7 +2456,7 @@ def refresh_market_snapshot(
         if rotate_enrich:
             meta = get_snapshot_meta()
             try:
-                start_idx = int(meta.get(cursor_key, "0" if scope == "A" else meta.get("enrich_cursor_index", "0")))
+                start_idx = int(meta.get(cursor_key, "0"))
             except Exception:
                 start_idx = 0
             start_idx = start_idx % len(active_indices)
@@ -2248,6 +2613,12 @@ def refresh_market_snapshot(
                         fallback_total = int(row.get("count", 0) or 0)
                         fallback_pending = max(0, fallback_total - int(row.get("persisted_count", 0) or 0))
                         break
+            elif scope == "HK":
+                for row in get_hk_enrich_segment_status(existed):
+                    if _safe_str(row.get("key")) == segment_key:
+                        fallback_total = int(row.get("count", 0) or 0)
+                        fallback_pending = max(0, fallback_total - int(row.get("persisted_count", 0) or 0))
+                        break
             _log_snapshot_run(
                 row_count=int(len(existed)),
                 enriched_count=0,
@@ -2300,12 +2671,14 @@ def refresh_market_snapshot(
         _snapshot_meta_set("last_enrich_segment_A", segment_key)
         if enrich_n > 0:
             _snapshot_meta_set(f"last_enrich_segment_at_{segment_key}", now_text)
+    elif scope == "HK":
+        _snapshot_meta_set("last_enrich_segment_HK", segment_key)
+        if enrich_n > 0:
+            _snapshot_meta_set(f"last_enrich_segment_at_HK_{segment_key}", now_text)
     _snapshot_meta_set("last_backup_at", _safe_str(backup_info.get("backup_at", "")))
     _snapshot_meta_set("last_backup_row_count", str(int(backup_info.get("row_count", 0) or 0)))
     if rotate_enrich and enrich_n > 0 and active_indices:
         _snapshot_meta_set(cursor_key, str((start_idx + enrich_n) % len(active_indices)))
-        if scope != "A":
-            _snapshot_meta_set("enrich_cursor_index", str((start_idx + enrich_n) % len(active_indices)))
     if weekly_mode:
         _snapshot_meta_set(f"last_weekly_update_{scope}", now_text)
 
