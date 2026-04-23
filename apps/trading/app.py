@@ -9,8 +9,9 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time as pytime
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
 from pathlib import Path
 from typing import List
 from zoneinfo import ZoneInfo
@@ -22,6 +23,7 @@ import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
+import yaml
 from streamlit.components.v1 import html
 
 OPENAI_AVAILABLE = True
@@ -106,6 +108,10 @@ from filter_engine import (
 )
 from apps.portfolio.app import APP_VERSION as PORTFOLIO_APP_VERSION
 from apps.portfolio.app import render_portfolio_page as _render_portfolio_page
+from apps.backtest.src.paper_trader import PaperTrader
+from apps.backtest.src.config_loader import ConfigError as BacktestConfigError
+from apps.backtest.src.config_loader import load_strategy as backtest_load_strategy
+from apps.backtest.src.config_loader import load_universe as backtest_load_universe
 from shared.multi_agent_analyzer import MultiAgentAnalyzer
 from shared.ui_shell import render_app_shell, render_section_intro, render_status_row, render_top_nav
 
@@ -1181,6 +1187,237 @@ def _call_deepseek_with_prompt(
         "prompt_cache_miss_tokens": cache_miss_tokens,
     }
     return report, usage_dict, cost, elapsed
+
+
+BACKTEST_AI_STRATEGY_SYSTEM_PROMPT = """你是港股多空回测策略生成器。
+任务：根据用户自然语言需求，生成一份可直接落库的 YAML 策略草案。
+
+硬约束：
+1. 只输出 YAML，禁止 Markdown 代码块，禁止解释文字。
+2. 只能使用候选股票池中明确给出的股票代码。
+3. long_positions 与 short_positions 权重和都必须等于 1.0。
+4. capital.long_pct + capital.short_pct + capital.cash_buffer_pct 必须等于 1.0。
+5. rebalance.frequency 只能是 daily/weekly/monthly/quarterly。
+6. 必须同时包含多头和空头，且都不能为空。
+7. market 固定为港股，不要输出 A 股或美股代码。
+8. 优先生成“能运行”的保守草案，不要追求花哨。
+
+输出字段结构固定为：
+strategy_name
+description
+sector
+backtest.start_date
+backtest.end_date
+capital.total
+capital.rmb_to_hkd_rate
+capital.long_pct
+capital.short_pct
+capital.cash_buffer_pct
+long_positions[].code
+long_positions[].weight
+short_positions[].code
+short_positions[].weight
+weighting_mode
+rebalance.frequency
+rebalance.day
+costs.commission_rate
+costs.slippage
+costs.short_borrow_rate
+stop_loss.single_long_stop
+stop_loss.single_long_action
+stop_loss.single_short_stop
+stop_loss.single_short_action
+stop_loss.portfolio_stop
+stop_loss.portfolio_action
+sensitivity.borrow_rates
+
+默认偏好：
+- capital.total = 1000000
+- capital.rmb_to_hkd_rate = 1.0
+- weighting_mode = manual
+- end_date = today
+- 不确定时使用 monthly 调仓
+- 不确定时多头 0.65 / 空头 0.20 / 现金 0.15
+- 不确定时 stop_loss 采用现有策略中的保守参数
+"""
+
+
+def _bt_strip_yaml_block(text: str) -> str:
+    s = (text or "").strip()
+    if s.startswith("```"):
+        s = re.sub(r"^```(?:yaml|yml)?\s*", "", s, flags=re.IGNORECASE)
+        s = re.sub(r"\s*```$", "", s)
+    return s.strip()
+
+
+def _bt_normalize_strategy_yaml_text(strategy_text: str) -> str:
+    text = _bt_strip_yaml_block(strategy_text)
+    if not text:
+        return ""
+    try:
+        raw = yaml.safe_load(text) or {}
+    except Exception:
+        return text
+    if not isinstance(raw, dict):
+        return text
+
+    raw["strategy_name"] = str(raw.get("strategy_name", "")).strip() or "AI策略草案"
+    raw["description"] = str(raw.get("description", "")).strip() or "由 AI 根据自然语言需求生成的港股多空策略草案"
+    raw["sector"] = str(raw.get("sector", "") or "").strip()
+
+    backtest = raw.get("backtest") or {}
+    if not isinstance(backtest, dict):
+        backtest = {}
+    backtest["start_date"] = str(backtest.get("start_date", "")).strip() or "2023-01-01"
+    backtest["end_date"] = str(backtest.get("end_date", "")).strip() or "today"
+    raw["backtest"] = backtest
+
+    capital = raw.get("capital") or {}
+    if not isinstance(capital, dict):
+        capital = {}
+    capital["total"] = float(capital.get("total", 1000000) or 1000000)
+    capital["rmb_to_hkd_rate"] = float(capital.get("rmb_to_hkd_rate", 1.0) or 1.0)
+    capital["long_pct"] = float(capital.get("long_pct", 0.65) or 0.65)
+    capital["short_pct"] = float(capital.get("short_pct", 0.20) or 0.20)
+    capital["cash_buffer_pct"] = float(capital.get("cash_buffer_pct", 0.15) or 0.15)
+    raw["capital"] = capital
+
+    raw["weighting_mode"] = str(raw.get("weighting_mode", "manual")).strip().lower() or "manual"
+
+    rebalance = raw.get("rebalance") or {}
+    if not isinstance(rebalance, dict):
+        rebalance = {}
+    rebalance["frequency"] = str(rebalance.get("frequency", "monthly")).strip().lower() or "monthly"
+    rebalance["day"] = int(rebalance.get("day", 1) or 1)
+    raw["rebalance"] = rebalance
+
+    costs = raw.get("costs") or {}
+    if not isinstance(costs, dict):
+        costs = {}
+    costs["commission_rate"] = float(costs.get("commission_rate", 0.0015) or 0.0015)
+    costs["slippage"] = float(costs.get("slippage", 0.001) or 0.001)
+    costs["short_borrow_rate"] = float(costs.get("short_borrow_rate", 0.08) or 0.08)
+    raw["costs"] = costs
+
+    stop_loss = raw.get("stop_loss") or {}
+    if not isinstance(stop_loss, dict):
+        stop_loss = {}
+    stop_loss["single_long_stop"] = float(stop_loss.get("single_long_stop", -0.20) or -0.20)
+    stop_loss["single_long_action"] = str(stop_loss.get("single_long_action", "halve")).strip().lower() or "halve"
+    stop_loss["single_short_stop"] = float(stop_loss.get("single_short_stop", 0.30) or 0.30)
+    stop_loss["single_short_action"] = str(stop_loss.get("single_short_action", "close")).strip().lower() or "close"
+    stop_loss["portfolio_stop"] = float(stop_loss.get("portfolio_stop", -0.12) or -0.12)
+    stop_loss["portfolio_action"] = str(stop_loss.get("portfolio_action", "close_all")).strip().lower() or "close_all"
+    raw["stop_loss"] = stop_loss
+
+    sensitivity = raw.get("sensitivity") or {}
+    if not isinstance(sensitivity, dict):
+        sensitivity = {}
+    borrow_rates = sensitivity.get("borrow_rates", [0.03, 0.05, 0.08, 0.12])
+    if not isinstance(borrow_rates, list) or not borrow_rates:
+        borrow_rates = [0.03, 0.05, 0.08, 0.12]
+    sensitivity["borrow_rates"] = [float(x) for x in borrow_rates]
+    raw["sensitivity"] = sensitivity
+
+    return yaml.safe_dump(raw, allow_unicode=True, sort_keys=False)
+
+
+def _bt_load_universe_prompt_text() -> str:
+    universe_path = BACKTEST_DIR / "config" / "universe.yaml"
+    raw = yaml.safe_load(universe_path.read_text(encoding="utf-8")) or {}
+    sectors = raw.get("sectors") or {}
+    chunks: list[str] = []
+    for sec_key, sec_obj in sectors.items():
+        if not isinstance(sec_obj, dict):
+            continue
+        sec_name = str(sec_obj.get("name", sec_key)).strip()
+        groups = sec_obj.get("groups") or {}
+        parts: list[str] = []
+        for grp_key, grp_obj in groups.items():
+            if not isinstance(grp_obj, dict):
+                continue
+            grp_name = str(grp_obj.get("name", grp_key)).strip()
+            stocks = grp_obj.get("stocks") or []
+            stock_txt = []
+            for st_obj in stocks:
+                if not isinstance(st_obj, dict):
+                    continue
+                code = str(st_obj.get("code", "")).strip()
+                name = str(st_obj.get("name", "")).strip()
+                tags = st_obj.get("tags") or []
+                tag_txt = f"（{'/'.join(str(t) for t in tags[:3])}）" if tags else ""
+                if code and name:
+                    stock_txt.append(f"{code} {name}{tag_txt}")
+            if stock_txt:
+                parts.append(f"- {grp_name}: " + "；".join(stock_txt))
+        if parts:
+            chunks.append(f"[{sec_name}]\n" + "\n".join(parts))
+    return "\n\n".join(chunks)
+
+
+def _bt_validate_strategy_yaml_text(strategy_text: str) -> tuple[bool, str]:
+    text = _bt_normalize_strategy_yaml_text(strategy_text)
+    if not text:
+        return False, "AI 未生成有效 YAML。"
+    universe_path = BACKTEST_DIR / "config" / "universe.yaml"
+    try:
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False, encoding="utf-8") as tf:
+            tf.write(text)
+            temp_path = Path(tf.name)
+        universe = backtest_load_universe(universe_path)
+        backtest_load_strategy(temp_path, universe)
+        return True, ""
+    except BacktestConfigError as exc:
+        return False, f"策略校验失败: {exc}"
+    except Exception as exc:
+        return False, f"策略解析失败: {exc}"
+    finally:
+        try:
+            if 'temp_path' in locals() and temp_path.exists():
+                temp_path.unlink()
+        except Exception:
+            pass
+
+
+def _bt_generate_ai_strategy_draft(user_prompt: str, template_name: str = "") -> dict:
+    prompt = (user_prompt or "").strip()
+    if not prompt:
+        raise RuntimeError("策略描述为空。")
+    universe_text = _bt_load_universe_prompt_text()
+    template_block = ""
+    if template_name and template_name != "(不使用模板)":
+        tp = BACKTEST_STRATEGY_DIR / template_name
+        if tp.exists():
+            template_block = f"\n\n参考模板（可借鉴风格，但不要照抄）：\n{tp.read_text(encoding='utf-8', errors='replace')}\n"
+    user_content = f"""用户需求：
+{prompt}
+
+候选股票池（只能从这里选）：
+{universe_text}
+{template_block}
+
+请直接输出 YAML 草案。
+"""
+    report, usage, cost, elapsed = _call_deepseek_with_prompt(
+        user_content=user_content,
+        system_prompt=BACKTEST_AI_STRATEGY_SYSTEM_PROMPT,
+        max_tokens=2200,
+        temperature=0.2,
+        top_p=0.9,
+    )
+    yaml_text = _bt_normalize_strategy_yaml_text(report)
+    ok, err = _bt_validate_strategy_yaml_text(yaml_text)
+    parsed = yaml.safe_load(yaml_text) if ok else {}
+    return {
+        "yaml_text": yaml_text,
+        "valid": ok,
+        "error": err,
+        "usage": usage,
+        "cost": cost,
+        "elapsed": elapsed,
+        "strategy_name": str((parsed or {}).get("strategy_name", "")).strip() if isinstance(parsed, dict) else "",
+        "description": str((parsed or {}).get("description", "")).strip() if isinstance(parsed, dict) else "",
+    }
 
 
 def _call_deepseek_analysis(json_text: str) -> tuple[str, dict, float, float]:
@@ -2657,6 +2894,26 @@ def _render_backtest_page():
     st.markdown("### 策略库管理")
     st.caption("点击策略名载入；右上角小 × 删除会进入回收站。")
 
+    def _read_strategy_name_for_delete(src: Path) -> str:
+        try:
+            raw = src.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            return src.stem
+        m = re.search(r'^\s*strategy_name\s*:\s*["\']?(.*?)["\']?\s*$', raw, flags=re.MULTILINE)
+        if m:
+            return (m.group(1) or "").strip() or src.stem
+        return src.stem
+
+    def _archive_paper_runs_for_strategy(src: Path) -> dict:
+        trader = PaperTrader(base_dir=BACKTEST_DIR, logger=lambda *args, **kwargs: None)
+        strategy_name = _read_strategy_name_for_delete(src)
+        return trader.archive_runs_for_strategy(config_path=src, strategy_name=strategy_name)
+
+    def _restore_paper_runs_for_strategy(dst: Path) -> dict:
+        trader = PaperTrader(base_dir=BACKTEST_DIR, logger=lambda *args, **kwargs: None)
+        strategy_name = _read_strategy_name_for_delete(dst)
+        return trader.restore_runs_for_strategy(config_path=dst, strategy_name=strategy_name)
+
     def _move_strategy_to_trash(src: Path) -> Path:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         base_name = f"{src.stem}__{ts}{src.suffix}"
@@ -2687,12 +2944,17 @@ def _render_backtest_page():
                         st.error(f"读取策略失败: {exc}")
                 if b2.button("✕", use_container_width=True, key=f"bt_close_strategy_{name}"):
                     try:
+                        archive_info = _archive_paper_runs_for_strategy(p)
                         _move_strategy_to_trash(p)
                         if st.session_state.get("bt_selected_strategy") == name:
                             st.session_state["bt_selected_strategy"] = ""
                             st.session_state["bt_strategy_text"] = ""
                             st.session_state["bt_strategy_source"] = "__inline__"
-                        st.success(f"已移入回收站: {name}")
+                        archived_count = int(archive_info.get("count", 0) or 0)
+                        if archived_count > 0:
+                            st.success(f"已移入回收站: {name} ｜ 同步归档模拟实盘 {archived_count} 个，资金占用已释放")
+                        else:
+                            st.success(f"已移入回收站: {name}")
                         st.rerun()
                     except Exception as exc:
                         st.error(f"删除失败: {exc}")
@@ -2710,7 +2972,12 @@ def _render_backtest_page():
                 dst = BACKTEST_STRATEGY_DIR / f"{dst.stem}_restored_{datetime.now().strftime('%H%M%S')}{dst.suffix}"
             try:
                 shutil.move(str(src), str(dst))
-                st.success(f"已恢复: {dst.name}")
+                restore_info = _restore_paper_runs_for_strategy(dst)
+                restored_count = int(restore_info.get("count", 0) or 0)
+                if restored_count > 0:
+                    st.success(f"已恢复: {dst.name} ｜ 同步恢复模拟实盘 {restored_count} 个")
+                else:
+                    st.success(f"已恢复: {dst.name}")
                 st.rerun()
             except Exception as exc:
                 st.error(f"恢复失败: {exc}")
@@ -2728,6 +2995,106 @@ def _render_backtest_page():
                 st.rerun()
     else:
         st.caption("回收站为空。")
+
+    st.markdown("### 策略编写")
+    bt_mode = st.radio("编写模式", options=["手动编写", "AI辅助写策略"], horizontal=True, key="bt_mode_main")
+    if "bt_ai_prompt" not in st.session_state:
+        st.session_state["bt_ai_prompt"] = ""
+    if "bt_ai_draft_yaml" not in st.session_state:
+        st.session_state["bt_ai_draft_yaml"] = ""
+    if "bt_ai_draft_meta" not in st.session_state:
+        st.session_state["bt_ai_draft_meta"] = {}
+
+    if bt_mode == "AI辅助写策略":
+        render_section_intro(
+            "AI 策略草拟",
+            "输入策略想法，AI 先生成可校验的港股多空 YAML 草案；你确认后再保存或直接回测。",
+            kicker="DeepSeek",
+            pills=("自然语言", "YAML草案", "校验后再保存"),
+        )
+        ai_template_options = ["(不使用模板)"] + strategy_names
+        ai_cols = st.columns([1.2, 1.0], vertical_alignment="bottom")
+        selected_template = ai_cols[0].selectbox("参考模板", options=ai_template_options, key="bt_ai_template")
+        ai_save_name = ai_cols[1].text_input("AI草案保存文件名（可选）", value="", key="bt_ai_save_name")
+        st.text_area(
+            "策略想法",
+            height=110,
+            key="bt_ai_prompt",
+            placeholder="例如：做多高股息央企和现金流稳健龙头，做空持续亏损的AI概念股，偏防守，月度调仓，总资金100万港币。",
+        )
+        ai_btn_cols = st.columns([1.0, 1.0, 1.2], vertical_alignment="bottom")
+        if ai_btn_cols[0].button("生成AI策略草案", type="primary", use_container_width=True, key="bt_ai_generate"):
+            try:
+                draft = _bt_generate_ai_strategy_draft(
+                    user_prompt=str(st.session_state.get("bt_ai_prompt", "") or ""),
+                    template_name=str(selected_template or ""),
+                )
+                st.session_state["bt_ai_draft_yaml"] = draft["yaml_text"]
+                st.session_state["bt_ai_draft_meta"] = draft
+                if draft.get("valid"):
+                    st.success(
+                        f"草案生成完成：{draft.get('strategy_name') or '未命名'} ｜ "
+                        f"{float(draft.get('elapsed', 0.0)):.1f}s ｜ 约 ${float(draft.get('cost', 0.0)):.4f}"
+                    )
+                else:
+                    st.error(str(draft.get("error", "草案校验失败")))
+            except Exception as exc:
+                st.error(f"AI 生成失败: {exc}")
+        if ai_btn_cols[1].button("采用草案到下方编辑区", use_container_width=True, key="bt_ai_apply_draft"):
+            draft_yaml = str(st.session_state.get("bt_ai_draft_yaml", "") or "")
+            if not draft_yaml.strip():
+                st.error("当前没有 AI 草案。")
+            else:
+                st.session_state["bt_strategy_text"] = draft_yaml
+                st.session_state["bt_strategy_source"] = "__manual__"
+                st.success("已将 AI 草案写入下方策略编辑区。")
+                st.rerun()
+        if ai_btn_cols[2].button("保存并直接回测AI草案", use_container_width=True, key="bt_ai_save_run"):
+            draft_yaml = str(st.session_state.get("bt_ai_draft_yaml", "") or "")
+            ok, err = _bt_validate_strategy_yaml_text(draft_yaml)
+            if not draft_yaml.strip():
+                st.error("当前没有 AI 草案。")
+            elif not ok:
+                st.error(err or "AI 草案尚未通过校验。")
+            else:
+                raw = (ai_save_name or "").strip() or f"{(st.session_state.get('bt_ai_draft_meta', {}) or {}).get('strategy_name', 'ai_strategy')}.yaml"
+                safe = re.sub(r'[\\/:*?"<>|\x00-\x1f]', '_', raw).strip().strip(".")
+                if not safe:
+                    safe = "ai_strategy.yaml"
+                if not safe.lower().endswith((".yaml", ".yml")):
+                    safe = f"{safe}.yaml"
+                target = BACKTEST_STRATEGY_DIR / safe
+                try:
+                    target.write_text(draft_yaml, encoding="utf-8")
+                    st.session_state["bt_selected_strategy"] = target.name
+                    st.session_state["bt_strategy_text"] = draft_yaml
+                    st.session_state["bt_strategy_source"] = target.name
+                    _run_cmd(
+                        [
+                            sys.executable,
+                            "run_backtest.py",
+                            "--config",
+                            f"config/strategies/{target.name}",
+                            "--output",
+                            "reports",
+                            "--no-browser",
+                        ],
+                        f"运行AI策略({target.name})",
+                    )
+                except Exception as exc:
+                    st.error(f"保存或回测失败: {exc}")
+
+        draft_yaml = str(st.session_state.get("bt_ai_draft_yaml", "") or "")
+        if draft_yaml.strip():
+            draft_meta = st.session_state.get("bt_ai_draft_meta", {}) or {}
+            render_status_row(
+                (
+                    ("草案名称", str(draft_meta.get("strategy_name", "未命名")) or "未命名"),
+                    ("校验结果", "通过" if bool(draft_meta.get("valid")) else "失败"),
+                    ("生成耗时", f"{float(draft_meta.get('elapsed', 0.0)):.1f}s"),
+                )
+            )
+            st.text_area("AI 策略草案 YAML", value=draft_yaml, height=360, key="bt_ai_draft_preview")
 
     st.markdown("### 策略输入（直接粘贴即可）")
     st.caption("把你的完整 YAML 直接贴进来，点击“粘贴策略并运行”即可，无需手动改文件。")
@@ -2881,6 +3248,38 @@ def _render_paper_page():
     if "paper_console_output" not in st.session_state:
         st.session_state["paper_console_output"] = ""
 
+    def _paper_daily_agent_status() -> dict:
+        plist_path = Path.home() / "Library" / "LaunchAgents" / "com.quant.paper_daily.plist"
+        out_log = PROJECT_ROOT / "data" / "logs" / "paper_daily.out.log"
+        installed = plist_path.exists()
+        last_auto = ""
+        if out_log.exists():
+            try:
+                lines = [line.strip() for line in out_log.read_text(encoding="utf-8", errors="replace").splitlines() if line.strip()]
+                for line in reversed(lines):
+                    m = re.match(r"^\[PAPER-DAILY\]\s+(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})\s+", line)
+                    if m:
+                        last_auto = m.group(1)
+                        break
+            except Exception:
+                last_auto = ""
+
+        next_run = ""
+        if installed:
+            now = datetime.now(ZoneInfo("Asia/Shanghai"))
+            candidate = now.replace(hour=16, minute=20, second=0, microsecond=0)
+            while True:
+                if candidate.weekday() < 5 and candidate > now:
+                    next_run = candidate.strftime("%Y-%m-%d %H:%M")
+                    break
+                candidate = (candidate + timedelta(days=1)).replace(hour=16, minute=20, second=0, microsecond=0)
+
+        return {
+            "installed": installed,
+            "last_auto": last_auto or "--",
+            "next_run": next_run or "--",
+        }
+
     BACKTEST_PAPER_DIR.mkdir(parents=True, exist_ok=True)
     strategy_files = sorted(
         [p for p in BACKTEST_STRATEGY_DIR.glob("*.yaml") if p.is_file()],
@@ -2893,6 +3292,8 @@ def _render_paper_page():
     if not BACKTEST_PAPER_RUNNER.exists():
         st.error(f"未找到模拟实盘入口: {BACKTEST_PAPER_RUNNER}")
         return
+
+    st.caption("规则：每个交易日 16:20 自动推进全部运行中模拟盘到最新交易日，并自动重建看板。")
 
     st.markdown(
         """
@@ -3090,11 +3491,8 @@ def _render_paper_page():
     weighted_initial = float(sum((x[2] / (1.0 + x[3])) for x in active_rows if np.isfinite(x[2]) and np.isfinite(x[3]) and (1.0 + x[3]) != 0.0))
     total_cum = (total_equity / weighted_initial - 1.0) if weighted_initial > 0 else float("nan")
 
-    h1, h2 = st.columns(2)
-    if h1.button("更新全部活跃模拟盘", use_container_width=True, key="paper_update_all"):
-        _run_paper_cmd([sys.executable, "paper_trade.py", "update", "--all", "--as-of", "today"], "更新全部活跃模拟盘")
-        st.rerun()
-    if h2.button("刷新状态", use_container_width=True, key="paper_refresh_state"):
+    if st.button("推进全部运行中模拟盘到最新交易日", use_container_width=True, key="paper_update_all"):
+        _run_paper_cmd([sys.executable, "paper_trade.py", "update", "--all", "--as-of", "today"], "推进全部运行中模拟盘到最新交易日")
         st.rerun()
 
     render_status_row(
@@ -3126,7 +3524,7 @@ def _render_paper_page():
                         """,
                         unsafe_allow_html=True,
                     )
-                    action_label = "更新数据" if row else "启动模拟"
+                    action_label = "更新到今日" if row else "启动模拟"
                     if st.button(action_label, use_container_width=True, key=f"paper_action_{name}"):
                         if row:
                             _run_paper_cmd(
@@ -3139,7 +3537,7 @@ def _render_paper_page():
                                     "--as-of",
                                     "today",
                                 ],
-                                f"模拟更新({name})",
+                                f"模拟推进到今日({name})",
                             )
                         else:
                             _run_paper_cmd(
@@ -3157,18 +3555,6 @@ def _render_paper_page():
                                 f"模拟启动({name})",
                             )
                         st.rerun()
-
-    with st.expander("低频操作", expanded=False):
-        if st.button("重建模拟看板", use_container_width=True, key="paper_build_dashboard"):
-            _run_paper_cmd([sys.executable, "paper_trade.py", "dashboard"], "重建模拟看板")
-            st.rerun()
-        render_status_row(
-            (
-                ("模块目录", str(BACKTEST_DIR)),
-                ("模拟盘目录", str(BACKTEST_PAPER_DIR)),
-                ("Python", sys.executable),
-            )
-        )
 
     if BACKTEST_PAPER_DASHBOARD.exists():
         with st.expander("模拟盘管理中心", expanded=False):

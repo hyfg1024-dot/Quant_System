@@ -80,12 +80,14 @@ class PaperTrader:
 
         self.data_dir = self.base_dir / "data"
         self.paper_dir = self.base_dir / "paper_trades"
+        self.paper_trash_dir = self.paper_dir / "_trash"
         self.active_path = self.paper_dir / ".active"
         self.dashboard_path = self.paper_dir / "dashboard.html"
 
         self.dm = DataManager(data_dir=self.data_dir, logger=self.logger)
 
         self.paper_dir.mkdir(parents=True, exist_ok=True)
+        self.paper_trash_dir.mkdir(parents=True, exist_ok=True)
         self._ensure_active_registry()
         self._ensure_dashboard_stub()
 
@@ -570,6 +572,103 @@ class PaperTrader:
         """Backward-compatible alias."""
         return self.generate_dashboard()
 
+    def archive_runs_for_strategy(self, config_path: Path, strategy_name: str = "") -> Dict[str, Any]:
+        """Archive paper runs linked to one strategy and remove them from active registry."""
+        target_cfg = self._resolve_path(config_path)
+        target_cfg_text = str(target_cfg.resolve()) if target_cfg.exists() else str(target_cfg)
+        target_name = str(strategy_name or "").strip()
+
+        active_rows = self._load_active()
+        keep_rows: List[Dict[str, Any]] = []
+        archived: List[Dict[str, Any]] = []
+        seen_run_ids: Set[str] = set()
+
+        for row in active_rows:
+            rid = str(row.get("run_id", "")).strip()
+            if not rid:
+                continue
+            run_dir = Path(str(row.get("run_dir", self.paper_dir / rid)))
+            if not run_dir.is_absolute():
+                run_dir = self._resolve_path(run_dir)
+            state_path = run_dir / "state.json"
+            match = self._run_matches_strategy(
+                state_path=state_path,
+                target_config_path=target_cfg_text,
+                target_strategy_name=target_name,
+                fallback_row=row,
+            )
+            if not match:
+                keep_rows.append(row)
+                continue
+            seen_run_ids.add(rid)
+            archived.append(self._archive_run_dir(run_dir=run_dir, run_id=rid))
+
+        for state_path in sorted(self.paper_dir.glob("*/state.json")):
+            if self.paper_trash_dir in state_path.parents:
+                continue
+            run_dir = state_path.parent
+            rid = run_dir.name
+            if rid in seen_run_ids:
+                continue
+            if not self._run_matches_strategy(
+                state_path=state_path,
+                target_config_path=target_cfg_text,
+                target_strategy_name=target_name,
+                fallback_row=None,
+            ):
+                continue
+            archived.append(self._archive_run_dir(run_dir=run_dir, run_id=rid))
+
+        self._save_active(keep_rows)
+        self.build_dashboard()
+        return {
+            "count": len(archived),
+            "run_ids": [str(x.get("run_id", "")) for x in archived],
+            "archived": archived,
+        }
+
+    def restore_runs_for_strategy(self, config_path: Path, strategy_name: str = "") -> Dict[str, Any]:
+        """Restore archived paper runs linked to one strategy and re-register them as active."""
+        target_cfg = self._resolve_path(config_path)
+        target_cfg_text = str(target_cfg.resolve()) if target_cfg.exists() else str(target_cfg)
+        target_name = str(strategy_name or "").strip()
+        restored: List[Dict[str, Any]] = []
+
+        for state_path in sorted(self.paper_trash_dir.glob("*/state.json")):
+            run_dir = state_path.parent
+            rid = run_dir.name.split("__", 1)[0]
+            if not self._run_matches_strategy(
+                state_path=state_path,
+                target_config_path=target_cfg_text,
+                target_strategy_name=target_name,
+                fallback_row=None,
+            ):
+                continue
+            restored_info = self._restore_run_dir(run_dir=run_dir, run_id=rid)
+            restored.append(restored_info)
+            state = {}
+            try:
+                state = self._read_json(Path(restored_info["restored_dir"]) / "state.json")
+            except Exception:
+                state = {}
+            self._upsert_active(
+                {
+                    "run_id": str(state.get("run_id", rid)),
+                    "strategy_name": str(state.get("strategy_name", target_name)),
+                    "created_at": str(state.get("created_at", "")),
+                    "last_update_date": str(state.get("last_update_date", "")),
+                    "status": "active",
+                    "run_dir": str(restored_info["restored_dir"]),
+                }
+            )
+
+        self.build_dashboard()
+        return {
+            "count": len(restored),
+            "run_ids": [str(x.get("run_id", "")) for x in restored],
+            "restored": restored,
+        }
+
     def generate_dashboard(self) -> Path:
         """Render advanced HTML dashboard for all paper runs."""
         payload = self._collect_dashboard_payload()
@@ -843,9 +942,9 @@ class PaperTrader:
             <tr>
               <th data-key='strategy_name'>策略名称</th>
               <th data-key='status'>状态</th>
-              <th data-key='run_days'>运行天数</th>
+              <th data-key='run_days'>已记录交易日</th>
               <th class='num' data-key='equity'>权益(HKD)</th>
-              <th class='num' data-key='cum_return'>累计收益</th>
+              <th class='num' data-key='cum_return'>累计收益率</th>
               <th class='num' data-key='today_return'>今日</th>
             </tr>
           </thead>
@@ -887,7 +986,7 @@ class PaperTrader:
       return v >= 0 ? "var(--up)" : "var(--down)";
     }}
     function statusBadge(status) {{
-      return (status || "").toLowerCase() === "active" ? "🟢 active" : "⚪ stopped";
+      return (status || "").toLowerCase() === "active" ? "🟢 运行中" : "⚪ 已停止";
     }}
     function sparklineSvg(values, color) {{
       const vals = (values || []).filter((x) => isNum(x));
@@ -922,7 +1021,7 @@ class PaperTrader:
     function renderTopSummary() {{
       const s = DATA.summary || {{}};
       const totalRetHtml = `<span style="color:${{colorBySign(s.total_return)}}">${{fmtPct(s.total_return)}}</span>`;
-      const txt = `${{s.active_count || 0}}个活跃策略 · 总权益: HKD ${{fmtNum(s.total_equity)}} · 总收益: ${{totalRetHtml}}`;
+      const txt = `${{s.active_count || 0}}个活跃策略 · 总权益: HKD ${{fmtNum(s.total_equity)}} · 累计收益率: ${{totalRetHtml}}`;
       document.getElementById("top-summary").innerHTML = txt;
     }}
 
@@ -1018,20 +1117,20 @@ class PaperTrader:
               </div>
               <div>
                 <div class="metric-big mono ${{tagCls}}">${{fmtPct(r.cum_return)}}</div>
-                <div class="metric-tag">累计收益</div>
+                <div class="metric-tag">累计收益率</div>
               </div>
             </div>
             <div class="card-curve">${{curve}}</div>
             <div class="card-foot">
               <div>多头 ${{r.long_count || 0}} 只 · 空头 ${{r.short_count || 0}} 只</div>
-              <div>运行 ${{r.run_days || 0}} 天</div>
+              <div>已记录 ${{r.run_days || 0}} 个交易日</div>
               <div class="mono">现金: ${{fmtNum(r.cash)}}</div>
               <div>下次调仓: ${{r.next_rebalance || "-"}}</div>
               <div class="mono">融券费: ${{fmtNum(r.borrow_fee_total)}}</div>
               <div class="mono">交易费: ${{fmtNum(r.trade_fee_total)}}</div>
             </div>
             <div class="card-actions">
-              <button class="btn small primary" type="button" title="请回到应用内执行更新">更新数据</button>
+              <button class="btn small primary" type="button" title="请回到应用内执行更新">更新到今日</button>
               <button class="btn small secondary" type="button" data-run-detail="${{r.run_id}}">查看详情</button>
             </div>
           </article>
@@ -1835,6 +1934,59 @@ class PaperTrader:
             rows.append(row)
         rows.sort(key=lambda x: (str(x.get("last_update_date", "")), str(x.get("run_id", ""))), reverse=True)
         self._save_active(rows)
+
+    def _run_matches_strategy(
+        self,
+        *,
+        state_path: Path,
+        target_config_path: str,
+        target_strategy_name: str,
+        fallback_row: Optional[Dict[str, Any]],
+    ) -> bool:
+        state: Dict[str, Any] = {}
+        try:
+            if state_path.exists():
+                state = self._read_json(state_path)
+        except Exception:
+            state = {}
+
+        config_path_text = str(state.get("config_path", "")).strip()
+        strategy_name = str(state.get("strategy_name", "")).strip()
+        if not config_path_text and isinstance(fallback_row, dict):
+            strategy_name = strategy_name or str(fallback_row.get("strategy_name", "")).strip()
+        if config_path_text:
+            try:
+                resolved = self._resolve_path(Path(config_path_text))
+                config_path_text = str(resolved.resolve()) if resolved.exists() else str(resolved)
+            except Exception:
+                pass
+        if target_config_path and config_path_text and config_path_text == target_config_path:
+            return True
+        return bool(target_strategy_name and strategy_name and strategy_name == target_strategy_name)
+
+    def _archive_run_dir(self, run_dir: Path, run_id: str) -> Dict[str, Any]:
+        if not run_dir.exists():
+            return {"run_id": run_id, "archived_dir": "", "missing": True}
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        dst = self.paper_trash_dir / f"{run_dir.name}__{ts}"
+        idx = 1
+        while dst.exists():
+            dst = self.paper_trash_dir / f"{run_dir.name}__{ts}_{idx}"
+            idx += 1
+        shutil.move(str(run_dir), str(dst))
+        return {"run_id": run_id, "archived_dir": str(dst), "missing": False}
+
+    def _restore_run_dir(self, run_dir: Path, run_id: str) -> Dict[str, Any]:
+        if not run_dir.exists():
+            return {"run_id": run_id, "restored_dir": "", "missing": True}
+        base_name = run_dir.name.split("__", 1)[0]
+        dst = self.paper_dir / base_name
+        idx = 1
+        while dst.exists():
+            dst = self.paper_dir / f"{base_name}_restored_{idx}"
+            idx += 1
+        shutil.move(str(run_dir), str(dst))
+        return {"run_id": run_id, "restored_dir": str(dst), "missing": False}
 
     def _safe_read_state_last_date(self, state_path: Path) -> str:
         try:
