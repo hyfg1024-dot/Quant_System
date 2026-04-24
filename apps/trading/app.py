@@ -24,10 +24,18 @@ import pandas as pd
 import requests
 import streamlit as st
 import yaml
-from streamlit.components.v1 import html
 
 OPENAI_AVAILABLE = True
 OPENAI_IMPORT_ERROR = None
+
+
+def html(body: str, *, height: int | None = None, scrolling: bool = False) -> None:
+    if height:
+        overflow = "auto" if scrolling else "hidden"
+        body = f"<div style='height:{int(height)}px;overflow:{overflow};'>{body}</div>"
+    st.html(body, unsafe_allow_javascript=True, width="stretch")
+
+
 try:
     from openai import APIConnectionError, APIStatusError, APITimeoutError, AuthenticationError, OpenAI, RateLimitError
 except Exception as _exc:  # pragma: no cover - 依赖缺失时兜底
@@ -666,8 +674,8 @@ new_query = st.sidebar.text_input(
 )
 
 add_cols = st.sidebar.columns(2)
-add_holding = add_cols[0].button("加入持仓", use_container_width=True)
-add_watch = add_cols[1].button("加入观察", use_container_width=True)
+add_holding = add_cols[0].button("加入持仓", width="stretch")
+add_watch = add_cols[1].button("加入观察", width="stretch")
 if add_holding or add_watch:
     pool_group = "holding" if add_holding else "watch"
     group_text = "持仓" if pool_group == "holding" else "观察"
@@ -687,7 +695,7 @@ if pool_rows_for_sidebar:
         options=[code for code, _ in pool_rows_for_sidebar],
         format_func=lambda c: f"{pool_name_map.get(c, c)} ({c})",
     )
-    if st.sidebar.button("删除选中", use_container_width=True):
+    if st.sidebar.button("删除选中", width="stretch"):
         remove_stock_from_pool(remove_code)
         if st.session_state.get("fast_selected_code") == remove_code:
             st.session_state.pop("fast_selected_code", None)
@@ -1587,7 +1595,7 @@ def _ensure_fundamental_state(force_refresh: bool = False):
 def _render_fundamental_page():
     st.caption(f"版本号: {FUND_APP_VERSION}")
     top_cols = st.columns([1, 5], vertical_alignment="center")
-    if top_cols[0].button("刷新基本面", use_container_width=True, key="refresh_fundamental_now"):
+    if top_cols[0].button("刷新基本面", width="stretch", key="refresh_fundamental_now"):
         _ensure_fundamental_state(force_refresh=True)
         st.rerun()
 
@@ -1717,6 +1725,7 @@ def _render_fundamental_page():
 
     code = str(row.get("code", ""))
     json_payload = json.dumps(row, ensure_ascii=False, indent=2)
+    payload_hash = hashlib.sha1(json_payload.encode("utf-8")).hexdigest()[:12]
     json_b64 = base64.b64encode(json_payload.encode("utf-8")).decode("ascii")
     btn1, btn2 = st.columns([1, 1], gap="small")
     with btn1:
@@ -1746,7 +1755,7 @@ def _render_fundamental_page():
             height=88,
         )
     with btn2:
-        if st.button("DeepSeek分析", key=f"fnd_deepseek_{code}", use_container_width=True):
+        if st.button("DeepSeek分析", key=f"fnd_deepseek_{code}", width="stretch"):
             progress = st.progress(0, text="正在准备分析任务...")
             pytime.sleep(0.08)
             progress.progress(35, text="正在压缩数据...")
@@ -1763,6 +1772,7 @@ def _render_fundamental_page():
                     "cost": cost,
                     "elapsed": elapsed,
                     "at": datetime.now().strftime("%m-%d %H:%M:%S"),
+                    "input_hash": payload_hash,
                 }
             except Exception as exc:
                 progress.empty()
@@ -1775,7 +1785,8 @@ def _render_fundamental_page():
         st.caption(
             f"分析时间: {deep.get('at','')} ｜耗时: {deep.get('elapsed',0):.2f}s ｜"
             f"Tokens: {deep.get('usage',{}).get('total_tokens',0)} ｜"
-            f"预估成本: {deep.get('cost',0):.4f} 元"
+            f"预估成本: {deep.get('cost',0):.4f} 元 ｜"
+            f"数据指纹: {deep.get('input_hash', '--')}"
         )
         report_text = (deep.get("report", "") or "").strip()
         st.markdown(report_text)
@@ -1843,6 +1854,91 @@ def _safe_int(v: object) -> int:
         return int(float(str(v)))
     except Exception:
         return 0
+
+
+def _parse_dt_text(value: object) -> datetime | None:
+    text = _safe_str(value)
+    if not text:
+        return None
+    candidates = (
+        (text[:19].replace("T", " "), "%Y-%m-%d %H:%M:%S"),
+        (text[:10], "%Y-%m-%d"),
+    )
+    for candidate, fmt in candidates:
+        try:
+            return datetime.strptime(candidate, fmt)
+        except Exception:
+            continue
+    return None
+
+
+def _flt_hk_segment_health(row: dict) -> dict:
+    total = max(0, int(row.get("count", 0) or 0))
+    covered = max(0, int(row.get("persisted_count", 0) or 0))
+    missing = max(0, total - covered)
+    coverage = (covered / total) if total else 0.0
+    last_dt = _parse_dt_text(row.get("last_enriched_at"))
+    age_days = (datetime.now() - last_dt).days if last_dt else None
+    if total <= 0:
+        label, color = "无样本", "#8292a5"
+    elif covered <= 0:
+        label, color = "未建立", "#8292a5"
+    elif coverage < 0.5:
+        label, color = "覆盖不足", "#ef6461"
+    elif age_days is None:
+        label, color = "时间未知", "#8292a5"
+    elif age_days <= 7 and coverage >= 0.95:
+        label, color = "新鲜", "#35c46a"
+    elif age_days <= 30:
+        label, color = "可用偏旧", "#e2b84d"
+    elif age_days <= 90:
+        label, color = "需要更新", "#e8914b"
+    else:
+        label, color = "已过期", "#ef6461"
+    if last_dt is None:
+        recent = "--"
+    elif age_days == 0:
+        recent = "今天"
+    elif age_days == 1:
+        recent = "昨天"
+    else:
+        recent = f"{age_days}天前"
+    return {
+        "covered": covered,
+        "missing": missing,
+        "coverage_pct": coverage * 100,
+        "label": label,
+        "color": color,
+        "recent": recent,
+    }
+
+
+def _flt_render_hk_segment_tile(
+    col,
+    row: dict,
+    *,
+    key_prefix: str,
+    selected_key: str,
+) -> bool:
+    row_key = str(row.get("key"))
+    total_count = int(row.get("count", 0) or 0)
+    current_selected = [str(item) for item in st.session_state.get(selected_key, [])]
+    selected_now = row_key in set(current_selected)
+    health = _flt_hk_segment_health(row)
+    value = col.checkbox(
+        f"{_safe_str(row.get('label'))}｜{health['label']}｜{health['coverage_pct']:.0f}%",
+        value=selected_now,
+        key=f"{key_prefix}_seg_check_{row_key}",
+    )
+    col.markdown(
+        f"<div style='margin-top:-0.35rem;font-size:0.76rem;color:rgba(234,240,245,0.58);"
+        f"white-space:nowrap;overflow:hidden;text-overflow:ellipsis;'>"
+        f"<span style='color:{health['color']};font-weight:800'>{health['label']}</span>"
+        f" · 可筛 {health['covered']}/{total_count} · 缺 {health['missing']} · {health['recent']}"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+    return bool(value)
 
 
 def _display_df(df: pd.DataFrame) -> pd.DataFrame:
@@ -2027,7 +2123,7 @@ def _flt_render_source_check_result(scope: str) -> None:
             }
         )
     if rows:
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
 
 
 def _flt_run_market_update(scope: str, *, max_stocks: int, enrich_n: int, enrich_segment: str, force_refresh: bool, rotate_enrich: bool, safe_mode: bool) -> None:
@@ -2214,11 +2310,11 @@ def _render_filter_market_ops_tab(scope: str, *, key_prefix: str) -> None:
         f"当前状态: {weekly_state}"
     )
     b1, b2, b3 = st.columns(3)
-    if b1.button(f"运行{label}更新", use_container_width=True, key=f"{key_prefix}_run_once"):
+    if b1.button(f"运行{label}更新", width="stretch", key=f"{key_prefix}_run_once"):
         _flt_run_market_update(scope, max_stocks=int(max_stocks), enrich_n=int(enrich_n), enrich_segment=str(enrich_segment), force_refresh=bool(force_refresh), rotate_enrich=False, safe_mode=bool(safe_mode))
-    if b2.button(f"执行{label}周更（7天一次）", use_container_width=True, key=f"{key_prefix}_weekly"):
+    if b2.button(f"执行{label}周更（7天一次）", width="stretch", key=f"{key_prefix}_weekly"):
         _flt_run_market_weekly(scope, enrich_n=int(enrich_n), enrich_segment=str(enrich_segment))
-    if b3.button(f"检测{label}数据源", use_container_width=True, key=f"{key_prefix}_source_check"):
+    if b3.button(f"检测{label}数据源", width="stretch", key=f"{key_prefix}_source_check"):
         _flt_run_source_check(scope)
     _flt_render_source_check_result(scope)
 
@@ -2235,7 +2331,10 @@ def _render_filter_market_ops_tab(scope: str, *, key_prefix: str) -> None:
 
         st.markdown("<div style='height:1.2rem'></div>", unsafe_allow_html=True)
         st.markdown("### A股板块深补" if scope == "A" else "### 港股板块深补")
-        st.caption("点击下方板块按钮，直接深补该板块全部股票。")
+        if scope == "A":
+            st.caption("点击下方板块按钮，直接深补该板块全部股票。")
+        else:
+            st.caption("勾选一个或多个港股板块，再点击“深补勾选板块”。默认只补缺，已深补股票不会重复抓。")
         segment_rows = _flt_a_segment_status() if scope == "A" else _flt_hk_segment_status()
         store_summary = filter_get_stock_enrichment_store_summary()
         completed_segments = sum(1 for row in segment_rows if _safe_str(row.get("status")) == "已完成")
@@ -2244,20 +2343,55 @@ def _render_filter_market_ops_tab(scope: str, *, key_prefix: str) -> None:
             f"已完成板块 {completed_segments}/{len(segment_rows)} ｜ "
             f"最近深补 {_safe_str(store_summary.get('latest_enriched_at', '')) or '--'}"
         )
-        for start in range(0, len(segment_rows), 4):
-            cols = st.columns(4)
-            for col, row in zip(cols, segment_rows[start : start + 4]):
-                label_text = f"{row['label']}（{int(row['count'])}）"
-                if col.button(label_text, use_container_width=True, key=f"{key_prefix}_seg_{row['key']}"):
-                    if scope == "A":
-                        _flt_run_a_segment_enrich(
-                            segment_key=str(row["key"]),
-                            segment_label=str(row["label"]),
-                            segment_count=int(row["count"]),
-                            force_refresh=bool(force_refresh),
-                            safe_mode=bool(safe_mode),
-                        )
-                    else:
+        if scope == "HK":
+            selected_key = f"{key_prefix}_hk_selected_segments"
+            if selected_key not in st.session_state:
+                st.session_state[selected_key] = []
+            row_map = {str(row["key"]): row for row in segment_rows}
+            pending_keys = [
+                str(row["key"])
+                for row in segment_rows
+                if int(row.get("persisted_count", 0) or 0) < int(row.get("count", 0) or 0)
+            ]
+            selected_segments = [str(item) for item in st.session_state.get(selected_key, []) if str(item) in row_map]
+            st.session_state[selected_key] = selected_segments
+            ctrl1, ctrl2, ctrl3 = st.columns([1.2, 1, 1], vertical_alignment="bottom")
+            ctrl1.caption(f"已选择 {len(selected_segments)} 个板块")
+            if ctrl2.button("全选未完成", width="stretch", key=f"{key_prefix}_hk_select_pending"):
+                st.session_state[selected_key] = pending_keys
+                for row in segment_rows:
+                    st.session_state[f"{key_prefix}_seg_check_{row['key']}"] = str(row["key"]) in set(pending_keys)
+                st.rerun()
+            if ctrl3.button("清空选择", width="stretch", key=f"{key_prefix}_hk_clear_selected"):
+                st.session_state[selected_key] = []
+                for row in segment_rows:
+                    st.session_state[f"{key_prefix}_seg_check_{row['key']}"] = False
+                st.rerun()
+            st.markdown("<div style='height:0.6rem'></div>", unsafe_allow_html=True)
+
+        if scope == "HK":
+            chosen_now: list[str] = []
+            with st.form(f"{key_prefix}_hk_segment_select_form", border=False):
+                for start in range(0, len(segment_rows), 5):
+                    cols = st.columns(5)
+                    for col, row in zip(cols, segment_rows[start : start + 5]):
+                        row_key = str(row.get("key"))
+                        if _flt_render_hk_segment_tile(
+                            col,
+                            row,
+                            key_prefix=key_prefix,
+                            selected_key=f"{key_prefix}_hk_selected_segments",
+                        ):
+                            chosen_now.append(row_key)
+                if st.form_submit_button("深补勾选板块", type="primary", width="stretch"):
+                    st.session_state[selected_key] = chosen_now
+                    if not chosen_now:
+                        st.warning("请先勾选至少一个港股板块。")
+                        return
+                    for segment_key in chosen_now:
+                        row = row_map.get(str(segment_key))
+                        if not row:
+                            continue
                         _flt_run_hk_segment_enrich(
                             segment_key=str(row["key"]),
                             segment_label=str(row["label"]),
@@ -2265,11 +2399,25 @@ def _render_filter_market_ops_tab(scope: str, *, key_prefix: str) -> None:
                             force_refresh=bool(force_refresh),
                             safe_mode=bool(safe_mode),
                         )
-                persisted = int(row.get("persisted_count", 0) or 0)
-                total_count = int(row.get("count", 0) or 0)
-                col.caption(f"{_safe_str(row.get('status'))} ｜ 已深补 {persisted}/{total_count}")
-                last_text = _safe_str(row.get("last_enriched_at", ""))
-                col.caption(f"上次深补：{last_text}" if last_text else "上次深补：未深补")
+                    st.session_state["flt_result"] = None
+        else:
+            for start in range(0, len(segment_rows), 4):
+                cols = st.columns(4)
+                for col, row in zip(cols, segment_rows[start : start + 4]):
+                    label_text = f"{row['label']}（{int(row['count'])}）"
+                    if col.button(label_text, width="stretch", key=f"{key_prefix}_seg_{row['key']}"):
+                        _flt_run_a_segment_enrich(
+                            segment_key=str(row["key"]),
+                            segment_label=str(row["label"]),
+                            segment_count=int(row["count"]),
+                            force_refresh=bool(force_refresh),
+                            safe_mode=bool(safe_mode),
+                        )
+                    persisted = int(row.get("persisted_count", 0) or 0)
+                    total_count = int(row.get("count", 0) or 0)
+                    col.caption(f"{_safe_str(row.get('status'))} ｜ 已深补 {persisted}/{total_count}")
+                    last_text = _safe_str(row.get("last_enriched_at", ""))
+                    col.caption(f"上次深补：{last_text}" if last_text else "上次深补：未深补")
 
 
 def _render_filter_ops_panel() -> None:
@@ -2300,7 +2448,7 @@ def _render_filter_ops_panel() -> None:
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             key="flt_ops_export_health",
         )
-        if action_col2.button("从备份恢复快照", use_container_width=True, disabled=not bool(backup_status.get("exists")), key="flt_ops_restore_backup"):
+        if action_col2.button("从备份恢复快照", width="stretch", disabled=not bool(backup_status.get("exists")), key="flt_ops_restore_backup"):
             try:
                 restored = filter_restore_snapshot_from_backup()
                 st.success(
@@ -2319,8 +2467,8 @@ def _render_filter_ops_panel() -> None:
             st.caption("当前没有可恢复的快照备份。")
 
         with st.expander("查看体检详情", expanded=False):
-            st.dataframe(report.get("trend_df", pd.DataFrame()), use_container_width=True, hide_index=True)
-            st.dataframe(report.get("runs_df", pd.DataFrame()), use_container_width=True, hide_index=True)
+            st.dataframe(report.get("trend_df", pd.DataFrame()), width="stretch", hide_index=True)
+            st.dataframe(report.get("runs_df", pd.DataFrame()), width="stretch", hide_index=True)
 
 
 def _render_filter_page():
@@ -2349,7 +2497,7 @@ def _render_filter_page():
         unsafe_allow_html=True,
     )
     toggle_label = "打开数据运维台" if not bool(st.session_state.get("flt_show_ops_panel", False)) else "收起数据运维台"
-    if st.button(toggle_label, use_container_width=False, key="flt_ops_toggle_in_filter_header"):
+    if st.button(toggle_label, width="content", key="flt_ops_toggle_in_filter_header"):
         st.session_state["flt_show_ops_panel"] = not bool(st.session_state.get("flt_show_ops_panel", False))
         st.rerun()
     render_status_row(
@@ -2417,176 +2565,177 @@ def _render_filter_page():
         all_tpl = filter_load_templates()
         tpl_names = sorted(all_tpl.keys())
         selected_tpl = tpl_cols[0].selectbox("模板", options=["(无)"] + tpl_names, key="flt_tpl_select_main")
-        if tpl_cols[1].button("读取模板", use_container_width=True, key="flt_tpl_load_main"):
+        if tpl_cols[1].button("读取模板", width="stretch", key="flt_tpl_load_main"):
             if selected_tpl and selected_tpl != "(无)":
                 st.session_state["flt_cfg"] = filter_get_template_config(selected_tpl)
                 st.success(f"已加载模板: {selected_tpl}")
                 st.rerun()
         save_tpl_name = tpl_cols[2].text_input("保存为模板名", value="", key="flt_tpl_save_main")
-        if tpl_cols[3].button("保存模板", use_container_width=True, key="flt_tpl_save_btn_main"):
+        if tpl_cols[3].button("保存模板", width="stretch", key="flt_tpl_save_btn_main"):
             try:
                 filter_save_template(save_tpl_name, cfg)
                 st.success("模板已保存")
             except Exception as exc:
                 st.error(str(exc))
-    st.subheader("筛选条件（支持手动开关，像电商筛选一样）")
+    with st.form("flt_condition_form", clear_on_submit=False):
+        st.subheader("筛选条件（支持手动开关，像电商筛选一样）")
 
-    with st.expander("A. 财务健康度与硬排除", expanded=True):
-        c1, c2, c3 = st.columns(3)
-        cfg["missing_policy"] = c1.selectbox("缺失数据处理", options=["ignore", "exclude"], index=0 if cfg.get("missing_policy") == "ignore" else 1)
+        with st.expander("A. 财务健康度与硬排除", expanded=True):
+            c1, c2, c3 = st.columns(3)
+            cfg["missing_policy"] = c1.selectbox("缺失数据处理", options=["ignore", "exclude"], index=0 if cfg.get("missing_policy") == "ignore" else 1)
 
-        r = cfg["risk"]
-        q = cfg["quality"]
+            r = cfg["risk"]
+            q = cfg["quality"]
 
-        r["exclude_st"] = c1.checkbox("排除 ST/*ST", value=bool(r.get("exclude_st", True)))
-        r["exclude_investigation"] = c1.checkbox("排除立案调查", value=bool(r.get("exclude_investigation", True)))
-        r["exclude_penalty"] = c1.checkbox("排除重大处罚", value=bool(r.get("exclude_penalty", True)))
+            r["exclude_st"] = c1.checkbox("排除 ST/*ST", value=bool(r.get("exclude_st", True)))
+            r["exclude_investigation"] = c1.checkbox("排除立案调查", value=bool(r.get("exclude_investigation", True)))
+            r["exclude_penalty"] = c1.checkbox("排除重大处罚", value=bool(r.get("exclude_penalty", True)))
 
-        r["exclude_fund_occupation"] = c2.checkbox("排除资金占用", value=bool(r.get("exclude_fund_occupation", True)))
-        r["exclude_illegal_reduce"] = c2.checkbox("排除违规减持", value=bool(r.get("exclude_illegal_reduce", True)))
-        r["require_standard_audit"] = c2.checkbox("审计意见必须标准无保留", value=bool(r.get("require_standard_audit", False)))
+            r["exclude_fund_occupation"] = c2.checkbox("排除资金占用", value=bool(r.get("exclude_fund_occupation", True)))
+            r["exclude_illegal_reduce"] = c2.checkbox("排除违规减持", value=bool(r.get("exclude_illegal_reduce", True)))
+            r["require_standard_audit"] = c2.checkbox("审计意见必须标准无保留", value=bool(r.get("require_standard_audit", False)))
 
-        q["ocf_3y_min_enabled"] = c3.checkbox("启用近3年经营现金流下限(亿)", value=bool(q.get("ocf_3y_min_enabled", False)))
-        q["ocf_3y_min"] = c3.number_input("经营现金流下限(亿)", value=float(q.get("ocf_3y_min", 0.0)), step=1.0)
-        q["asset_liability_max_enabled"] = c3.checkbox("启用资产负债率上限(%)", value=bool(q.get("asset_liability_max_enabled", False)))
-        q["asset_liability_max"] = c3.number_input("资产负债率上限(%)", value=float(q.get("asset_liability_max", 80.0)), step=1.0)
+            q["ocf_3y_min_enabled"] = c3.checkbox("启用近3年经营现金流下限(亿)", value=bool(q.get("ocf_3y_min_enabled", False)))
+            q["ocf_3y_min"] = c3.number_input("经营现金流下限(亿)", value=float(q.get("ocf_3y_min", 0.0)), step=1.0)
+            q["asset_liability_max_enabled"] = c3.checkbox("启用资产负债率上限(%)", value=bool(q.get("asset_liability_max_enabled", False)))
+            q["asset_liability_max"] = c3.number_input("资产负债率上限(%)", value=float(q.get("asset_liability_max", 80.0)), step=1.0)
 
-    with st.expander("B. 估值与质量", expanded=True):
-        c1, c2, c3 = st.columns(3)
-        q = cfg["quality"]
-        v = cfg["valuation"]
+        with st.expander("B. 估值与质量", expanded=True):
+            c1, c2, c3 = st.columns(3)
+            q = cfg["quality"]
+            v = cfg["valuation"]
 
-        q["roe_min_enabled"] = c1.checkbox("启用 ROE 下限(%)", value=bool(q.get("roe_min_enabled", False)))
-        q["roe_min"] = c1.number_input("ROE 下限(%)", value=float(q.get("roe_min", 5.0)), step=0.5)
-        q["gross_margin_min_enabled"] = c1.checkbox("启用毛利率下限(%)", value=bool(q.get("gross_margin_min_enabled", False)))
-        q["gross_margin_min"] = c1.number_input("毛利率下限(%)", value=float(q.get("gross_margin_min", 20.0)), step=0.5)
-        q["net_margin_min_enabled"] = c1.checkbox("启用净利率下限(%)", value=bool(q.get("net_margin_min_enabled", False)))
-        q["net_margin_min"] = c1.number_input("净利率下限(%)", value=float(q.get("net_margin_min", 8.0)), step=0.5)
+            q["roe_min_enabled"] = c1.checkbox("启用 ROE 下限(%)", value=bool(q.get("roe_min_enabled", False)))
+            q["roe_min"] = c1.number_input("ROE 下限(%)", value=float(q.get("roe_min", 5.0)), step=0.5)
+            q["gross_margin_min_enabled"] = c1.checkbox("启用毛利率下限(%)", value=bool(q.get("gross_margin_min_enabled", False)))
+            q["gross_margin_min"] = c1.number_input("毛利率下限(%)", value=float(q.get("gross_margin_min", 20.0)), step=0.5)
+            q["net_margin_min_enabled"] = c1.checkbox("启用净利率下限(%)", value=bool(q.get("net_margin_min_enabled", False)))
+            q["net_margin_min"] = c1.number_input("净利率下限(%)", value=float(q.get("net_margin_min", 8.0)), step=0.5)
 
-        q["receivable_ratio_max_enabled"] = c2.checkbox("启用应收代理指标上限", value=bool(q.get("receivable_ratio_max_enabled", False)))
-        q["receivable_ratio_max"] = c2.number_input("应收代理指标上限", value=float(q.get("receivable_ratio_max", 50.0)), step=1.0)
-        q["goodwill_ratio_max_enabled"] = c2.checkbox("启用商誉/净资产上限(%)", value=bool(q.get("goodwill_ratio_max_enabled", False)))
-        q["goodwill_ratio_max"] = c2.number_input("商誉/净资产上限(%)", value=float(q.get("goodwill_ratio_max", 30.0)), step=1.0)
-        q["interest_debt_asset_max_enabled"] = c2.checkbox("启用有息负债/总资产上限(%)", value=bool(q.get("interest_debt_asset_max_enabled", False)))
-        q["interest_debt_asset_max"] = c2.number_input("有息负债/总资产上限(%)", value=float(q.get("interest_debt_asset_max", 20.0)), step=1.0)
+            q["receivable_ratio_max_enabled"] = c2.checkbox("启用应收代理指标上限", value=bool(q.get("receivable_ratio_max_enabled", False)))
+            q["receivable_ratio_max"] = c2.number_input("应收代理指标上限", value=float(q.get("receivable_ratio_max", 50.0)), step=1.0)
+            q["goodwill_ratio_max_enabled"] = c2.checkbox("启用商誉/净资产上限(%)", value=bool(q.get("goodwill_ratio_max_enabled", False)))
+            q["goodwill_ratio_max"] = c2.number_input("商誉/净资产上限(%)", value=float(q.get("goodwill_ratio_max", 30.0)), step=1.0)
+            q["interest_debt_asset_max_enabled"] = c2.checkbox("启用有息负债/总资产上限(%)", value=bool(q.get("interest_debt_asset_max_enabled", False)))
+            q["interest_debt_asset_max"] = c2.number_input("有息负债/总资产上限(%)", value=float(q.get("interest_debt_asset_max", 20.0)), step=1.0)
 
-        v["pe_ttm_min_enabled"] = c3.checkbox("启用 PE(TTM) 下限", value=bool(v.get("pe_ttm_min_enabled", False)))
-        v["pe_ttm_min"] = c3.number_input("PE(TTM) 下限", value=float(v.get("pe_ttm_min", 0.0)), step=1.0)
-        v["pe_ttm_max_enabled"] = c3.checkbox("启用 PE(TTM) 上限", value=bool(v.get("pe_ttm_max_enabled", False)))
-        v["pe_ttm_max"] = c3.number_input("PE(TTM) 上限", value=float(v.get("pe_ttm_max", 25.0)), step=1.0)
-        v["pb_max_enabled"] = c3.checkbox("启用 PB 上限", value=bool(v.get("pb_max_enabled", False)))
-        v["pb_max"] = c3.number_input("PB 上限", value=float(v.get("pb_max", 3.0)), step=0.1)
+            v["pe_ttm_min_enabled"] = c3.checkbox("启用 PE(TTM) 下限", value=bool(v.get("pe_ttm_min_enabled", False)))
+            v["pe_ttm_min"] = c3.number_input("PE(TTM) 下限", value=float(v.get("pe_ttm_min", 0.0)), step=1.0)
+            v["pe_ttm_max_enabled"] = c3.checkbox("启用 PE(TTM) 上限", value=bool(v.get("pe_ttm_max_enabled", False)))
+            v["pe_ttm_max"] = c3.number_input("PE(TTM) 上限", value=float(v.get("pe_ttm_max", 25.0)), step=1.0)
+            v["pb_max_enabled"] = c3.checkbox("启用 PB 上限", value=bool(v.get("pb_max_enabled", False)))
+            v["pb_max"] = c3.number_input("PB 上限", value=float(v.get("pb_max", 3.0)), step=0.1)
 
-    with st.expander("C. 行业、分红、流动性与规模", expanded=True):
-        c1, c2, c3 = st.columns(3)
-        r = cfg["risk"]
-        v = cfg["valuation"]
-        g = cfg["growth_liquidity"]
+        with st.expander("C. 行业、分红、流动性与规模", expanded=True):
+            c1, c2, c3 = st.columns(3)
+            r = cfg["risk"]
+            v = cfg["valuation"]
+            g = cfg["growth_liquidity"]
 
-        scope_map = {"all": "全部市场", "A": "仅A股", "HK": "仅港股"}
-        raw_scope = _safe_str(r.get("market_scope", "all")).upper()
-        scope_value = "all" if raw_scope not in {"A", "HK"} else raw_scope
-        r["market_scope"] = c1.selectbox(
-            "筛选市场范围",
-            options=["all", "A", "HK"],
-            index=["all", "A", "HK"].index(scope_value),
-            format_func=lambda x: scope_map.get(x, x),
-        )
-        r["industry_include_enabled"] = c1.checkbox("启用行业关键词包含", value=bool(r.get("industry_include_enabled", False)))
-        r["industry_include_keywords"] = c1.text_input(
-            "行业关键词（包含，逗号分隔）",
-            value=str(r.get("industry_include_keywords", "")),
-        )
-        if str(r.get("industry_include_keywords", "")).strip():
-            r["industry_include_enabled"] = True
-        r["exclude_sunset_industry"] = c1.checkbox("排除夕阳行业", value=bool(r.get("exclude_sunset_industry", False)))
-        r["sunset_industries"] = c1.text_area("夕阳行业关键词（逗号分隔）", value=str(r.get("sunset_industries", "")), height=120)
-        r["pledge_ratio_max_enabled"] = c1.checkbox("启用质押率上限(%)", value=bool(r.get("pledge_ratio_max_enabled", False)))
-        r["pledge_ratio_max"] = c1.number_input("质押率上限(%)", value=float(r.get("pledge_ratio_max", 80.0)), step=1.0)
-
-        v["dividend_min_enabled"] = c2.checkbox("启用股息率下限(%)", value=bool(v.get("dividend_min_enabled", False)))
-        v["dividend_min"] = c2.number_input("股息率下限(%)", value=float(v.get("dividend_min", 3.0)), step=0.1)
-        v["dividend_max_enabled"] = c2.checkbox("启用股息率上限(%)", value=bool(v.get("dividend_max_enabled", False)))
-        v["dividend_max"] = c2.number_input("股息率上限(%)", value=float(v.get("dividend_max", 12.0)), step=0.1)
-        r["exclude_no_dividend_5y"] = c2.checkbox("排除近5年未分红", value=bool(r.get("exclude_no_dividend_5y", False)))
-
-        g["market_cap_min_enabled"] = c3.checkbox("启用总市值下限(亿)", value=bool(g.get("market_cap_min_enabled", False)))
-        g["market_cap_min"] = c3.number_input("总市值下限(亿)", value=float(g.get("market_cap_min", 100.0)), step=10.0)
-        g["market_cap_max_enabled"] = c3.checkbox("启用总市值上限(亿)", value=bool(g.get("market_cap_max_enabled", False)))
-        g["market_cap_max"] = c3.number_input("总市值上限(亿)", value=float(g.get("market_cap_max", 5000.0)), step=10.0)
-
-        g["turnover_min_enabled"] = c3.checkbox("启用换手率下限(%)", value=bool(g.get("turnover_min_enabled", False)))
-        g["turnover_min"] = c3.number_input("换手率下限(%)", value=float(g.get("turnover_min", 0.2)), step=0.1)
-        g["turnover_max_enabled"] = c3.checkbox("启用换手率上限(%)", value=bool(g.get("turnover_max_enabled", False)))
-        g["turnover_max"] = c3.number_input("换手率上限(%)", value=float(g.get("turnover_max", 15.0)), step=0.1)
-
-        g["volume_ratio_min_enabled"] = c3.checkbox("启用量比下限", value=bool(g.get("volume_ratio_min_enabled", False)))
-        g["volume_ratio_min"] = c3.number_input("量比下限", value=float(g.get("volume_ratio_min", 0.5)), step=0.1)
-        g["volume_ratio_max_enabled"] = c3.checkbox("启用量比上限", value=bool(g.get("volume_ratio_max_enabled", False)))
-        g["volume_ratio_max"] = c3.number_input("量比上限", value=float(g.get("volume_ratio_max", 3.0)), step=0.1)
-
-    with st.expander("D. 五年后视镜（先看长期，再做当前筛选）", expanded=False):
-        st.caption("建议先开这一层做长期体检，再叠加 A/B/C 做当下过滤。")
-        d1, d2, d3 = st.columns(3)
-        d5 = cfg.setdefault("rearview_5y", {})
-
-        d5["revenue_cagr_5y_min_enabled"] = d1.checkbox(
-            "启用营收5年CAGR下限(%)", value=bool(d5.get("revenue_cagr_5y_min_enabled", False))
-        )
-        d5["revenue_cagr_5y_min"] = d1.number_input(
-            "营收5年CAGR下限(%)", value=float(d5.get("revenue_cagr_5y_min", 3.0)), step=0.5
-        )
-        d5["profit_cagr_5y_min_enabled"] = d1.checkbox(
-            "启用净利5年CAGR下限(%)", value=bool(d5.get("profit_cagr_5y_min_enabled", False))
-        )
-        d5["profit_cagr_5y_min"] = d1.number_input(
-            "净利5年CAGR下限(%)", value=float(d5.get("profit_cagr_5y_min", 3.0)), step=0.5
-        )
-
-        d5["roe_avg_5y_min_enabled"] = d2.checkbox(
-            "启用ROE 5年均值下限(%)", value=bool(d5.get("roe_avg_5y_min_enabled", False))
-        )
-        d5["roe_avg_5y_min"] = d2.number_input(
-            "ROE 5年均值下限(%)", value=float(d5.get("roe_avg_5y_min", 8.0)), step=0.5
-        )
-        d5["ocf_positive_years_5y_min_enabled"] = d2.checkbox(
-            "启用经营现金流为正年数下限", value=bool(d5.get("ocf_positive_years_5y_min_enabled", False))
-        )
-        d5["ocf_positive_years_5y_min"] = int(
-            d2.number_input(
-                "经营现金流为正年数下限(0-5)",
-                min_value=0,
-                max_value=5,
-                value=int(d5.get("ocf_positive_years_5y_min", 4)),
-                step=1,
+            scope_map = {"all": "全部市场", "A": "仅A股", "HK": "仅港股"}
+            raw_scope = _safe_str(r.get("market_scope", "all")).upper()
+            scope_value = "all" if raw_scope not in {"A", "HK"} else raw_scope
+            r["market_scope"] = c1.selectbox(
+                "筛选市场范围",
+                options=["all", "A", "HK"],
+                index=["all", "A", "HK"].index(scope_value),
+                format_func=lambda x: scope_map.get(x, x),
             )
-        )
+            r["industry_include_enabled"] = c1.checkbox("启用行业关键词包含", value=bool(r.get("industry_include_enabled", False)))
+            r["industry_include_keywords"] = c1.text_input(
+                "行业关键词（包含，逗号分隔）",
+                value=str(r.get("industry_include_keywords", "")),
+            )
+            if str(r.get("industry_include_keywords", "")).strip():
+                r["industry_include_enabled"] = True
+            r["exclude_sunset_industry"] = c1.checkbox("排除夕阳行业", value=bool(r.get("exclude_sunset_industry", False)))
+            r["sunset_industries"] = c1.text_area("夕阳行业关键词（逗号分隔）", value=str(r.get("sunset_industries", "")), height=120)
+            r["pledge_ratio_max_enabled"] = c1.checkbox("启用质押率上限(%)", value=bool(r.get("pledge_ratio_max_enabled", False)))
+            r["pledge_ratio_max"] = c1.number_input("质押率上限(%)", value=float(r.get("pledge_ratio_max", 80.0)), step=1.0)
 
-        d5["debt_ratio_change_5y_max_enabled"] = d3.checkbox(
-            "启用负债率5年变化上限(百分点)", value=bool(d5.get("debt_ratio_change_5y_max_enabled", False))
-        )
-        d5["debt_ratio_change_5y_max"] = d3.number_input(
-            "负债率5年变化上限(百分点)", value=float(d5.get("debt_ratio_change_5y_max", 8.0)), step=0.5
-        )
-        d5["gross_margin_change_5y_min_enabled"] = d3.checkbox(
-            "启用毛利率5年变化下限(百分点)", value=bool(d5.get("gross_margin_change_5y_min_enabled", False))
-        )
-        d5["gross_margin_change_5y_min"] = d3.number_input(
-            "毛利率5年变化下限(百分点)", value=float(d5.get("gross_margin_change_5y_min", -6.0)), step=0.5
-        )
+            v["dividend_min_enabled"] = c2.checkbox("启用股息率下限(%)", value=bool(v.get("dividend_min_enabled", False)))
+            v["dividend_min"] = c2.number_input("股息率下限(%)", value=float(v.get("dividend_min", 3.0)), step=0.1)
+            v["dividend_max_enabled"] = c2.checkbox("启用股息率上限(%)", value=bool(v.get("dividend_max_enabled", False)))
+            v["dividend_max"] = c2.number_input("股息率上限(%)", value=float(v.get("dividend_max", 12.0)), step=0.1)
+            r["exclude_no_dividend_5y"] = c2.checkbox("排除近5年未分红", value=bool(r.get("exclude_no_dividend_5y", False)))
 
-    st.session_state["flt_cfg"] = cfg
+            g["market_cap_min_enabled"] = c3.checkbox("启用总市值下限(亿)", value=bool(g.get("market_cap_min_enabled", False)))
+            g["market_cap_min"] = c3.number_input("总市值下限(亿)", value=float(g.get("market_cap_min", 100.0)), step=10.0)
+            g["market_cap_max_enabled"] = c3.checkbox("启用总市值上限(亿)", value=bool(g.get("market_cap_max_enabled", False)))
+            g["market_cap_max"] = c3.number_input("总市值上限(亿)", value=float(g.get("market_cap_max", 5000.0)), step=10.0)
 
-    render_section_intro(
-        "执行与结果",
-        "执行区负责跑规则，结果区负责解释结果和导出表格，让批量筛选的收尾动作更集中。",
-        kicker="Execution",
-        pills=("执行筛选", "二段筛选", "结果导出"),
-    )
-    run_col1, run_col2, run_col3 = st.columns([1, 1.4, 2])
-    run_now = run_col1.button("执行筛选", type="primary", use_container_width=True, key="flt_run_filter_btn")
-    two_stage = run_col2.checkbox("二段筛选（先 A/B/C，再 D 五年后视镜）", value=True, key="flt_two_stage_main")
-    run_col3.caption("注：部分标的5年数据可能缺失；可通过“缺失数据处理”决定是否直接排除。")
+            g["turnover_min_enabled"] = c3.checkbox("启用换手率下限(%)", value=bool(g.get("turnover_min_enabled", False)))
+            g["turnover_min"] = c3.number_input("换手率下限(%)", value=float(g.get("turnover_min", 0.2)), step=0.1)
+            g["turnover_max_enabled"] = c3.checkbox("启用换手率上限(%)", value=bool(g.get("turnover_max_enabled", False)))
+            g["turnover_max"] = c3.number_input("换手率上限(%)", value=float(g.get("turnover_max", 15.0)), step=0.1)
+
+            g["volume_ratio_min_enabled"] = c3.checkbox("启用量比下限", value=bool(g.get("volume_ratio_min_enabled", False)))
+            g["volume_ratio_min"] = c3.number_input("量比下限", value=float(g.get("volume_ratio_min", 0.5)), step=0.1)
+            g["volume_ratio_max_enabled"] = c3.checkbox("启用量比上限", value=bool(g.get("volume_ratio_max_enabled", False)))
+            g["volume_ratio_max"] = c3.number_input("量比上限", value=float(g.get("volume_ratio_max", 3.0)), step=0.1)
+
+        with st.expander("D. 五年后视镜（先看长期，再做当前筛选）", expanded=False):
+            st.caption("建议先开这一层做长期体检，再叠加 A/B/C 做当下过滤。")
+            d1, d2, d3 = st.columns(3)
+            d5 = cfg.setdefault("rearview_5y", {})
+
+            d5["revenue_cagr_5y_min_enabled"] = d1.checkbox(
+                "启用营收5年CAGR下限(%)", value=bool(d5.get("revenue_cagr_5y_min_enabled", False))
+            )
+            d5["revenue_cagr_5y_min"] = d1.number_input(
+                "营收5年CAGR下限(%)", value=float(d5.get("revenue_cagr_5y_min", 3.0)), step=0.5
+            )
+            d5["profit_cagr_5y_min_enabled"] = d1.checkbox(
+                "启用净利5年CAGR下限(%)", value=bool(d5.get("profit_cagr_5y_min_enabled", False))
+            )
+            d5["profit_cagr_5y_min"] = d1.number_input(
+                "净利5年CAGR下限(%)", value=float(d5.get("profit_cagr_5y_min", 3.0)), step=0.5
+            )
+
+            d5["roe_avg_5y_min_enabled"] = d2.checkbox(
+                "启用ROE 5年均值下限(%)", value=bool(d5.get("roe_avg_5y_min_enabled", False))
+            )
+            d5["roe_avg_5y_min"] = d2.number_input(
+                "ROE 5年均值下限(%)", value=float(d5.get("roe_avg_5y_min", 8.0)), step=0.5
+            )
+            d5["ocf_positive_years_5y_min_enabled"] = d2.checkbox(
+                "启用经营现金流为正年数下限", value=bool(d5.get("ocf_positive_years_5y_min_enabled", False))
+            )
+            d5["ocf_positive_years_5y_min"] = int(
+                d2.number_input(
+                    "经营现金流为正年数下限(0-5)",
+                    min_value=0,
+                    max_value=5,
+                    value=int(d5.get("ocf_positive_years_5y_min", 4)),
+                    step=1,
+                )
+            )
+
+            d5["debt_ratio_change_5y_max_enabled"] = d3.checkbox(
+                "启用负债率5年变化上限(百分点)", value=bool(d5.get("debt_ratio_change_5y_max_enabled", False))
+            )
+            d5["debt_ratio_change_5y_max"] = d3.number_input(
+                "负债率5年变化上限(百分点)", value=float(d5.get("debt_ratio_change_5y_max", 8.0)), step=0.5
+            )
+            d5["gross_margin_change_5y_min_enabled"] = d3.checkbox(
+                "启用毛利率5年变化下限(百分点)", value=bool(d5.get("gross_margin_change_5y_min_enabled", False))
+            )
+            d5["gross_margin_change_5y_min"] = d3.number_input(
+                "毛利率5年变化下限(百分点)", value=float(d5.get("gross_margin_change_5y_min", -6.0)), step=0.5
+            )
+
+        st.session_state["flt_cfg"] = cfg
+
+        render_section_intro(
+            "执行与结果",
+            "执行区负责跑规则，结果区负责解释结果和导出表格，让批量筛选的收尾动作更集中。",
+            kicker="Execution",
+            pills=("执行筛选", "二段筛选", "结果导出"),
+        )
+        run_col1, run_col2, run_col3 = st.columns([1, 1.4, 2])
+        run_now = run_col1.form_submit_button("执行筛选", type="primary", width="stretch")
+        two_stage = run_col2.checkbox("二段筛选（先 A/B/C，再 D 五年后视镜）", value=True, key="flt_two_stage_main")
+        run_col3.caption("注：部分标的5年数据可能缺失；可通过“缺失数据处理”决定是否直接排除。")
 
     if run_now:
         snap = filter_load_snapshot()
@@ -2667,7 +2816,7 @@ def _render_filter_page():
         data=xlsx_bytes,
         file_name=f"filter_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=True,
+        width="stretch",
     )
 
     tab1, tab2, tab3 = st.tabs(["通过池", "排除池", "缺失项"])
@@ -2702,15 +2851,15 @@ def _render_filter_page():
         t3.caption(f"展示数量: {len(passed_view)} / {len(passed_df)}")
         show1 = _display_df(passed_view)
         cols1 = [c for c in FILTER_DISPLAY_COLUMNS if c in show1.columns]
-        st.dataframe(show1[cols1] if cols1 else show1, use_container_width=True, hide_index=True)
+        st.dataframe(show1[cols1] if cols1 else show1, width="stretch", hide_index=True)
     with tab2:
         cols2 = [c for c in FILTER_DISPLAY_COLUMNS if c in rejected_df.columns]
         show2 = _display_df(rejected_df[cols2] if cols2 else rejected_df)
-        st.dataframe(show2, use_container_width=True, hide_index=True)
+        st.dataframe(show2, width="stretch", hide_index=True)
     with tab3:
         cols3 = [c for c in FILTER_DISPLAY_COLUMNS if c in missing_df.columns]
         show3 = _display_df(missing_df[cols3] if cols3 else missing_df)
-        st.dataframe(show3, use_container_width=True, hide_index=True)
+        st.dataframe(show3, width="stretch", hide_index=True)
 
 
 def _render_backtest_page():
@@ -2990,7 +3139,7 @@ def _render_backtest_page():
             name = p.name
             with cols[idx]:
                 b1, b2 = st.columns([8.8, 1.2], vertical_alignment="top")
-                if b1.button(name, use_container_width=True, key=f"bt_load_strategy_{name}"):
+                if b1.button(name, width="stretch", key=f"bt_load_strategy_{name}"):
                     try:
                         st.session_state["bt_selected_strategy"] = name
                         st.session_state["bt_strategy_text"] = p.read_text(encoding="utf-8")
@@ -2998,7 +3147,7 @@ def _render_backtest_page():
                         st.rerun()
                     except Exception as exc:
                         st.error(f"读取策略失败: {exc}")
-                if b2.button("✕", use_container_width=True, key=f"bt_close_strategy_{name}"):
+                if b2.button("✕", width="stretch", key=f"bt_close_strategy_{name}"):
                     try:
                         archive_info = _archive_paper_runs_for_strategy(p)
                         _move_strategy_to_trash(p)
@@ -3020,7 +3169,7 @@ def _render_backtest_page():
     if trash_files:
         t1, t2, t3 = st.columns([2.4, 1.0, 1.0], vertical_alignment="bottom")
         trash_name = t1.selectbox("回收站文件", options=[p.name for p in trash_files], key="bt_trash_selected")
-        if t2.button("恢复", use_container_width=True, key="bt_trash_restore"):
+        if t2.button("恢复", width="stretch", key="bt_trash_restore"):
             src = BACKTEST_STRATEGY_TRASH_DIR / trash_name
             raw_name = trash_name.split("__", 1)[0] + ".yaml"
             dst = BACKTEST_STRATEGY_DIR / raw_name
@@ -3037,7 +3186,7 @@ def _render_backtest_page():
                 st.rerun()
             except Exception as exc:
                 st.error(f"恢复失败: {exc}")
-        if t3.button("清空回收站", use_container_width=True, key="bt_trash_clear"):
+        if t3.button("清空回收站", width="stretch", key="bt_trash_clear"):
             err = None
             for fp in trash_files:
                 try:
@@ -3079,7 +3228,7 @@ def _render_backtest_page():
             placeholder="例如：做多高股息央企和现金流稳健龙头，做空持续亏损的AI概念股，偏防守，月度调仓，总资金100万港币。",
         )
         ai_btn_cols = st.columns([1.0, 1.0, 1.2], vertical_alignment="bottom")
-        if ai_btn_cols[0].button("生成AI策略草案", type="primary", use_container_width=True, key="bt_ai_generate"):
+        if ai_btn_cols[0].button("生成AI策略草案", type="primary", width="stretch", key="bt_ai_generate"):
             try:
                 draft = _bt_generate_ai_strategy_draft(
                     user_prompt=str(st.session_state.get("bt_ai_prompt", "") or ""),
@@ -3096,7 +3245,7 @@ def _render_backtest_page():
                     st.error(str(draft.get("error", "草案校验失败")))
             except Exception as exc:
                 st.error(f"AI 生成失败: {exc}")
-        if ai_btn_cols[1].button("采用草案到下方编辑区", use_container_width=True, key="bt_ai_apply_draft"):
+        if ai_btn_cols[1].button("采用草案到下方编辑区", width="stretch", key="bt_ai_apply_draft"):
             draft_yaml = str(st.session_state.get("bt_ai_draft_yaml", "") or "")
             if not draft_yaml.strip():
                 st.error("当前没有 AI 草案。")
@@ -3105,7 +3254,7 @@ def _render_backtest_page():
                 st.session_state["bt_strategy_source"] = "__manual__"
                 st.success("已将 AI 草案写入下方策略编辑区。")
                 st.rerun()
-        if ai_btn_cols[2].button("保存并直接回测AI草案", use_container_width=True, key="bt_ai_save_run"):
+        if ai_btn_cols[2].button("保存并直接回测AI草案", width="stretch", key="bt_ai_save_run"):
             draft_yaml = str(st.session_state.get("bt_ai_draft_yaml", "") or "")
             ok, err = _bt_validate_strategy_yaml_text(draft_yaml)
             if not draft_yaml.strip():
@@ -3153,15 +3302,19 @@ def _render_backtest_page():
             st.text_area("AI 策略草案 YAML", value=draft_yaml, height=360, key="bt_ai_draft_preview")
 
     st.markdown("### 策略输入（直接粘贴即可）")
-    st.caption("把你的完整 YAML 直接贴进来，点击“粘贴策略并运行”即可，无需手动改文件。")
-    st.text_area(
-        "策略YAML",
-        height=420,
-        key="bt_strategy_text",
-    )
-    s1, s2 = st.columns([1.2, 2.2], vertical_alignment="bottom")
-    save_name = s1.text_input("保存文件名（可选）", value="", key="bt_save_name")
-    if s2.button("保存到策略库", use_container_width=True, key="bt_save_strategy_text"):
+    st.caption("把完整 YAML 放进表单，只有点击保存或运行时才提交文本，避免边打字边触发页面重算。")
+    with st.form("bt_strategy_text_form", clear_on_submit=False):
+        st.text_area(
+            "策略YAML",
+            height=420,
+            key="bt_strategy_text",
+        )
+        s1, s2, s3 = st.columns([1.2, 1.1, 1.1], vertical_alignment="bottom")
+        save_name = s1.text_input("保存文件名（可选）", value="", key="bt_save_name")
+        save_submitted = s2.form_submit_button("保存到策略库", width="stretch")
+        run_pasted_submitted = s3.form_submit_button("粘贴策略并运行", type="primary", width="stretch")
+
+    if save_submitted:
         text = (st.session_state.get("bt_strategy_text") or "").strip()
         if not text:
             st.error("策略文本为空，无法保存。")
@@ -3183,48 +3336,7 @@ def _render_backtest_page():
             except Exception as exc:
                 st.error(f"保存失败: {exc}")
 
-    c1, c2, c3, c4 = st.columns(4)
-    if c1.button("安装回测依赖", use_container_width=True, key="bt_install_deps"):
-        _run_cmd([sys.executable, "-m", "pip", "install", "-r", "requirements.txt"], "安装依赖")
-    if c2.button("校验Universe", use_container_width=True, key="bt_validate_universe"):
-        # 自动补齐当前策略中的缺失代码，减少手工维护 universe。
-        strategy_text_for_fill = (st.session_state.get("bt_strategy_text") or "").strip()
-        if not strategy_text_for_fill and selected_cfg:
-            try:
-                strategy_text_for_fill = (BACKTEST_STRATEGY_DIR / selected_cfg).read_text(encoding="utf-8")
-            except Exception:
-                strategy_text_for_fill = ""
-
-        if strategy_text_for_fill:
-            codes = _extract_strategy_codes(strategy_text_for_fill)
-            if codes:
-                added_codes, err = _autofill_universe_by_codes(codes)
-                if err:
-                    st.warning(err)
-                elif added_codes:
-                    preview = ", ".join(added_codes[:8])
-                    suffix = " ..." if len(added_codes) > 8 else ""
-                    st.success(f"已自动补齐 {len(added_codes)} 个代码到 universe（auto_import/from_strategy）：{preview}{suffix}")
-        _run_cmd([sys.executable, "run_backtest.py", "--validate-universe"], "校验Universe")
-    if c3.button("更新缓存数据", use_container_width=True, key="bt_update_data"):
-        _run_cmd([sys.executable, "run_backtest.py", "--update-data-only", "--start", "2021-01-01", "--end", "today"], "更新缓存")
-    if c4.button("运行选中文件", use_container_width=True, key="bt_run", disabled=not bool(selected_cfg)):
-        if not selected_cfg:
-            st.error("当前没有策略文件，请先在下方保存一个策略到策略库。")
-        else:
-            _run_cmd(
-                [
-                    sys.executable,
-                    "run_backtest.py",
-                    "--config",
-                    f"config/strategies/{selected_cfg}",
-                    "--output",
-                    "reports",
-                    "--no-browser",
-                ],
-                "运行回测",
-            )
-    if st.button("粘贴策略并运行", type="primary", use_container_width=True, key="bt_run_pasted"):
+    if run_pasted_submitted:
         strategy_text = (st.session_state.get("bt_strategy_text") or "").strip()
         if not strategy_text:
             st.error("请先粘贴策略 YAML。")
@@ -3247,6 +3359,48 @@ def _render_backtest_page():
             except Exception as exc:
                 st.error(f"写入粘贴策略失败: {exc}")
 
+    c1, c2, c3, c4 = st.columns(4)
+    if c1.button("安装回测依赖", width="stretch", key="bt_install_deps"):
+        _run_cmd([sys.executable, "-m", "pip", "install", "-r", "requirements.txt"], "安装依赖")
+    if c2.button("校验Universe", width="stretch", key="bt_validate_universe"):
+        # 自动补齐当前策略中的缺失代码，减少手工维护 universe。
+        strategy_text_for_fill = (st.session_state.get("bt_strategy_text") or "").strip()
+        if not strategy_text_for_fill and selected_cfg:
+            try:
+                strategy_text_for_fill = (BACKTEST_STRATEGY_DIR / selected_cfg).read_text(encoding="utf-8")
+            except Exception:
+                strategy_text_for_fill = ""
+
+        if strategy_text_for_fill:
+            codes = _extract_strategy_codes(strategy_text_for_fill)
+            if codes:
+                added_codes, err = _autofill_universe_by_codes(codes)
+                if err:
+                    st.warning(err)
+                elif added_codes:
+                    preview = ", ".join(added_codes[:8])
+                    suffix = " ..." if len(added_codes) > 8 else ""
+                    st.success(f"已自动补齐 {len(added_codes)} 个代码到 universe（auto_import/from_strategy）：{preview}{suffix}")
+        _run_cmd([sys.executable, "run_backtest.py", "--validate-universe"], "校验Universe")
+    if c3.button("更新缓存数据", width="stretch", key="bt_update_data"):
+        _run_cmd([sys.executable, "run_backtest.py", "--update-data-only", "--start", "2021-01-01", "--end", "today"], "更新缓存")
+    if c4.button("运行选中文件", width="stretch", key="bt_run", disabled=not bool(selected_cfg)):
+        if not selected_cfg:
+            st.error("当前没有策略文件，请先在下方保存一个策略到策略库。")
+        else:
+            _run_cmd(
+                [
+                    sys.executable,
+                    "run_backtest.py",
+                    "--config",
+                    f"config/strategies/{selected_cfg}",
+                    "--output",
+                    "reports",
+                    "--no-browser",
+                ],
+                "运行回测",
+            )
+
     console_output = st.session_state.get("bt_console_output", "")
     if console_output:
         st.caption("最近一次命令输出")
@@ -3259,7 +3413,7 @@ def _render_backtest_page():
         preview_label = "打开页面内预览最新报告" if not st.session_state.get("bt_preview_latest_open", False) else "关闭页面内预览最新报告"
         pb1, pb2 = st.columns(2)
         with pb1:
-            if st.button(preview_label, use_container_width=True, key="bt_toggle_latest_preview"):
+            if st.button(preview_label, width="stretch", key="bt_toggle_latest_preview"):
                 st.session_state["bt_preview_latest_open"] = not bool(st.session_state.get("bt_preview_latest_open", False))
                 st.rerun()
         with pb2:
@@ -3268,7 +3422,7 @@ def _render_backtest_page():
                 data=latest.read_bytes(),
                 file_name=latest.name,
                 mime="text/html",
-                use_container_width=True,
+                width="stretch",
                 key="bt_download_latest",
             )
         if st.session_state.get("bt_preview_latest_open", False):
@@ -3288,7 +3442,7 @@ def _render_backtest_page():
                         "大小(KB)": round(stat.st_size / 1024.0, 1),
                     }
                 )
-            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
     else:
         st.info("暂未找到回测报告，请先点击“运行回测”。")
 
@@ -3547,7 +3701,7 @@ def _render_paper_page():
     weighted_initial = float(sum((x[2] / (1.0 + x[3])) for x in active_rows if np.isfinite(x[2]) and np.isfinite(x[3]) and (1.0 + x[3]) != 0.0))
     total_cum = (total_equity / weighted_initial - 1.0) if weighted_initial > 0 else float("nan")
 
-    if st.button("推进全部运行中模拟盘到最新交易日", use_container_width=True, key="paper_update_all"):
+    if st.button("推进全部运行中模拟盘到最新交易日", width="stretch", key="paper_update_all"):
         _run_paper_cmd([sys.executable, "paper_trade.py", "update", "--all", "--as-of", "today"], "推进全部运行中模拟盘到最新交易日")
         st.rerun()
 
@@ -3581,7 +3735,7 @@ def _render_paper_page():
                         unsafe_allow_html=True,
                     )
                     action_label = "更新到今日" if row else "启动模拟"
-                    if st.button(action_label, use_container_width=True, key=f"paper_action_{name}"):
+                    if st.button(action_label, width="stretch", key=f"paper_action_{name}"):
                         if row:
                             _run_paper_cmd(
                                 [
@@ -3623,11 +3777,11 @@ def _render_paper_page():
             data=BACKTEST_PAPER_DASHBOARD.read_bytes(),
             file_name=BACKTEST_PAPER_DASHBOARD.name,
             mime="text/html",
-            use_container_width=True,
+            width="stretch",
             key="paper_download_dashboard",
         )
     else:
-        if st.button("生成模拟看板", use_container_width=True, key="paper_build_dashboard_init"):
+        if st.button("生成模拟看板", width="stretch", key="paper_build_dashboard_init"):
             _run_paper_cmd([sys.executable, "paper_trade.py", "dashboard"], "生成模拟看板")
             st.rerun()
 
@@ -4024,9 +4178,9 @@ def _render_analysis_window(job_id: str, embedded: bool = False, auto_mode: str 
         run_mode = "deep" if auto_mode else ""
     else:
         btn_cols = st.columns(2)
-        if btn_cols[0].button("多智能体分析", key=f"analysis_window_deep_{job_id}", use_container_width=True):
+        if btn_cols[0].button("多智能体分析", key=f"analysis_window_deep_{job_id}", width="stretch"):
             run_mode = "deep"
-        if btn_cols[1].button("刷新", key=f"analysis_window_refresh_{job_id}", use_container_width=True):
+        if btn_cols[1].button("刷新", key=f"analysis_window_refresh_{job_id}", width="stretch"):
             run_mode = "deep"
             force_refresh = True
 
@@ -4110,7 +4264,7 @@ auto_refresh_sec = header_cols[2].selectbox(
     index=2,
     key="fast_auto_refresh_sec",
 )
-if header_cols[3].button("立即刷新", use_container_width=True, disabled=not market_open_for_ctrl):
+if header_cols[3].button("立即刷新", width="stretch", disabled=not market_open_for_ctrl):
     st.rerun()
 render_section_intro(
     "标的工作台",
@@ -4185,7 +4339,7 @@ def _render_stock_group(stock_rows, group_key_prefix: str) -> None:
                     if st.button(
                         f"{row['name']}\n{row['code']}",
                         key=f"open_fast_{group_key_prefix}_{row['code']}",
-                        use_container_width=True,
+                        width="stretch",
                     ):
                         st.session_state["fast_selected_code"] = row["code"]
                         st.session_state["fast_selected_name"] = row["name"]
@@ -4195,7 +4349,7 @@ def _render_stock_group(stock_rows, group_key_prefix: str) -> None:
                     if st.button(
                         "🗑️",
                         key=f"mini_del_{group_key_prefix}_{row['code']}",
-                        use_container_width=True,
+                        width="stretch",
                         type="tertiary",
                         help=f"删除 {row['name']}",
                     ):
@@ -4456,7 +4610,7 @@ def _render_fast_panel(selected_code: str, selected_name: str, panel=None):
             if st.button(
                 tf_label,
                 key=f"rsi_tf_btn_{selected_code}_{tf_key}",
-                use_container_width=True,
+                width="stretch",
                 type="primary" if is_active else "secondary",
             ):
                 st.session_state[rsi_tf_state] = tf_key
@@ -4778,7 +4932,7 @@ def _render_fast_panel(selected_code: str, selected_name: str, panel=None):
                 height=96,
             )
             st.markdown('<div style="margin-top:0.22rem;"></div>', unsafe_allow_html=True)
-            run_analysis_now = st.button("多智能体分析", key=f"run_inline_analysis_{selected_code}", use_container_width=True)
+            run_analysis_now = st.button("多智能体分析", key=f"run_inline_analysis_{selected_code}", width="stretch")
 
     render_section_intro(
         "快照矩阵",
@@ -4820,7 +4974,7 @@ def _render_fast_panel(selected_code: str, selected_name: str, panel=None):
                 .configure_view(strokeOpacity=0)
                 .configure_axis(gridColor="#dbe4f0", labelColor="#4a5f7c", titleColor="#4a5f7c")
             )
-            st.altair_chart(chart, use_container_width=True)
+            st.altair_chart(chart, width="stretch")
 
     with right:
         st.markdown(f'<div class="panel-title">实时盘口<span class="unit-sub">单位：{orderbook_unit}</span></div>', unsafe_allow_html=True)
@@ -4876,7 +5030,7 @@ def _render_fast_panel(selected_code: str, selected_name: str, panel=None):
     with doc_cols[0]:
         st.subheader(f"多智能体分析文档 · {selected_name} ({selected_code})")
     with doc_cols[1]:
-        refresh_analysis_now = st.button("刷新", key=f"refresh_inline_analysis_{selected_code}", use_container_width=True)
+        refresh_analysis_now = st.button("刷新", key=f"refresh_inline_analysis_{selected_code}", width="stretch")
 
     try:
         if run_analysis_now or refresh_analysis_now:

@@ -5,7 +5,6 @@ from html import escape
 from typing import Sequence
 
 import streamlit as st
-import streamlit.components.v1 as components
 
 
 @dataclass(frozen=True)
@@ -1035,10 +1034,11 @@ def render_top_nav(active_page: str) -> str:
             with cols[idx]:
                 marker_class = "qs-top-nav-marker is-active" if key == active_page else "qs-top-nav-marker"
                 st.markdown(f"<div class='{marker_class}'></div>", unsafe_allow_html=True)
-                if st.button(_SHELLS[key].nav_title, key=f"qs_top_nav_{key}", use_container_width=True):
+                if st.button(_SHELLS[key].nav_title, key=f"qs_top_nav_{key}", width="stretch"):
                     selected = key
-    components.html(
+    st.html(
         """
+        <div style="height:0;overflow:hidden;">
         <script>
         const syncTopNav = () => {
           try {
@@ -1082,8 +1082,10 @@ def render_top_nav(active_page: str) -> str:
 
         bindTopNav();
         </script>
+        </div>
         """,
-        height=0,
+        unsafe_allow_javascript=True,
+        width="content",
     )
     return selected
 

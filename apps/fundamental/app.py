@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 import re
@@ -13,7 +14,6 @@ from typing import Any, Dict, List
 import requests
 import streamlit as st
 from requests.adapters import HTTPAdapter
-from streamlit.components.v1 import html
 from urllib3.util.retry import Retry
 
 CURRENT_DIR = Path(__file__).resolve().parent
@@ -23,6 +23,15 @@ if str(PROJECT_ROOT) not in sys.path:
 
 OPENAI_AVAILABLE = True
 OPENAI_IMPORT_ERROR = None
+
+
+def html(body: str, *, height: int | None = None, scrolling: bool = False) -> None:
+    if height:
+        overflow = "auto" if scrolling else "hidden"
+        body = f"<div style='height:{int(height)}px;overflow:{overflow};'>{body}</div>"
+    st.html(body, unsafe_allow_javascript=True, width="stretch")
+
+
 try:
     from openai import APIConnectionError, APITimeoutError, OpenAI
 except Exception as _exc:  # pragma: no cover - 依赖缺失时兜底
@@ -511,6 +520,7 @@ def _render_summary(row: Dict[str, Any]) -> None:
         st.info("暂无总结。")
 
     json_payload = json.dumps(row, ensure_ascii=False, indent=2)
+    payload_hash = hashlib.sha1(json_payload.encode("utf-8")).hexdigest()[:12]
     json_b64 = base64.b64encode(json_payload.encode("utf-8")).decode("ascii")
 
     btn1, btn2 = st.columns([1, 1], gap="small")
@@ -542,7 +552,7 @@ def _render_summary(row: Dict[str, Any]) -> None:
         )
 
     with btn2:
-        if st.button("DeepSeek分析", key=f"fnd_deepseek_{code}", use_container_width=True):
+        if st.button("DeepSeek分析", key=f"fnd_deepseek_{code}", width="stretch"):
             progress = st.progress(0, text="正在准备分析任务...")
             pytime.sleep(0.08)
             progress.progress(25, text="正在压缩数据...")
@@ -558,6 +568,7 @@ def _render_summary(row: Dict[str, Any]) -> None:
                     "cost": cost,
                     "elapsed": elapsed,
                     "at": datetime.now().strftime("%m-%d %H:%M:%S"),
+                    "input_hash": payload_hash,
                 }
                 progress.progress(100, text="分析完成")
                 pytime.sleep(0.1)
@@ -573,7 +584,8 @@ def _render_summary(row: Dict[str, Any]) -> None:
         st.caption(
             f"分析时间: {deep.get('at','')} ｜耗时: {deep.get('elapsed',0):.2f}s ｜"
             f"Tokens: {deep.get('usage',{}).get('total_tokens',0)} ｜"
-            f"预估成本: {deep.get('cost',0):.4f} 元"
+            f"预估成本: {deep.get('cost',0):.4f} 元 ｜"
+            f"数据指纹: {deep.get('input_hash', '--')}"
         )
         st.text_area("分析文本（可复制）", value=deep.get("report", ""), height=360, key=f"fnd_report_{code}")
 
@@ -597,14 +609,14 @@ def _render_page() -> None:
         input_query = st.text_input("输入代码或名称", placeholder="例如 600007 / 中国国贸 / 00700")
         item_type = st.segmented_control("类型", options=["持仓", "观察"], default="观察")
         c1, c2 = st.columns(2, gap="small")
-        if c1.button("加入", use_container_width=True):
+        if c1.button("加入", width="stretch"):
             try:
                 st.session_state["fnd_watchlist"] = upsert_watch_item_by_query(input_query, item_type or "观察")
                 _refresh_rows(force_refresh=True)
                 st.rerun()
             except Exception as exc:
                 st.error(str(exc))
-        if c2.button("刷新全部", use_container_width=True):
+        if c2.button("刷新全部", width="stretch"):
             _refresh_rows(force_refresh=True)
             st.rerun()
 
@@ -614,7 +626,7 @@ def _render_page() -> None:
                 options=[x["code"] for x in st.session_state["fnd_watchlist"]],
                 format_func=lambda c: next((f"{x['name']} ({x['code']})" for x in st.session_state["fnd_watchlist"] if x["code"] == c), c),
             )
-            if st.button("删除", use_container_width=True):
+            if st.button("删除", width="stretch"):
                 st.session_state["fnd_watchlist"] = delete_watch_item(remove_code)
                 if st.session_state.get("fnd_selected_code") == remove_code:
                     st.session_state["fnd_selected_code"] = ""

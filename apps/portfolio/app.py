@@ -628,7 +628,7 @@ def _render_position_form() -> None:
         take_profit = col8.number_input("预期止盈价", min_value=0.0, value=0.0, step=0.01, format="%.2f")
         note = col9.text_input("备注", placeholder="OPEN / 调仓原因")
 
-        submitted = st.form_submit_button("保存持仓", use_container_width=True)
+        submitted = st.form_submit_button("保存持仓", width="stretch")
 
     if not submitted:
         return
@@ -675,7 +675,7 @@ def _render_delete_panel(positions_df: pd.DataFrame) -> None:
     labels = [item[0] for item in options]
     picked = st.selectbox("选择要删除的持仓", options=labels, key="portfolio_delete_select")
     delete_note = st.text_input("删除备注", key="portfolio_delete_note", placeholder="平仓/移出组合原因")
-    if st.button("删除持仓", type="secondary", use_container_width=True):
+    if st.button("删除持仓", type="secondary", width="stretch"):
         _, market, code = options[labels.index(picked)]
         try:
             ok = remove_position(code=code, market=market, note=delete_note)
@@ -715,7 +715,7 @@ def _render_risk_dashboard(total_equity: float, overview_df: pd.DataFrame) -> No
     )
     left, right = st.columns([1.05, 1.35], gap="large")
     with left:
-        st.altair_chart(_build_weight_chart(overview_df), use_container_width=True)
+        st.altair_chart(_build_weight_chart(overview_df), width="stretch")
     with right:
         display_df = overview_df.copy()
         display_df["标的"] = display_df.apply(
@@ -734,7 +734,7 @@ def _render_risk_dashboard(total_equity: float, overview_df: pd.DataFrame) -> No
             display_df[
                 ["标的", "现价", "成本", "浮盈亏", "浮盈亏%", "净值占比", "仓位占比", "止损", "止盈", "risk_status"]
             ].rename(columns={"risk_status": "风险状态"}),
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
         )
 
@@ -757,7 +757,7 @@ def _render_position_sizer(total_equity: float) -> None:
         risk_pct = c5.number_input("单笔风险上限(%)", min_value=0.1, value=1.0, step=0.1, format="%.1f")
         lot_size = c6.number_input("每手股数", min_value=1, value=100, step=1)
 
-        submitted = st.form_submit_button("计算建议仓位", use_container_width=True)
+        submitted = st.form_submit_button("计算建议仓位", width="stretch")
 
     if not submitted:
         return
@@ -797,7 +797,7 @@ def _render_price_param_editor(positions_df: pd.DataFrame) -> pd.DataFrame:
     st.caption("价格参数：统一维护心理价位、止损价和止盈价；非持仓股票只会保存心理价位。")
     return st.data_editor(
         editor_df.loc[:, ["code", "name", "psychological_price", "stop_loss", "take_profit"]].copy(),
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
         column_config={
             "code": st.column_config.TextColumn("代码", disabled=True),
@@ -882,7 +882,7 @@ def _render_alert_rule_ai_assistant(positions_df: pd.DataFrame) -> None:
         placeholder="例如：嘉友国际心理价位设 13.2，止损 12.6，止盈 14.5。我偏短线，5分钟异动 1.5%，RSI 用 28/72，放量突破至少 4 倍量，接近止损 0.8% 提醒，接近止盈 1.2% 提醒。",
     )
     c1, c2 = st.columns([1.2, 1.0])
-    if c1.button("生成参数草案", use_container_width=True):
+    if c1.button("生成参数草案", width="stretch"):
         if not str(prompt or "").strip():
             st.warning("先输入自然语言描述。")
         else:
@@ -897,7 +897,7 @@ def _render_alert_rule_ai_assistant(positions_df: pd.DataFrame) -> None:
                 st.session_state["portfolio_alert_rule_draft"] = normalized_draft
                 st.session_state["portfolio_alert_rule_raw_draft"] = raw_draft
                 st.success("草案已生成，先看预览再决定是否应用。")
-    if c2.button("清空草案", use_container_width=True):
+    if c2.button("清空草案", width="stretch"):
         st.session_state.pop("portfolio_alert_rule_draft", None)
         st.session_state.pop("portfolio_alert_rule_raw_draft", None)
         st.rerun()
@@ -918,17 +918,17 @@ def _render_alert_rule_ai_assistant(positions_df: pd.DataFrame) -> None:
     diff_df = _flatten_alert_rule_changes(current_config, draft)
     if not diff_df.empty:
         st.markdown("**通用告警参数变更**")
-        st.dataframe(diff_df, use_container_width=True, hide_index=True)
+        st.dataframe(diff_df, width="stretch", hide_index=True)
     symbol_diff_df = _flatten_symbol_changes(current_config, draft)
     if not symbol_diff_df.empty:
         st.markdown("**心理价位变更**")
-        st.dataframe(symbol_diff_df, use_container_width=True, hide_index=True)
+        st.dataframe(symbol_diff_df, width="stretch", hide_index=True)
     position_diff_df = _flatten_position_changes(positions_df, draft)
     if not position_diff_df.empty:
         st.markdown("**持仓止盈止损变更**")
-        st.dataframe(position_diff_df, use_container_width=True, hide_index=True)
+        st.dataframe(position_diff_df, width="stretch", hide_index=True)
 
-    if st.button("应用草案", type="primary", use_container_width=True):
+    if st.button("应用草案", type="primary", width="stretch"):
         try:
             _apply_ai_draft(current_config, positions_df, draft)
         except Exception as exc:
@@ -1028,7 +1028,7 @@ def _render_alert_rule_settings(positions_df: pd.DataFrame) -> None:
             "突破缓冲(%)", min_value=0.0, value=float(breakout_cfg.get("breakout_buffer_pct", 0.0) or 0.0), step=0.1, format="%.1f"
         )
 
-        submitted = st.form_submit_button("保存告警参数", use_container_width=True)
+        submitted = st.form_submit_button("保存告警参数", width="stretch")
 
     if not submitted:
         return
@@ -1100,7 +1100,7 @@ def _render_flows() -> None:
                 "note": "备注",
             }
         ),
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
     )
 

@@ -7,7 +7,7 @@ import logging
 import os
 import sys
 from dataclasses import dataclass
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from zoneinfo import ZoneInfo
@@ -175,6 +175,26 @@ def _is_trading_time(config: Dict[str, Any], now: Optional[datetime] = None) -> 
         if start <= t <= end:
             return True
     return False
+
+
+def _build_trading_cron_specs(
+    windows: Sequence[Tuple[time, time]],
+    interval_minutes: int,
+) -> List[Tuple[str, str]]:
+    """Convert trading windows into compact APScheduler cron specs."""
+    specs: List[Tuple[str, str]] = []
+    anchor = datetime(2000, 1, 3)
+    for start, end in windows:
+        current = datetime.combine(anchor.date(), start)
+        end_dt = datetime.combine(anchor.date(), end)
+        minutes_by_hour: Dict[int, List[int]] = {}
+        while current <= end_dt:
+            minutes_by_hour.setdefault(current.hour, []).append(current.minute)
+            current += timedelta(minutes=interval_minutes)
+        for hour, minutes in sorted(minutes_by_hour.items()):
+            minute_spec = ",".join(str(item) for item in sorted(set(minutes)))
+            specs.append((str(hour), minute_spec))
+    return specs
 
 
 def _resolve_symbol_contexts() -> List[SymbolContext]:
@@ -905,14 +925,21 @@ def start_scheduler(*, config_path: Path = CONFIG_PATH, dry_run: bool = False) -
     timezone = _config_timezone(config)
 
     scheduler = BlockingScheduler(timezone=timezone, job_defaults={"coalesce": True, "max_instances": 1})
-    scheduler.add_job(
-        run_monitors,
-        trigger=CronTrigger(day_of_week="mon-fri", hour="9-15", minute=f"*/{interval_minutes}"),
-        kwargs={"config_path": config_path, "dry_run": dry_run, "force_run": False},
-        id="quant_alert_worker",
-        replace_existing=True,
+    cron_specs = _build_trading_cron_specs(_parse_trading_windows(config), interval_minutes)
+    for idx, (hour_spec, minute_spec) in enumerate(cron_specs, start=1):
+        scheduler.add_job(
+            run_monitors,
+            trigger=CronTrigger(day_of_week="mon-fri", hour=hour_spec, minute=minute_spec),
+            kwargs={"config_path": config_path, "dry_run": dry_run, "force_run": False},
+            id=f"quant_alert_worker_{idx}",
+            replace_existing=True,
+        )
+    LOGGER.info(
+        "alert worker 已启动，按 %s 每 %d 分钟扫描交易窗口: %s",
+        timezone,
+        interval_minutes,
+        ", ".join(f"{start.strftime('%H:%M')}-{end.strftime('%H:%M')}" for start, end in _parse_trading_windows(config)),
     )
-    LOGGER.info("alert worker 已启动，按 %s 每 %d 分钟扫描一次交易时段股票池", timezone, interval_minutes)
     scheduler.start()
 
 

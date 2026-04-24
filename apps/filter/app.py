@@ -175,6 +175,91 @@ def _safe_int(v: object) -> int:
         return 0
 
 
+def _parse_dt_text(value: object) -> datetime | None:
+    text = _safe_str(value)
+    if not text:
+        return None
+    candidates = (
+        (text[:19].replace("T", " "), "%Y-%m-%d %H:%M:%S"),
+        (text[:10], "%Y-%m-%d"),
+    )
+    for candidate, fmt in candidates:
+        try:
+            return datetime.strptime(candidate, fmt)
+        except Exception:
+            continue
+    return None
+
+
+def _hk_segment_health(row: dict) -> dict:
+    total = max(0, int(row.get("count", 0) or 0))
+    covered = max(0, int(row.get("persisted_count", 0) or 0))
+    missing = max(0, total - covered)
+    coverage = (covered / total) if total else 0.0
+    last_dt = _parse_dt_text(row.get("last_enriched_at"))
+    age_days = (datetime.now() - last_dt).days if last_dt else None
+    if total <= 0:
+        label, color = "无样本", "#8292a5"
+    elif covered <= 0:
+        label, color = "未建立", "#8292a5"
+    elif coverage < 0.5:
+        label, color = "覆盖不足", "#ef6461"
+    elif age_days is None:
+        label, color = "时间未知", "#8292a5"
+    elif age_days <= 7 and coverage >= 0.95:
+        label, color = "新鲜", "#35c46a"
+    elif age_days <= 30:
+        label, color = "可用偏旧", "#e2b84d"
+    elif age_days <= 90:
+        label, color = "需要更新", "#e8914b"
+    else:
+        label, color = "已过期", "#ef6461"
+    if last_dt is None:
+        recent = "--"
+    elif age_days == 0:
+        recent = "今天"
+    elif age_days == 1:
+        recent = "昨天"
+    else:
+        recent = f"{age_days}天前"
+    return {
+        "covered": covered,
+        "missing": missing,
+        "coverage_pct": coverage * 100,
+        "label": label,
+        "color": color,
+        "recent": recent,
+    }
+
+
+def _render_hk_segment_tile(
+    col,
+    row: dict,
+    *,
+    key_prefix: str,
+    selected_key: str,
+) -> bool:
+    row_key = str(row.get("key"))
+    total_count = int(row.get("count", 0) or 0)
+    current_selected = [str(item) for item in st.session_state.get(selected_key, [])]
+    selected_now = row_key in set(current_selected)
+    health = _hk_segment_health(row)
+    value = col.checkbox(
+        f"{_safe_str(row.get('label'))}｜{health['label']}｜{health['coverage_pct']:.0f}%",
+        value=selected_now,
+        key=f"{key_prefix}_seg_check_{row_key}",
+    )
+    col.markdown(
+        f"<div style='margin-top:-0.35rem;font-size:0.76rem;color:rgba(234,240,245,0.58);"
+        f"white-space:nowrap;overflow:hidden;text-overflow:ellipsis;'>"
+        f"<span style='color:{health['color']};font-weight:800'>{health['label']}</span>"
+        f" · 可筛 {health['covered']}/{total_count} · 缺 {health['missing']} · {health['recent']}"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+    return bool(value)
+
+
 def _sync_snapshot_into_duckdb(snapshot_df: pd.DataFrame) -> dict:
     if snapshot_df is None or snapshot_df.empty:
         return {"stock_basic": 0, "daily_kline": 0, "daily_fundamental": 0}
@@ -355,7 +440,7 @@ def _render_source_check_result(scope: str) -> None:
             }
         )
     if rows:
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
 
 
 def _run_market_update(scope: str, *, max_stocks: int, enrich_n: int, enrich_segment: str, force_refresh: bool, rotate_enrich: bool, safe_mode: bool) -> None:
@@ -559,11 +644,11 @@ def _render_market_ops_tab(scope: str, *, key_prefix: str) -> None:
         f"当前状态: {weekly_state}"
     )
     b1, b2, b3 = st.columns(3)
-    if b1.button(f"运行{label}更新", use_container_width=True, key=f"{key_prefix}_run_once"):
+    if b1.button(f"运行{label}更新", width="stretch", key=f"{key_prefix}_run_once"):
         _run_market_update(scope, max_stocks=int(max_stocks), enrich_n=int(enrich_n), enrich_segment=str(enrich_segment), force_refresh=bool(force_refresh), rotate_enrich=False, safe_mode=bool(safe_mode))
-    if b2.button(f"执行{label}周更（7天一次）", use_container_width=True, key=f"{key_prefix}_weekly"):
+    if b2.button(f"执行{label}周更（7天一次）", width="stretch", key=f"{key_prefix}_weekly"):
         _run_market_weekly(scope, enrich_n=int(enrich_n), enrich_segment=str(enrich_segment))
-    if b3.button(f"检测{label}数据源", use_container_width=True, key=f"{key_prefix}_source_check"):
+    if b3.button(f"检测{label}数据源", width="stretch", key=f"{key_prefix}_source_check"):
         _run_source_check(scope)
     _render_source_check_result(scope)
 
@@ -581,7 +666,10 @@ def _render_market_ops_tab(scope: str, *, key_prefix: str) -> None:
         st.markdown("<div style='height:1.2rem'></div>", unsafe_allow_html=True)
         section_title = "A股板块深补" if scope == "A" else "港股板块深补"
         st.markdown(f"### {section_title}")
-        st.caption("点击下方板块按钮，直接深补该板块全部股票。")
+        if scope == "A":
+            st.caption("点击下方板块按钮，直接深补该板块全部股票。")
+        else:
+            st.caption("勾选一个或多个港股板块，再点击“深补勾选板块”。默认只补缺，已深补股票不会重复抓。")
         segment_rows = _a_segment_status() if scope == "A" else _hk_segment_status()
         store_summary = get_stock_enrichment_store_summary()
         completed_segments = sum(1 for row in segment_rows if _safe_str(row.get("status")) == "已完成")
@@ -590,20 +678,55 @@ def _render_market_ops_tab(scope: str, *, key_prefix: str) -> None:
             f"已完成板块 {completed_segments}/{len(segment_rows)} ｜ "
             f"最近深补 {_safe_str(store_summary.get('latest_enriched_at', '')) or '--'}"
         )
-        for start in range(0, len(segment_rows), 4):
-            cols = st.columns(4)
-            for col, row in zip(cols, segment_rows[start : start + 4]):
-                label_text = f"{row['label']}（{int(row['count'])}）"
-                if col.button(label_text, use_container_width=True, key=f"{key_prefix}_seg_{row['key']}"):
-                    if scope == "A":
-                        _run_a_segment_enrich(
-                            segment_key=str(row["key"]),
-                            segment_label=str(row["label"]),
-                            segment_count=int(row["count"]),
-                            force_refresh=bool(force_refresh),
-                            safe_mode=bool(safe_mode),
-                        )
-                    else:
+        if scope == "HK":
+            selected_key = f"{key_prefix}_hk_selected_segments"
+            if selected_key not in st.session_state:
+                st.session_state[selected_key] = []
+            row_map = {str(row["key"]): row for row in segment_rows}
+            pending_keys = [
+                str(row["key"])
+                for row in segment_rows
+                if int(row.get("persisted_count", 0) or 0) < int(row.get("count", 0) or 0)
+            ]
+            selected_segments = [str(item) for item in st.session_state.get(selected_key, []) if str(item) in row_map]
+            st.session_state[selected_key] = selected_segments
+            ctrl1, ctrl2, ctrl3 = st.columns([1.2, 1, 1], vertical_alignment="bottom")
+            ctrl1.caption(f"已选择 {len(selected_segments)} 个板块")
+            if ctrl2.button("全选未完成", width="stretch", key=f"{key_prefix}_hk_select_pending"):
+                st.session_state[selected_key] = pending_keys
+                for row in segment_rows:
+                    st.session_state[f"{key_prefix}_seg_check_{row['key']}"] = str(row["key"]) in set(pending_keys)
+                st.rerun()
+            if ctrl3.button("清空选择", width="stretch", key=f"{key_prefix}_hk_clear_selected"):
+                st.session_state[selected_key] = []
+                for row in segment_rows:
+                    st.session_state[f"{key_prefix}_seg_check_{row['key']}"] = False
+                st.rerun()
+            st.markdown("<div style='height:0.6rem'></div>", unsafe_allow_html=True)
+
+        if scope == "HK":
+            chosen_now: list[str] = []
+            with st.form(f"{key_prefix}_hk_segment_select_form", border=False):
+                for start in range(0, len(segment_rows), 5):
+                    cols = st.columns(5)
+                    for col, row in zip(cols, segment_rows[start : start + 5]):
+                        row_key = str(row.get("key"))
+                        if _render_hk_segment_tile(
+                            col,
+                            row,
+                            key_prefix=key_prefix,
+                            selected_key=f"{key_prefix}_hk_selected_segments",
+                        ):
+                            chosen_now.append(row_key)
+                if st.form_submit_button("深补勾选板块", type="primary", width="stretch"):
+                    st.session_state[selected_key] = chosen_now
+                    if not chosen_now:
+                        st.warning("请先勾选至少一个港股板块。")
+                        return
+                    for segment_key in chosen_now:
+                        row = row_map.get(str(segment_key))
+                        if not row:
+                            continue
                         _run_hk_segment_enrich(
                             segment_key=str(row["key"]),
                             segment_label=str(row["label"]),
@@ -611,11 +734,24 @@ def _render_market_ops_tab(scope: str, *, key_prefix: str) -> None:
                             force_refresh=bool(force_refresh),
                             safe_mode=bool(safe_mode),
                         )
-                persisted = int(row.get("persisted_count", 0) or 0)
-                total_count = int(row.get("count", 0) or 0)
-                col.caption(f"{_safe_str(row.get('status'))} ｜ 已深补 {persisted}/{total_count}")
-                last_text = _safe_str(row.get("last_enriched_at", ""))
-                col.caption(f"上次深补：{last_text}" if last_text else "上次深补：未深补")
+        else:
+            for start in range(0, len(segment_rows), 4):
+                cols = st.columns(4)
+                for col, row in zip(cols, segment_rows[start : start + 4]):
+                    label_text = f"{row['label']}（{int(row['count'])}）"
+                    if col.button(label_text, width="stretch", key=f"{key_prefix}_seg_{row['key']}"):
+                        _run_a_segment_enrich(
+                            segment_key=str(row["key"]),
+                            segment_label=str(row["label"]),
+                            segment_count=int(row["count"]),
+                            force_refresh=bool(force_refresh),
+                            safe_mode=bool(safe_mode),
+                        )
+                    persisted = int(row.get("persisted_count", 0) or 0)
+                    total_count = int(row.get("count", 0) or 0)
+                    col.caption(f"{_safe_str(row.get('status'))} ｜ 已深补 {persisted}/{total_count}")
+                    last_text = _safe_str(row.get("last_enriched_at", ""))
+                    col.caption(f"上次深补：{last_text}" if last_text else "上次深补：未深补")
 
 
 def _render_ops_panel() -> None:
@@ -650,7 +786,7 @@ def _render_ops_panel() -> None:
             file_name=f"filter_health_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
-        if action_col2.button("从备份恢复快照", use_container_width=True, disabled=not bool(backup_status.get("exists"))):
+        if action_col2.button("从备份恢复快照", width="stretch", disabled=not bool(backup_status.get("exists"))):
             try:
                 restored = restore_snapshot_from_backup()
                 st.success(
@@ -669,8 +805,8 @@ def _render_ops_panel() -> None:
             st.caption("当前没有可恢复的快照备份。")
 
         with st.expander("查看体检详情", expanded=False):
-            st.dataframe(report.get("trend_df", pd.DataFrame()), use_container_width=True, hide_index=True)
-            st.dataframe(report.get("runs_df", pd.DataFrame()), use_container_width=True, hide_index=True)
+            st.dataframe(report.get("trend_df", pd.DataFrame()), width="stretch", hide_index=True)
+            st.dataframe(report.get("runs_df", pd.DataFrame()), width="stretch", hide_index=True)
 
 meta = get_snapshot_meta()
 overall = _all_market_snapshot_summary()
@@ -711,7 +847,7 @@ enrich_n = st.sidebar.number_input("深度补充数量（调用基本面引擎�
 rotate_enrich = st.sidebar.checkbox("深度补充采用轮转增量（推荐）", value=True)
 force_refresh = st.sidebar.checkbox("忽略缓存强制重抓", value=False)
 
-if st.sidebar.button("更新全市场数据", use_container_width=True):
+if st.sidebar.button("更新全市场数据", width="stretch"):
     with st.spinner("正在更新市场数据，请稍候..."):
         try:
             stats = refresh_market_snapshot(
@@ -777,7 +913,7 @@ if (
 st.sidebar.caption("已本地保存，不会上传到 GitHub。")
 if st.sidebar.button(
     "打开数据运维台" if not st.session_state["show_ops_panel"] else "收起数据运维台",
-    use_container_width=True,
+    width="stretch",
 ):
     st.session_state["show_ops_panel"] = not bool(st.session_state["show_ops_panel"])
 
@@ -811,183 +947,184 @@ elif mode == "模板筛选":
     all_tpl = load_templates()
     tpl_names = sorted(all_tpl.keys())
     selected_tpl = tpl_cols[0].selectbox("模板", options=["(无)"] + tpl_names, key="flt_tpl_select_main")
-    if tpl_cols[1].button("读取模板", use_container_width=True, key="flt_tpl_load_main"):
+    if tpl_cols[1].button("读取模板", width="stretch", key="flt_tpl_load_main"):
         if selected_tpl and selected_tpl != "(无)":
             st.session_state["flt_cfg"] = get_template_config(selected_tpl)
             st.success(f"已加载模板: {selected_tpl}")
             st.rerun()
     save_tpl_name = tpl_cols[2].text_input("保存为模板名", value="", key="flt_tpl_save_main")
-    if tpl_cols[3].button("保存模板", use_container_width=True, key="flt_tpl_save_btn_main"):
+    if tpl_cols[3].button("保存模板", width="stretch", key="flt_tpl_save_btn_main"):
         try:
             save_template(save_tpl_name, cfg)
             st.success("模板已保存")
         except Exception as exc:
             st.error(str(exc))
 
-render_section_intro(
-    "条件矩阵",
-    "把筛选条件拆成四个层次，从硬排除到五年后视镜，帮助你先做风险清洗，再叠加估值、质量和长期验证。",
-    kicker="Configuration",
-    pills=("A 硬排除", "B 估值质量", "C 行业规模", "D 五年后视镜"),
-)
-st.subheader("筛选条件（支持手动开关，像电商筛选一样）")
-
-with st.expander("A. 财务健康度与硬排除", expanded=True):
-    c1, c2, c3 = st.columns(3)
-    cfg["missing_policy"] = c1.selectbox("缺失数据处理", options=["ignore", "exclude"], index=0 if cfg.get("missing_policy") == "ignore" else 1)
-
-    r = cfg["risk"]
-    q = cfg["quality"]
-
-    r["exclude_st"] = c1.checkbox("排除 ST/*ST", value=bool(r.get("exclude_st", True)))
-    r["exclude_investigation"] = c1.checkbox("排除立案调查", value=bool(r.get("exclude_investigation", True)))
-    r["exclude_penalty"] = c1.checkbox("排除重大处罚", value=bool(r.get("exclude_penalty", True)))
-
-    r["exclude_fund_occupation"] = c2.checkbox("排除资金占用", value=bool(r.get("exclude_fund_occupation", True)))
-    r["exclude_illegal_reduce"] = c2.checkbox("排除违规减持", value=bool(r.get("exclude_illegal_reduce", True)))
-    r["require_standard_audit"] = c2.checkbox("审计意见必须标准无保留", value=bool(r.get("require_standard_audit", False)))
-
-    q["ocf_3y_min_enabled"] = c3.checkbox("启用近3年经营现金流下限(亿)", value=bool(q.get("ocf_3y_min_enabled", False)))
-    q["ocf_3y_min"] = c3.number_input("经营现金流下限(亿)", value=float(q.get("ocf_3y_min", 0.0)), step=1.0)
-    q["asset_liability_max_enabled"] = c3.checkbox("启用资产负债率上限(%)", value=bool(q.get("asset_liability_max_enabled", False)))
-    q["asset_liability_max"] = c3.number_input("资产负债率上限(%)", value=float(q.get("asset_liability_max", 80.0)), step=1.0)
-
-with st.expander("B. 估值与质量", expanded=True):
-    c1, c2, c3 = st.columns(3)
-    q = cfg["quality"]
-    v = cfg["valuation"]
-
-    q["roe_min_enabled"] = c1.checkbox("启用 ROE 下限(%)", value=bool(q.get("roe_min_enabled", False)))
-    q["roe_min"] = c1.number_input("ROE 下限(%)", value=float(q.get("roe_min", 5.0)), step=0.5)
-    q["gross_margin_min_enabled"] = c1.checkbox("启用毛利率下限(%)", value=bool(q.get("gross_margin_min_enabled", False)))
-    q["gross_margin_min"] = c1.number_input("毛利率下限(%)", value=float(q.get("gross_margin_min", 20.0)), step=0.5)
-    q["net_margin_min_enabled"] = c1.checkbox("启用净利率下限(%)", value=bool(q.get("net_margin_min_enabled", False)))
-    q["net_margin_min"] = c1.number_input("净利率下限(%)", value=float(q.get("net_margin_min", 8.0)), step=0.5)
-
-    q["receivable_ratio_max_enabled"] = c2.checkbox("启用应收代理指标上限", value=bool(q.get("receivable_ratio_max_enabled", False)))
-    q["receivable_ratio_max"] = c2.number_input("应收代理指标上限", value=float(q.get("receivable_ratio_max", 50.0)), step=1.0)
-    q["goodwill_ratio_max_enabled"] = c2.checkbox("启用商誉/净资产上限(%)", value=bool(q.get("goodwill_ratio_max_enabled", False)))
-    q["goodwill_ratio_max"] = c2.number_input("商誉/净资产上限(%)", value=float(q.get("goodwill_ratio_max", 30.0)), step=1.0)
-    q["interest_debt_asset_max_enabled"] = c2.checkbox("启用有息负债/总资产上限(%)", value=bool(q.get("interest_debt_asset_max_enabled", False)))
-    q["interest_debt_asset_max"] = c2.number_input("有息负债/总资产上限(%)", value=float(q.get("interest_debt_asset_max", 20.0)), step=1.0)
-
-    v["pe_ttm_min_enabled"] = c3.checkbox("启用 PE(TTM) 下限", value=bool(v.get("pe_ttm_min_enabled", False)))
-    v["pe_ttm_min"] = c3.number_input("PE(TTM) 下限", value=float(v.get("pe_ttm_min", 0.0)), step=1.0)
-    v["pe_ttm_max_enabled"] = c3.checkbox("启用 PE(TTM) 上限", value=bool(v.get("pe_ttm_max_enabled", False)))
-    v["pe_ttm_max"] = c3.number_input("PE(TTM) 上限", value=float(v.get("pe_ttm_max", 25.0)), step=1.0)
-    v["pb_max_enabled"] = c3.checkbox("启用 PB 上限", value=bool(v.get("pb_max_enabled", False)))
-    v["pb_max"] = c3.number_input("PB 上限", value=float(v.get("pb_max", 3.0)), step=0.1)
-
-with st.expander("C. 行业、分红、流动性与规模", expanded=True):
-    c1, c2, c3 = st.columns(3)
-    r = cfg["risk"]
-    v = cfg["valuation"]
-    g = cfg["growth_liquidity"]
-
-    scope_map = {"all": "全部市场", "A": "仅A股", "HK": "仅港股"}
-    raw_scope = _safe_str(r.get("market_scope", "all")).upper()
-    scope_value = "all" if raw_scope not in {"A", "HK"} else raw_scope
-    r["market_scope"] = c1.selectbox(
-        "筛选市场范围",
-        options=["all", "A", "HK"],
-        index=["all", "A", "HK"].index(scope_value),
-        format_func=lambda x: scope_map.get(x, x),
+with st.form("flt_condition_form", clear_on_submit=False):
+    render_section_intro(
+        "条件矩阵",
+        "把筛选条件拆成四个层次，从硬排除到五年后视镜，帮助你先做风险清洗，再叠加估值、质量和长期验证。",
+        kicker="Configuration",
+        pills=("A 硬排除", "B 估值质量", "C 行业规模", "D 五年后视镜"),
     )
-    r["industry_include_enabled"] = c1.checkbox("启用行业关键词包含", value=bool(r.get("industry_include_enabled", False)))
-    r["industry_include_keywords"] = c1.text_input(
-        "行业关键词（包含，逗号分隔）",
-        value=str(r.get("industry_include_keywords", "")),
-    )
-    if str(r.get("industry_include_keywords", "")).strip():
-        r["industry_include_enabled"] = True
-    r["exclude_sunset_industry"] = c1.checkbox("排除夕阳行业", value=bool(r.get("exclude_sunset_industry", False)))
-    r["sunset_industries"] = c1.text_area("夕阳行业关键词（逗号分隔）", value=str(r.get("sunset_industries", "")), height=120)
-    r["pledge_ratio_max_enabled"] = c1.checkbox("启用质押率上限(%)", value=bool(r.get("pledge_ratio_max_enabled", False)))
-    r["pledge_ratio_max"] = c1.number_input("质押率上限(%)", value=float(r.get("pledge_ratio_max", 80.0)), step=1.0)
+    st.subheader("筛选条件（支持手动开关，像电商筛选一样）")
 
-    v["dividend_min_enabled"] = c2.checkbox("启用股息率下限(%)", value=bool(v.get("dividend_min_enabled", False)))
-    v["dividend_min"] = c2.number_input("股息率下限(%)", value=float(v.get("dividend_min", 3.0)), step=0.1)
-    v["dividend_max_enabled"] = c2.checkbox("启用股息率上限(%)", value=bool(v.get("dividend_max_enabled", False)))
-    v["dividend_max"] = c2.number_input("股息率上限(%)", value=float(v.get("dividend_max", 12.0)), step=0.1)
-    r["exclude_no_dividend_5y"] = c2.checkbox("排除近5年未分红", value=bool(r.get("exclude_no_dividend_5y", False)))
+    with st.expander("A. 财务健康度与硬排除", expanded=True):
+        c1, c2, c3 = st.columns(3)
+        cfg["missing_policy"] = c1.selectbox("缺失数据处理", options=["ignore", "exclude"], index=0 if cfg.get("missing_policy") == "ignore" else 1)
 
-    g["market_cap_min_enabled"] = c3.checkbox("启用总市值下限(亿)", value=bool(g.get("market_cap_min_enabled", False)))
-    g["market_cap_min"] = c3.number_input("总市值下限(亿)", value=float(g.get("market_cap_min", 100.0)), step=10.0)
-    g["market_cap_max_enabled"] = c3.checkbox("启用总市值上限(亿)", value=bool(g.get("market_cap_max_enabled", False)))
-    g["market_cap_max"] = c3.number_input("总市值上限(亿)", value=float(g.get("market_cap_max", 5000.0)), step=10.0)
+        r = cfg["risk"]
+        q = cfg["quality"]
 
-    g["turnover_min_enabled"] = c3.checkbox("启用换手率下限(%)", value=bool(g.get("turnover_min_enabled", False)))
-    g["turnover_min"] = c3.number_input("换手率下限(%)", value=float(g.get("turnover_min", 0.2)), step=0.1)
-    g["turnover_max_enabled"] = c3.checkbox("启用换手率上限(%)", value=bool(g.get("turnover_max_enabled", False)))
-    g["turnover_max"] = c3.number_input("换手率上限(%)", value=float(g.get("turnover_max", 15.0)), step=0.1)
+        r["exclude_st"] = c1.checkbox("排除 ST/*ST", value=bool(r.get("exclude_st", True)))
+        r["exclude_investigation"] = c1.checkbox("排除立案调查", value=bool(r.get("exclude_investigation", True)))
+        r["exclude_penalty"] = c1.checkbox("排除重大处罚", value=bool(r.get("exclude_penalty", True)))
 
-    g["volume_ratio_min_enabled"] = c3.checkbox("启用量比下限", value=bool(g.get("volume_ratio_min_enabled", False)))
-    g["volume_ratio_min"] = c3.number_input("量比下限", value=float(g.get("volume_ratio_min", 0.5)), step=0.1)
-    g["volume_ratio_max_enabled"] = c3.checkbox("启用量比上限", value=bool(g.get("volume_ratio_max_enabled", False)))
-    g["volume_ratio_max"] = c3.number_input("量比上限", value=float(g.get("volume_ratio_max", 3.0)), step=0.1)
+        r["exclude_fund_occupation"] = c2.checkbox("排除资金占用", value=bool(r.get("exclude_fund_occupation", True)))
+        r["exclude_illegal_reduce"] = c2.checkbox("排除违规减持", value=bool(r.get("exclude_illegal_reduce", True)))
+        r["require_standard_audit"] = c2.checkbox("审计意见必须标准无保留", value=bool(r.get("require_standard_audit", False)))
 
-with st.expander("D. 五年后视镜（先看长期，再做当前筛选）", expanded=False):
-    st.caption("建议先开这一层做长期体检，再叠加 A/B/C 做当下过滤。")
-    d1, d2, d3 = st.columns(3)
-    d5 = cfg.setdefault("rearview_5y", {})
+        q["ocf_3y_min_enabled"] = c3.checkbox("启用近3年经营现金流下限(亿)", value=bool(q.get("ocf_3y_min_enabled", False)))
+        q["ocf_3y_min"] = c3.number_input("经营现金流下限(亿)", value=float(q.get("ocf_3y_min", 0.0)), step=1.0)
+        q["asset_liability_max_enabled"] = c3.checkbox("启用资产负债率上限(%)", value=bool(q.get("asset_liability_max_enabled", False)))
+        q["asset_liability_max"] = c3.number_input("资产负债率上限(%)", value=float(q.get("asset_liability_max", 80.0)), step=1.0)
 
-    d5["revenue_cagr_5y_min_enabled"] = d1.checkbox(
-        "启用营收5年CAGR下限(%)", value=bool(d5.get("revenue_cagr_5y_min_enabled", False))
-    )
-    d5["revenue_cagr_5y_min"] = d1.number_input(
-        "营收5年CAGR下限(%)", value=float(d5.get("revenue_cagr_5y_min", 3.0)), step=0.5
-    )
-    d5["profit_cagr_5y_min_enabled"] = d1.checkbox(
-        "启用净利5年CAGR下限(%)", value=bool(d5.get("profit_cagr_5y_min_enabled", False))
-    )
-    d5["profit_cagr_5y_min"] = d1.number_input(
-        "净利5年CAGR下限(%)", value=float(d5.get("profit_cagr_5y_min", 3.0)), step=0.5
-    )
+    with st.expander("B. 估值与质量", expanded=True):
+        c1, c2, c3 = st.columns(3)
+        q = cfg["quality"]
+        v = cfg["valuation"]
 
-    d5["roe_avg_5y_min_enabled"] = d2.checkbox(
-        "启用ROE 5年均值下限(%)", value=bool(d5.get("roe_avg_5y_min_enabled", False))
-    )
-    d5["roe_avg_5y_min"] = d2.number_input(
-        "ROE 5年均值下限(%)", value=float(d5.get("roe_avg_5y_min", 8.0)), step=0.5
-    )
-    d5["ocf_positive_years_5y_min_enabled"] = d2.checkbox(
-        "启用经营现金流为正年数下限", value=bool(d5.get("ocf_positive_years_5y_min_enabled", False))
-    )
-    d5["ocf_positive_years_5y_min"] = int(
-        d2.number_input(
-            "经营现金流为正年数下限(0-5)",
-            min_value=0,
-            max_value=5,
-            value=int(d5.get("ocf_positive_years_5y_min", 4)),
-            step=1,
+        q["roe_min_enabled"] = c1.checkbox("启用 ROE 下限(%)", value=bool(q.get("roe_min_enabled", False)))
+        q["roe_min"] = c1.number_input("ROE 下限(%)", value=float(q.get("roe_min", 5.0)), step=0.5)
+        q["gross_margin_min_enabled"] = c1.checkbox("启用毛利率下限(%)", value=bool(q.get("gross_margin_min_enabled", False)))
+        q["gross_margin_min"] = c1.number_input("毛利率下限(%)", value=float(q.get("gross_margin_min", 20.0)), step=0.5)
+        q["net_margin_min_enabled"] = c1.checkbox("启用净利率下限(%)", value=bool(q.get("net_margin_min_enabled", False)))
+        q["net_margin_min"] = c1.number_input("净利率下限(%)", value=float(q.get("net_margin_min", 8.0)), step=0.5)
+
+        q["receivable_ratio_max_enabled"] = c2.checkbox("启用应收代理指标上限", value=bool(q.get("receivable_ratio_max_enabled", False)))
+        q["receivable_ratio_max"] = c2.number_input("应收代理指标上限", value=float(q.get("receivable_ratio_max", 50.0)), step=1.0)
+        q["goodwill_ratio_max_enabled"] = c2.checkbox("启用商誉/净资产上限(%)", value=bool(q.get("goodwill_ratio_max_enabled", False)))
+        q["goodwill_ratio_max"] = c2.number_input("商誉/净资产上限(%)", value=float(q.get("goodwill_ratio_max", 30.0)), step=1.0)
+        q["interest_debt_asset_max_enabled"] = c2.checkbox("启用有息负债/总资产上限(%)", value=bool(q.get("interest_debt_asset_max_enabled", False)))
+        q["interest_debt_asset_max"] = c2.number_input("有息负债/总资产上限(%)", value=float(q.get("interest_debt_asset_max", 20.0)), step=1.0)
+
+        v["pe_ttm_min_enabled"] = c3.checkbox("启用 PE(TTM) 下限", value=bool(v.get("pe_ttm_min_enabled", False)))
+        v["pe_ttm_min"] = c3.number_input("PE(TTM) 下限", value=float(v.get("pe_ttm_min", 0.0)), step=1.0)
+        v["pe_ttm_max_enabled"] = c3.checkbox("启用 PE(TTM) 上限", value=bool(v.get("pe_ttm_max_enabled", False)))
+        v["pe_ttm_max"] = c3.number_input("PE(TTM) 上限", value=float(v.get("pe_ttm_max", 25.0)), step=1.0)
+        v["pb_max_enabled"] = c3.checkbox("启用 PB 上限", value=bool(v.get("pb_max_enabled", False)))
+        v["pb_max"] = c3.number_input("PB 上限", value=float(v.get("pb_max", 3.0)), step=0.1)
+
+    with st.expander("C. 行业、分红、流动性与规模", expanded=True):
+        c1, c2, c3 = st.columns(3)
+        r = cfg["risk"]
+        v = cfg["valuation"]
+        g = cfg["growth_liquidity"]
+
+        scope_map = {"all": "全部市场", "A": "仅A股", "HK": "仅港股"}
+        raw_scope = _safe_str(r.get("market_scope", "all")).upper()
+        scope_value = "all" if raw_scope not in {"A", "HK"} else raw_scope
+        r["market_scope"] = c1.selectbox(
+            "筛选市场范围",
+            options=["all", "A", "HK"],
+            index=["all", "A", "HK"].index(scope_value),
+            format_func=lambda x: scope_map.get(x, x),
         )
-    )
+        r["industry_include_enabled"] = c1.checkbox("启用行业关键词包含", value=bool(r.get("industry_include_enabled", False)))
+        r["industry_include_keywords"] = c1.text_input(
+            "行业关键词（包含，逗号分隔）",
+            value=str(r.get("industry_include_keywords", "")),
+        )
+        if str(r.get("industry_include_keywords", "")).strip():
+            r["industry_include_enabled"] = True
+        r["exclude_sunset_industry"] = c1.checkbox("排除夕阳行业", value=bool(r.get("exclude_sunset_industry", False)))
+        r["sunset_industries"] = c1.text_area("夕阳行业关键词（逗号分隔）", value=str(r.get("sunset_industries", "")), height=120)
+        r["pledge_ratio_max_enabled"] = c1.checkbox("启用质押率上限(%)", value=bool(r.get("pledge_ratio_max_enabled", False)))
+        r["pledge_ratio_max"] = c1.number_input("质押率上限(%)", value=float(r.get("pledge_ratio_max", 80.0)), step=1.0)
 
-    d5["debt_ratio_change_5y_max_enabled"] = d3.checkbox(
-        "启用负债率5年变化上限(百分点)", value=bool(d5.get("debt_ratio_change_5y_max_enabled", False))
-    )
-    d5["debt_ratio_change_5y_max"] = d3.number_input(
-        "负债率5年变化上限(百分点)", value=float(d5.get("debt_ratio_change_5y_max", 8.0)), step=0.5
-    )
-    d5["gross_margin_change_5y_min_enabled"] = d3.checkbox(
-        "启用毛利率5年变化下限(百分点)", value=bool(d5.get("gross_margin_change_5y_min_enabled", False))
-    )
-    d5["gross_margin_change_5y_min"] = d3.number_input(
-        "毛利率5年变化下限(百分点)", value=float(d5.get("gross_margin_change_5y_min", -6.0)), step=0.5
-    )
+        v["dividend_min_enabled"] = c2.checkbox("启用股息率下限(%)", value=bool(v.get("dividend_min_enabled", False)))
+        v["dividend_min"] = c2.number_input("股息率下限(%)", value=float(v.get("dividend_min", 3.0)), step=0.1)
+        v["dividend_max_enabled"] = c2.checkbox("启用股息率上限(%)", value=bool(v.get("dividend_max_enabled", False)))
+        v["dividend_max"] = c2.number_input("股息率上限(%)", value=float(v.get("dividend_max", 12.0)), step=0.1)
+        r["exclude_no_dividend_5y"] = c2.checkbox("排除近5年未分红", value=bool(r.get("exclude_no_dividend_5y", False)))
 
-st.session_state["flt_cfg"] = cfg
+        g["market_cap_min_enabled"] = c3.checkbox("启用总市值下限(亿)", value=bool(g.get("market_cap_min_enabled", False)))
+        g["market_cap_min"] = c3.number_input("总市值下限(亿)", value=float(g.get("market_cap_min", 100.0)), step=10.0)
+        g["market_cap_max_enabled"] = c3.checkbox("启用总市值上限(亿)", value=bool(g.get("market_cap_max_enabled", False)))
+        g["market_cap_max"] = c3.number_input("总市值上限(亿)", value=float(g.get("market_cap_max", 5000.0)), step=10.0)
 
-render_section_intro(
-    "执行与结果",
-    "执行区负责运行筛选逻辑，结果区集中展示样本分布、二段筛选说明和导出能力。",
-    kicker="Execution",
-    pills=("执行筛选", "二段筛选", "结果导出"),
-)
-run_col1, run_col2, run_col3 = st.columns([1, 1.4, 2])
-run_now = run_col1.button("执行筛选", type="primary", use_container_width=True)
-two_stage = run_col2.checkbox("二段筛选（先 A/B/C，再 D 五年后视镜）", value=True)
-run_col3.caption("注：部分标的5年数据可能缺失；可通过“缺失数据处理”决定是否直接排除。")
+        g["turnover_min_enabled"] = c3.checkbox("启用换手率下限(%)", value=bool(g.get("turnover_min_enabled", False)))
+        g["turnover_min"] = c3.number_input("换手率下限(%)", value=float(g.get("turnover_min", 0.2)), step=0.1)
+        g["turnover_max_enabled"] = c3.checkbox("启用换手率上限(%)", value=bool(g.get("turnover_max_enabled", False)))
+        g["turnover_max"] = c3.number_input("换手率上限(%)", value=float(g.get("turnover_max", 15.0)), step=0.1)
+
+        g["volume_ratio_min_enabled"] = c3.checkbox("启用量比下限", value=bool(g.get("volume_ratio_min_enabled", False)))
+        g["volume_ratio_min"] = c3.number_input("量比下限", value=float(g.get("volume_ratio_min", 0.5)), step=0.1)
+        g["volume_ratio_max_enabled"] = c3.checkbox("启用量比上限", value=bool(g.get("volume_ratio_max_enabled", False)))
+        g["volume_ratio_max"] = c3.number_input("量比上限", value=float(g.get("volume_ratio_max", 3.0)), step=0.1)
+
+    with st.expander("D. 五年后视镜（先看长期，再做当前筛选）", expanded=False):
+        st.caption("建议先开这一层做长期体检，再叠加 A/B/C 做当下过滤。")
+        d1, d2, d3 = st.columns(3)
+        d5 = cfg.setdefault("rearview_5y", {})
+
+        d5["revenue_cagr_5y_min_enabled"] = d1.checkbox(
+            "启用营收5年CAGR下限(%)", value=bool(d5.get("revenue_cagr_5y_min_enabled", False))
+        )
+        d5["revenue_cagr_5y_min"] = d1.number_input(
+            "营收5年CAGR下限(%)", value=float(d5.get("revenue_cagr_5y_min", 3.0)), step=0.5
+        )
+        d5["profit_cagr_5y_min_enabled"] = d1.checkbox(
+            "启用净利5年CAGR下限(%)", value=bool(d5.get("profit_cagr_5y_min_enabled", False))
+        )
+        d5["profit_cagr_5y_min"] = d1.number_input(
+            "净利5年CAGR下限(%)", value=float(d5.get("profit_cagr_5y_min", 3.0)), step=0.5
+        )
+
+        d5["roe_avg_5y_min_enabled"] = d2.checkbox(
+            "启用ROE 5年均值下限(%)", value=bool(d5.get("roe_avg_5y_min_enabled", False))
+        )
+        d5["roe_avg_5y_min"] = d2.number_input(
+            "ROE 5年均值下限(%)", value=float(d5.get("roe_avg_5y_min", 8.0)), step=0.5
+        )
+        d5["ocf_positive_years_5y_min_enabled"] = d2.checkbox(
+            "启用经营现金流为正年数下限", value=bool(d5.get("ocf_positive_years_5y_min_enabled", False))
+        )
+        d5["ocf_positive_years_5y_min"] = int(
+            d2.number_input(
+                "经营现金流为正年数下限(0-5)",
+                min_value=0,
+                max_value=5,
+                value=int(d5.get("ocf_positive_years_5y_min", 4)),
+                step=1,
+            )
+        )
+
+        d5["debt_ratio_change_5y_max_enabled"] = d3.checkbox(
+            "启用负债率5年变化上限(百分点)", value=bool(d5.get("debt_ratio_change_5y_max_enabled", False))
+        )
+        d5["debt_ratio_change_5y_max"] = d3.number_input(
+            "负债率5年变化上限(百分点)", value=float(d5.get("debt_ratio_change_5y_max", 8.0)), step=0.5
+        )
+        d5["gross_margin_change_5y_min_enabled"] = d3.checkbox(
+            "启用毛利率5年变化下限(百分点)", value=bool(d5.get("gross_margin_change_5y_min_enabled", False))
+        )
+        d5["gross_margin_change_5y_min"] = d3.number_input(
+            "毛利率5年变化下限(百分点)", value=float(d5.get("gross_margin_change_5y_min", -6.0)), step=0.5
+        )
+
+    st.session_state["flt_cfg"] = cfg
+
+    render_section_intro(
+        "执行与结果",
+        "执行区负责运行筛选逻辑，结果区集中展示样本分布、二段筛选说明和导出能力。",
+        kicker="Execution",
+        pills=("执行筛选", "二段筛选", "结果导出"),
+    )
+    run_col1, run_col2, run_col3 = st.columns([1, 1.4, 2])
+    run_now = run_col1.form_submit_button("执行筛选", type="primary", width="stretch")
+    two_stage = run_col2.checkbox("二段筛选（先 A/B/C，再 D 五年后视镜）", value=True)
+    run_col3.caption("注：部分标的5年数据可能缺失；可通过“缺失数据处理”决定是否直接排除。")
 
 if run_now:
     snap = load_snapshot()
@@ -1081,15 +1218,15 @@ if res:
         data=xlsx_bytes,
         file_name=f"filter_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=True,
+        width="stretch",
     )
 
     tab1, tab2, tab3 = st.tabs(["通过池", "排除池", "缺失项"])
     with tab1:
-        st.dataframe(passed_df[DISPLAY_COLUMNS], use_container_width=True, hide_index=True)
+        st.dataframe(passed_df[DISPLAY_COLUMNS], width="stretch", hide_index=True)
     with tab2:
-        st.dataframe(rejected_df[DISPLAY_COLUMNS], use_container_width=True, hide_index=True)
+        st.dataframe(rejected_df[DISPLAY_COLUMNS], width="stretch", hide_index=True)
     with tab3:
-        st.dataframe(missing_df[DISPLAY_COLUMNS], use_container_width=True, hide_index=True)
+        st.dataframe(missing_df[DISPLAY_COLUMNS], width="stretch", hide_index=True)
 else:
     st.info("请先更新市场快照，然后点击“执行筛选”。")
