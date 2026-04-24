@@ -987,8 +987,13 @@ def render_app_shell(
     version: str,
     badges: Sequence[str] | None = None,
     metrics: Sequence[tuple[str, str]] | None = None,
+    show_hero: bool = True,
 ) -> None:
     meta = _SHELLS.get(active_page, _SHELLS["trading"])
+    if not show_hero:
+        st.markdown(_shell_style(meta, active_page), unsafe_allow_html=True)
+        return
+
     card_metrics = list(metrics or meta.metrics)
     badge_html = "".join(
         f"<span class='qs-badge'>{escape(item)}</span>" for item in (badges or ())

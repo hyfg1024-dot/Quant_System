@@ -19,3 +19,7 @@ apps/backtest/paper_trades/
 **/apps/filter/data/cache/
 **/apps/filter/data/filter_templates.json
 **/apps/filter/data/manual_flags.json
+# local data safety backups / private runtime assets
+backups/
+data/backups/
+*.restore_tmp

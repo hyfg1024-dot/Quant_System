@@ -1390,7 +1390,7 @@ class PaperTrader:
                         today_return = equity / prev_eq - 1.0
 
             initial_capital = self._safe_float(state.get("initial_capital_hkd", np.nan))
-            if not np.isfinite(cum_return) and np.isfinite(equity) and np.isfinite(initial_capital) and initial_capital != 0:
+            if np.isfinite(equity) and np.isfinite(initial_capital) and initial_capital != 0:
                 cum_return = equity / initial_capital - 1.0
 
             positions = self._build_position_rows(state=state, meta=meta, universe_name_map=universe_name_map)

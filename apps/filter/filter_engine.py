@@ -19,11 +19,18 @@ import pandas as pd
 import requests
 
 CURRENT_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = CURRENT_DIR.parent.parent
 FUNDAMENTAL_DIR = CURRENT_DIR.parent / "fundamental"
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 if str(FUNDAMENTAL_DIR) not in sys.path:
     sys.path.insert(0, str(FUNDAMENTAL_DIR))
 
 from fundamental_engine import analyze_fundamental
+try:
+    from shared.backup_manager import create_backup as create_data_backup
+except Exception:  # pragma: no cover - backup guard must never block data refresh
+    create_data_backup = None  # type: ignore[assignment]
 
 APP_VERSION = "FLT-20260423-07"
 DATA_DIR = CURRENT_DIR / "data"
@@ -2159,6 +2166,15 @@ def _log_snapshot_run(
         conn.commit()
 
 
+def _replace_table_with_df(conn: sqlite3.Connection, table_name: str, df: pd.DataFrame) -> None:
+    """Replace a SQLite table without relying on pandas' fragile DROP TABLE path."""
+    safe_name = _safe_str(table_name)
+    if not safe_name.replace("_", "").isalnum():
+        raise RuntimeError(f"非法表名: {safe_name}")
+    conn.execute(f'DROP TABLE IF EXISTS "{safe_name}"')
+    df.to_sql(safe_name, conn, if_exists="fail", index=False)
+
+
 def _backup_current_snapshot(conn: sqlite3.Connection) -> Dict[str, Any]:
     try:
         current_df = pd.read_sql_query("SELECT * FROM market_snapshot", conn)
@@ -2169,7 +2185,7 @@ def _backup_current_snapshot(conn: sqlite3.Connection) -> Dict[str, Any]:
     backup_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     backup_df = current_df.copy()
     backup_df["backup_at"] = backup_at
-    backup_df.to_sql("market_snapshot_backup", conn, if_exists="replace", index=False)
+    _replace_table_with_df(conn, "market_snapshot_backup", backup_df)
     return {"backed_up": True, "row_count": int(len(backup_df)), "backup_at": backup_at}
 
 
@@ -2204,7 +2220,7 @@ def _merge_scope_snapshot(
 
 def _replace_market_snapshot_atomically(conn: sqlite3.Connection, save_df: pd.DataFrame) -> None:
     staging_table = "market_snapshot_staging"
-    save_df.to_sql(staging_table, conn, if_exists="replace", index=False)
+    _replace_table_with_df(conn, staging_table, save_df)
     staged_count = conn.execute(f"SELECT COUNT(*) FROM {staging_table}").fetchone()[0]
     if int(staged_count or 0) <= 0:
         raise RuntimeError("staging 快照为空，已取消覆盖主表")
@@ -2333,6 +2349,18 @@ def refresh_market_snapshot(
     enrich_mode = "rotate" if rotate_enrich else "top"
     if only_missing_enrich:
         enrich_mode = f"{enrich_mode}_missing"
+
+    data_backup_id = ""
+    if create_data_backup is not None:
+        try:
+            backup_manifest = create_data_backup(
+                reason=f"before_refresh_market_snapshot:{scope}:{segment_key}:{enrich_mode}",
+                asset_keys=("filter_market_db", "filter_templates", "manual_flags"),
+                max_keep=30,
+            )
+            data_backup_id = _safe_str(backup_manifest.get("backup_id"))
+        except Exception:
+            data_backup_id = ""
 
     local_snapshot_first = bool(scope in {"A", "HK"} and only_missing_enrich and not force_refresh)
     if local_snapshot_first:
@@ -2715,6 +2743,7 @@ def refresh_market_snapshot(
         "source_summary": source_summary,
         "backup_at": _safe_str(backup_info.get("backup_at", "")),
         "backup_row_count": int(backup_info.get("row_count", 0) or 0),
+        "data_backup_id": data_backup_id,
     }
 
 

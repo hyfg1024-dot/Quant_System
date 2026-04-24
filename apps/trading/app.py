@@ -23,6 +23,7 @@ import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
+import streamlit.components.v1 as st_components
 import yaml
 
 OPENAI_AVAILABLE = True
@@ -30,10 +31,8 @@ OPENAI_IMPORT_ERROR = None
 
 
 def html(body: str, *, height: int | None = None, scrolling: bool = False) -> None:
-    if height:
-        overflow = "auto" if scrolling else "hidden"
-        body = f"<div style='height:{int(height)}px;overflow:{overflow};'>{body}</div>"
-    st.html(body, unsafe_allow_javascript=True, width="stretch")
+    # components.html still executes the dashboard JavaScript; st.html renders static HTML only.
+    st_components.html(body, height=height or 600, scrolling=scrolling)
 
 
 try:
@@ -121,6 +120,7 @@ from apps.backtest.src.paper_trader import PaperTrader
 from apps.backtest.src.config_loader import ConfigError as BacktestConfigError
 from apps.backtest.src.config_loader import load_strategy as backtest_load_strategy
 from apps.backtest.src.config_loader import load_universe as backtest_load_universe
+from shared.data_vault_ui import render_data_vault_panel
 from shared.multi_agent_analyzer import MultiAgentAnalyzer
 from shared.ui_shell import render_app_shell, render_section_intro, render_status_row, render_top_nav
 
@@ -822,6 +822,7 @@ render_app_shell(
             ("工作流", "盘口 -> 研判 -> 决策"),
         ),
     ),
+    show_hero=_active_page != "filter",
 )
 
 rows = get_latest_fundamental_snapshot()
@@ -1926,15 +1927,16 @@ def _flt_render_hk_segment_tile(
     selected_now = row_key in set(current_selected)
     health = _flt_hk_segment_health(row)
     value = col.checkbox(
-        f"{_safe_str(row.get('label'))}｜{health['label']}｜{health['coverage_pct']:.0f}%",
+        f"{_safe_str(row.get('label'))}（{total_count}）",
         value=selected_now,
         key=f"{key_prefix}_seg_check_{row_key}",
     )
     col.markdown(
-        f"<div style='margin-top:-0.35rem;font-size:0.76rem;color:rgba(234,240,245,0.58);"
-        f"white-space:nowrap;overflow:hidden;text-overflow:ellipsis;'>"
-        f"<span style='color:{health['color']};font-weight:800'>{health['label']}</span>"
-        f" · 可筛 {health['covered']}/{total_count} · 缺 {health['missing']} · {health['recent']}"
+        f"<div style='margin:-0.42rem 0 0.95rem 2.05rem;"
+        f"font-size:0.74rem;line-height:1.35;color:rgba(234,240,245,0.58);'>"
+        f"<span style='color:{health['color']};font-weight:900'>{health['label']}</span>"
+        f"<span style='opacity:.65'> / 覆盖 {health['coverage_pct']:.0f}%</span><br/>"
+        f"<span>可筛 {health['covered']}/{total_count} · 缺 {health['missing']} · {health['recent']}</span>"
         f"</div>",
         unsafe_allow_html=True,
     )
@@ -2370,24 +2372,27 @@ def _render_filter_market_ops_tab(scope: str, *, key_prefix: str) -> None:
             st.markdown("<div style='height:0.6rem'></div>", unsafe_allow_html=True)
 
         if scope == "HK":
-            chosen_now: list[str] = []
             with st.form(f"{key_prefix}_hk_segment_select_form", border=False):
-                for start in range(0, len(segment_rows), 5):
-                    cols = st.columns(5)
-                    for col, row in zip(cols, segment_rows[start : start + 5]):
-                        row_key = str(row.get("key"))
-                        if _flt_render_hk_segment_tile(
+                for start in range(0, len(segment_rows), 4):
+                    cols = st.columns(4)
+                    for col, row in zip(cols, segment_rows[start : start + 4]):
+                        _flt_render_hk_segment_tile(
                             col,
                             row,
                             key_prefix=key_prefix,
                             selected_key=f"{key_prefix}_hk_selected_segments",
-                        ):
-                            chosen_now.append(row_key)
+                        )
                 if st.form_submit_button("深补勾选板块", type="primary", width="stretch"):
+                    chosen_now = [
+                        str(row.get("key"))
+                        for row in segment_rows
+                        if bool(st.session_state.get(f"{key_prefix}_seg_check_{row.get('key')}", False))
+                    ]
                     st.session_state[selected_key] = chosen_now
                     if not chosen_now:
                         st.warning("请先勾选至少一个港股板块。")
                         return
+                    st.info(f"准备深补：{', '.join([_safe_str(row_map[k].get('label')) for k in chosen_now if k in row_map])}")
                     for segment_key in chosen_now:
                         row = row_map.get(str(segment_key))
                         if not row:
@@ -2421,33 +2426,47 @@ def _render_filter_market_ops_tab(scope: str, *, key_prefix: str) -> None:
 
 
 def _render_filter_ops_panel() -> None:
-    tab_a, tab_hk, tab_all = st.tabs(["A股", "港股", "总览"])
-    with tab_a:
+    ops_view = st.radio(
+        "运维视图",
+        options=["A股", "港股", "总览"],
+        horizontal=True,
+        label_visibility="collapsed",
+        key="flt_ops_panel_view",
+    )
+    if ops_view == "A股":
         _render_filter_market_ops_tab("A", key_prefix="flt_ops_a")
-    with tab_hk:
+    elif ops_view == "港股":
         _render_filter_market_ops_tab("HK", key_prefix="flt_ops_hk")
-    with tab_all:
+    else:
+        governance = filter_get_enrichment_governance_summary("ALL")
         report = filter_get_snapshot_health_report(days=7, top_n=20)
         backup_status = filter_get_snapshot_backup_status()
-        qc = report.get("quality_counts", {})
-        total = int(report.get("total", 0) or 0)
+        coverage = governance.get("coverage", {}) if isinstance(governance, dict) else {}
+        completeness = governance.get("completeness", {}) if isinstance(governance, dict) else {}
+        total = int(governance.get("total", 0) or 0)
+        covered = int(coverage.get("covered", 0) or 0)
+        missing = int(coverage.get("missing", 0) or 0)
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("总样本", total)
-        m2.metric("full", int(qc.get("full", 0) or 0))
-        m3.metric("partial", int(qc.get("partial", 0) or 0))
-        m4.metric("missing", int(qc.get("missing", 0) or 0))
-        coverage_ratio = float(report.get("coverage_ratio", 0.0) or 0.0)
-        st.progress(coverage_ratio, text=f"覆盖率 {coverage_ratio * 100:.1f}%")
+        m2.metric("已覆盖", covered)
+        m3.metric("部分/稀疏", int(completeness.get("partial", 0) or 0) + int(completeness.get("sparse", 0) or 0))
+        m4.metric("缺失", missing)
+        coverage_ratio = float(governance.get("coverage_ratio", 0.0) or 0.0)
+        st.progress(coverage_ratio, text=f"深补覆盖率 {coverage_ratio * 100:.1f}%")
+        _flt_render_governance_cards(governance)
 
-        diag_xlsx = filter_export_snapshot_health_excel(days=30, top_n=50)
         action_col1, action_col2 = st.columns(2)
-        action_col1.download_button(
-            "导出体检报告（Excel）",
-            data=diag_xlsx,
-            file_name=f"filter_health_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            key="flt_ops_export_health",
-        )
+        if action_col1.button("生成体检报告（Excel）", width="stretch", key="flt_ops_generate_health_xlsx"):
+            st.session_state["flt_ops_health_xlsx"] = filter_export_snapshot_health_excel(days=30, top_n=50)
+            st.session_state["flt_ops_health_xlsx_name"] = f"filter_health_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        if st.session_state.get("flt_ops_health_xlsx"):
+            action_col1.download_button(
+                "下载体检报告（Excel）",
+                data=st.session_state["flt_ops_health_xlsx"],
+                file_name=st.session_state.get("flt_ops_health_xlsx_name", "filter_health_report.xlsx"),
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="flt_ops_download_health_xlsx",
+            )
         if action_col2.button("从备份恢复快照", width="stretch", disabled=not bool(backup_status.get("exists")), key="flt_ops_restore_backup"):
             try:
                 restored = filter_restore_snapshot_from_backup()
@@ -2466,6 +2485,8 @@ def _render_filter_ops_panel() -> None:
         else:
             st.caption("当前没有可恢复的快照备份。")
 
+        render_data_vault_panel(key_prefix="trading_filter_ops_vault")
+
         with st.expander("查看体检详情", expanded=False):
             st.dataframe(report.get("trend_df", pd.DataFrame()), width="stretch", hide_index=True)
             st.dataframe(report.get("runs_df", pd.DataFrame()), width="stretch", hide_index=True)
@@ -2479,7 +2500,7 @@ def _render_filter_page():
     overall = _flt_all_market_snapshot_summary()
     render_section_intro(
         "数据运维台",
-        "统一处理更新、周更与体检。点击下方按钮即可展开运维区；不展开时保持页面简洁。",
+        "默认收起，避免首次进入页面加载过重；需要维护快照、深补、备份与数据体检时再手动打开。",
         kicker="Workflow",
         pills=("A+H更新", "周更", "体检", "导出"),
     )
@@ -2510,9 +2531,11 @@ def _render_filter_page():
     if bool(st.session_state.get("flt_show_ops_panel", False)):
         _render_filter_ops_panel()
         st.markdown("---")
+    else:
+        st.caption("数据运维台已收起，需要维护数据时点击上方按钮打开。")
 
     render_section_intro(
-        "条件矩阵",
+        "筛选矩阵",
         "筛选条件被拆成四层，从硬排除到五年后视镜，帮助你先做风险清洗，再做估值与长期验证。",
         kicker="Configuration",
         pills=("A 硬排除", "B 估值质量", "C 行业规模", "D 五年后视镜"),
@@ -2580,7 +2603,7 @@ def _render_filter_page():
     with st.form("flt_condition_form", clear_on_submit=False):
         st.subheader("筛选条件（支持手动开关，像电商筛选一样）")
 
-        with st.expander("A. 财务健康度与硬排除", expanded=True):
+        with st.expander("A. 财务健康度与硬排除", expanded=False):
             c1, c2, c3 = st.columns(3)
             cfg["missing_policy"] = c1.selectbox("缺失数据处理", options=["ignore", "exclude"], index=0 if cfg.get("missing_policy") == "ignore" else 1)
 
@@ -2600,7 +2623,7 @@ def _render_filter_page():
             q["asset_liability_max_enabled"] = c3.checkbox("启用资产负债率上限(%)", value=bool(q.get("asset_liability_max_enabled", False)))
             q["asset_liability_max"] = c3.number_input("资产负债率上限(%)", value=float(q.get("asset_liability_max", 80.0)), step=1.0)
 
-        with st.expander("B. 估值与质量", expanded=True):
+        with st.expander("B. 估值与质量", expanded=False):
             c1, c2, c3 = st.columns(3)
             q = cfg["quality"]
             v = cfg["valuation"]
@@ -2626,7 +2649,7 @@ def _render_filter_page():
             v["pb_max_enabled"] = c3.checkbox("启用 PB 上限", value=bool(v.get("pb_max_enabled", False)))
             v["pb_max"] = c3.number_input("PB 上限", value=float(v.get("pb_max", 3.0)), step=0.1)
 
-        with st.expander("C. 行业、分红、流动性与规模", expanded=True):
+        with st.expander("C. 行业、分红、流动性与规模", expanded=False):
             c1, c2, c3 = st.columns(3)
             r = cfg["risk"]
             v = cfg["valuation"]
@@ -3598,7 +3621,12 @@ def _render_paper_page():
         else:
             try:
                 dash_mtime = BACKTEST_PAPER_DASHBOARD.stat().st_mtime
-                watched = [BACKTEST_PAPER_ACTIVE, *strategy_paths]
+                watched = [
+                    BACKTEST_PAPER_ACTIVE,
+                    BACKTEST_PAPER_RUNNER,
+                    BACKTEST_DIR / "src" / "paper_trader.py",
+                    *strategy_paths,
+                ]
                 for p in watched:
                     if p.exists() and p.stat().st_mtime > dash_mtime:
                         need_sync = True
