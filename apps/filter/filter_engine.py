@@ -2353,7 +2353,10 @@ def refresh_market_snapshot(
         enrich_mode = f"{enrich_mode}_missing"
 
     data_backup_id = ""
-    if create_data_backup is not None:
+    if create_data_backup is None:
+        if safe_mode:
+            raise RuntimeError("数据恢复点模块不可用，已阻止批量写入。请检查 shared.backup_manager。")
+    else:
         try:
             backup_manifest = create_data_backup(
                 reason=f"before_refresh_market_snapshot:{scope}:{segment_key}:{enrich_mode}",
@@ -2361,7 +2364,9 @@ def refresh_market_snapshot(
                 max_keep=30,
             )
             data_backup_id = _safe_str(backup_manifest.get("backup_id"))
-        except Exception:
+        except Exception as exc:
+            if safe_mode:
+                raise RuntimeError(f"数据恢复点创建失败，已阻止批量写入：{exc}") from exc
             data_backup_id = ""
 
     local_snapshot_first = bool(scope in {"A", "HK"} and only_missing_enrich and not force_refresh)

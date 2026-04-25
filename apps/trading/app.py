@@ -23,16 +23,47 @@ import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
-import streamlit.components.v1 as st_components
 import yaml
 
 OPENAI_AVAILABLE = True
 OPENAI_IMPORT_ERROR = None
 
 
+def _prune_iframe_cache(cache_dir: Path, *, keep: int = 64, max_age_seconds: int = 7 * 86400) -> None:
+    try:
+        files = sorted(
+            [p for p in cache_dir.glob("widget_*.html") if p.is_file()],
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        now = pytime.time()
+        for idx, path in enumerate(files):
+            try:
+                too_many = idx >= keep
+                too_old = now - path.stat().st_mtime > max_age_seconds
+                if too_many or too_old:
+                    path.unlink(missing_ok=True)
+            except Exception:
+                continue
+    except Exception:
+        return
+
+
 def html(body: str, *, height: int | None = None, scrolling: bool = False) -> None:
-    # components.html still executes the dashboard JavaScript; st.html renders static HTML only.
-    st_components.html(body, height=height or 600, scrolling=scrolling)
+    # st.components.v1.html is deprecated. st.iframe preserves JS dashboards by
+    # serving the HTML as a temporary local document instead of inlining it.
+    try:
+        html_dir = Path(tempfile.gettempdir()) / "quant_system_streamlit_iframes"
+        html_dir.mkdir(parents=True, exist_ok=True)
+        digest = hashlib.sha256(body.encode("utf-8", errors="ignore")).hexdigest()[:16]
+        html_path = html_dir / f"widget_{digest}.html"
+        if not html_path.exists() or html_path.read_text(encoding="utf-8") != body:
+            html_path.write_text(body, encoding="utf-8")
+        _prune_iframe_cache(html_dir)
+        st.iframe(html_path, width="stretch", height=height or 600)
+    except Exception:
+        # Fallback keeps the UI usable if a future Streamlit build changes iframe path handling.
+        st.html(body, width="stretch", unsafe_allow_javascript=True)
 
 
 try:
