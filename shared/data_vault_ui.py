@@ -5,10 +5,12 @@ import streamlit as st
 
 from shared.backup_manager import (
     create_backup,
+    delete_backup,
     format_bytes,
     get_local_data_asset_status,
     list_backups,
     restore_backup,
+    update_backup_note,
 )
 
 _STATUS_COLOR = {
@@ -116,9 +118,16 @@ def render_data_vault_panel(*, key_prefix: str = "data_vault") -> None:
 
     st.markdown("##### 备份操作")
     b1, b2 = st.columns([1, 2], vertical_alignment="bottom")
+    backup_note = b2.text_input(
+        "备份备注",
+        value="manual_data_vault",
+        placeholder="例如：A/H 深补完成后的手动恢复点",
+        key=f"{key_prefix}_create_note",
+    )
     if b1.button("立即创建完整备份", type="primary", width="stretch", key=f"{key_prefix}_create"):
         try:
-            manifest = create_backup(reason="manual_data_vault", max_keep=30)
+            note_text = backup_note.strip() or "manual_data_vault"
+            manifest = create_backup(reason=note_text, note=note_text, max_keep=30)
             st.success(f"已创建恢复点：{manifest.get('backup_id')}")
             st.rerun()
         except Exception as exc:
@@ -139,12 +148,55 @@ def render_data_vault_panel(*, key_prefix: str = "data_vault") -> None:
             {
                 "备份ID": bid,
                 "创建时间": item.get("created_at", ""),
-                "原因": item.get("reason", ""),
+                "备注": item.get("note", "") or item.get("reason", ""),
                 "资产数": item.get("asset_count", 0),
                 "大小": format_bytes(item.get("total_size", 0)),
             }
         )
     st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+
+    with st.expander("管理备份备注 / 删除", expanded=False):
+        selected_manage = st.selectbox("选择备份", options=labels, key=f"{key_prefix}_manage_backup")
+        selected_item = next((item for item in backups if str(item.get("backup_id", "")) == selected_manage), {})
+        st.caption(
+            "当前选择："
+            f"{selected_manage} | {selected_item.get('created_at', '--')} | "
+            f"{format_bytes(selected_item.get('total_size', 0))}"
+        )
+        manage_note = st.text_area(
+            "备注",
+            value=str(selected_item.get("note", "") or selected_item.get("reason", "")),
+            height=90,
+            key=f"{key_prefix}_manage_note_{selected_manage}",
+        )
+        c1, c2 = st.columns([1, 1], vertical_alignment="bottom")
+        if c1.button("保存备注", width="stretch", key=f"{key_prefix}_save_note"):
+            try:
+                update_backup_note(selected_manage, manage_note)
+                st.success(f"已更新备份备注：{selected_manage}")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"备注保存失败：{exc}")
+
+        c2.warning("删除只移除这个恢复点，不影响当前数据库。")
+        delete_confirm = st.text_input(
+            "输入 DELETE 确认删除",
+            value="",
+            key=f"{key_prefix}_delete_confirm_{selected_manage}",
+        )
+        delete_ready = delete_confirm.strip().upper() == "DELETE"
+        if st.button(
+            "确认删除选中备份" if delete_ready else "先输入 DELETE 才能删除",
+            width="stretch",
+            disabled=not delete_ready,
+            key=f"{key_prefix}_delete_backup",
+        ):
+            try:
+                deleted = delete_backup(selected_manage)
+                st.success(f"已删除备份 {selected_manage}，释放 {format_bytes(deleted.get('size', 0))}。")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"删除失败：{exc}")
 
     with st.expander("从备份恢复（危险操作）", expanded=False):
         selected = st.selectbox("选择备份", options=labels, key=f"{key_prefix}_selected_backup")

@@ -29,8 +29,10 @@ if str(FUNDAMENTAL_DIR) not in sys.path:
 from fundamental_engine import analyze_fundamental
 try:
     from shared.backup_manager import create_backup as create_data_backup
+    from shared.backup_manager import delete_backup as delete_data_backup
 except Exception:  # pragma: no cover - backup guard must never block data refresh
     create_data_backup = None  # type: ignore[assignment]
+    delete_data_backup = None  # type: ignore[assignment]
 
 APP_VERSION = "FLT-20260423-07"
 DATA_DIR = CURRENT_DIR / "data"
@@ -2724,6 +2726,14 @@ def refresh_market_snapshot(
         enrich_mode=enrich_mode,
     )
 
+    data_backup_deleted = False
+    if data_backup_id and delete_data_backup is not None:
+        try:
+            delete_data_backup(data_backup_id)
+            data_backup_deleted = True
+        except Exception:
+            data_backup_deleted = False
+
     return {
         "row_count": len(save_df),
         "enriched_count": enrich_n,
@@ -2744,6 +2754,7 @@ def refresh_market_snapshot(
         "backup_at": _safe_str(backup_info.get("backup_at", "")),
         "backup_row_count": int(backup_info.get("row_count", 0) or 0),
         "data_backup_id": data_backup_id,
+        "data_backup_deleted": data_backup_deleted,
     }
 
 

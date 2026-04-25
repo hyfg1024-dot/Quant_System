@@ -39,6 +39,22 @@ def _safe_reason(reason: str) -> str:
     return text[:120] if text else "manual"
 
 
+def _safe_note(note: str) -> str:
+    text = str(note or "").strip()
+    return text[:300]
+
+
+def _backup_dir_for_id(backup_id: str) -> tuple[str, Path]:
+    bid = str(backup_id or "").strip()
+    if not bid:
+        raise ValueError("backup_id 不能为空")
+    root = BACKUP_ROOT.resolve()
+    backup_dir = (root / bid).resolve()
+    if backup_dir.parent != root:
+        raise ValueError("非法备份路径，拒绝操作")
+    return bid, backup_dir
+
+
 def _asset_map() -> dict[str, dict[str, str]]:
     return {item["key"]: item for item in DEFAULT_ASSETS}
 
@@ -99,6 +115,7 @@ def _copy_dir(src: Path, dst: Path) -> tuple[int, int]:
 def create_backup(
     reason: str = "manual",
     *,
+    note: str = "",
     asset_keys: Iterable[str] | None = None,
     max_keep: int = 30,
 ) -> dict[str, Any]:
@@ -119,6 +136,7 @@ def create_backup(
         "backup_id": bid,
         "created_at": _now_text(),
         "reason": _safe_reason(reason),
+        "note": _safe_note(note),
         "project_root": str(PROJECT_ROOT),
         "assets": [],
         "schema_version": 1,
@@ -163,6 +181,7 @@ def list_backups(limit: int | None = None) -> list[dict[str, Any]]:
             row["backup_dir"] = str(manifest_path.parent)
             row["asset_count"] = sum(1 for item in row.get("assets", []) if item.get("exists"))
             row["total_size"] = sum(int(item.get("size", 0) or 0) for item in row.get("assets", []))
+            row["note"] = _safe_note(row.get("note", "")) or _safe_reason(row.get("reason", ""))
             rows.append(row)
         except Exception:
             continue
@@ -188,10 +207,8 @@ def restore_backup(
     asset_keys: Iterable[str] | None = None,
     create_restore_point: bool = True,
 ) -> dict[str, Any]:
-    bid = str(backup_id or "").strip()
-    if not bid:
-        raise ValueError("backup_id 不能为空")
-    manifest_path = BACKUP_ROOT / bid / "manifest.json"
+    bid, backup_dir = _backup_dir_for_id(backup_id)
+    manifest_path = backup_dir / "manifest.json"
     if not manifest_path.exists():
         raise FileNotFoundError(f"找不到备份: {bid}")
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -208,7 +225,7 @@ def restore_backup(
         rel_path = str(asset.get("path", ""))
         if not rel_path:
             continue
-        src = BACKUP_ROOT / bid / "payload" / rel_path
+        src = backup_dir / "payload" / rel_path
         dst = PROJECT_ROOT / rel_path
         if not src.exists():
             continue
@@ -226,6 +243,32 @@ def restore_backup(
                 shutil.copy2(fp, target)
         restored.append({"key": asset.get("key"), "path": rel_path, "type": asset.get("type")})
     return {"backup_id": bid, "restored_at": _now_text(), "restored": restored}
+
+
+def update_backup_note(backup_id: str, note: str) -> dict[str, Any]:
+    bid, backup_dir = _backup_dir_for_id(backup_id)
+    manifest_path = backup_dir / "manifest.json"
+    if not manifest_path.exists():
+        raise FileNotFoundError(f"找不到备份: {bid}")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["note"] = _safe_note(note)
+    manifest["note_updated_at"] = _now_text()
+    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    return {"backup_id": bid, "note": manifest["note"], "note_updated_at": manifest["note_updated_at"]}
+
+
+def delete_backup(backup_id: str) -> dict[str, Any]:
+    bid, backup_dir = _backup_dir_for_id(backup_id)
+    if not backup_dir.exists():
+        raise FileNotFoundError(f"找不到备份: {bid}")
+    if not backup_dir.is_dir():
+        raise ValueError("非法备份路径，拒绝删除")
+    manifest_path = backup_dir / "manifest.json"
+    if not manifest_path.exists():
+        raise FileNotFoundError(f"备份清单缺失，拒绝删除: {bid}")
+    size = sum(int(item.get("size", 0) or 0) for item in json.loads(manifest_path.read_text(encoding="utf-8")).get("assets", []))
+    shutil.rmtree(backup_dir)
+    return {"backup_id": bid, "deleted_at": _now_text(), "size": size}
 
 
 def prune_backups(max_keep: int = 30) -> int:
