@@ -1,5 +1,8 @@
+from __future__ import annotations
+
 import base64
 import asyncio
+import concurrent.futures
 import copy
 import hashlib
 import json
@@ -88,7 +91,7 @@ except Exception as _exc:  # pragma: no cover - 依赖缺失时兜底
     class RateLimitError(Exception):
         pass
 
-from fast_engine import fetch_fast_panel, fetch_realtime_quotes_batch
+from fast_engine import fetch_fast_panel, fetch_realtime_panel, fetch_realtime_quotes_batch
 from slow_engine import (
     add_stock_by_query,
     fetch_live_valuation_snapshot,
@@ -97,7 +100,7 @@ from slow_engine import (
     get_stock_group_map,
     init_db,
     remove_stock_from_pool,
-    update_fundamental_data,
+    seed_fundamental_from_local_filter,
 )
 
 CURRENT_DIR = Path(__file__).resolve().parent
@@ -700,19 +703,25 @@ if "flt_show_ops_panel" not in st.session_state:
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("股票池管理")
-new_query = st.sidebar.text_input(
-    "新增股票（代码或名称）", value="", placeholder="例如 600036 / 00700 / 腾讯控股"
-)
-
-add_cols = st.sidebar.columns(2)
-add_holding = add_cols[0].button("加入持仓", width="stretch")
-add_watch = add_cols[1].button("加入观察", width="stretch")
+with st.sidebar.form("tr_stock_pool_add_form", clear_on_submit=True):
+    new_query = st.text_input(
+        "新增股票（代码或名称）", value="", placeholder="例如 600036 / 00700 / 腾讯控股"
+    )
+    add_cols = st.columns(2)
+    add_holding = add_cols[0].form_submit_button("加入持仓", width="stretch")
+    add_watch = add_cols[1].form_submit_button("加入观察", width="stretch")
 if add_holding or add_watch:
     pool_group = "holding" if add_holding else "watch"
     group_text = "持仓" if pool_group == "holding" else "观察"
     try:
         code, name = add_stock_by_query(new_query, pool_group=pool_group)
-        update_fundamental_data([(code, name, pool_group)])
+        seed_fundamental_from_local_filter(code, name)
+        st.session_state["fast_selected_code"] = code
+        st.session_state["fast_selected_name"] = name
+        st.session_state["fast_recently_added_code"] = code
+        st.session_state["fast_auto_fetch_after_add"] = True
+        st.session_state["fast_refresh_message"] = f"正在获取 {name} ({code}) 的实时盘口..."
+        st.session_state.pop(f"fast_panel_cache_{code}", None)
         st.sidebar.success(f"已加入{group_text}: {code} - {name}")
         st.rerun()
     except Exception as exc:
@@ -4323,7 +4332,8 @@ auto_refresh_sec = header_cols[2].selectbox(
     index=2,
     key="fast_auto_refresh_sec",
 )
-if header_cols[3].button("立即刷新", width="stretch", disabled=not market_open_for_ctrl):
+if header_cols[3].button("立即刷新", width="stretch"):
+    st.session_state["fast_force_refresh"] = True
     st.rerun()
 render_section_intro(
     "标的工作台",
@@ -4347,11 +4357,16 @@ watch_rows = [r for r in rows if group_map.get(str(r["code"]), "watch") != "hold
 all_pool_codes = [str(r.get("code", "")).strip() for r in rows if str(r.get("code", "")).strip()]
 pool_quote_cache = st.session_state.get("fast_pool_quote_cache", {})
 pool_quote_latency_ms = float(st.session_state.get("fast_pool_quote_latency_ms", 0.0) or 0.0)
-should_refresh_pool_quote = bool(auto_refresh_on and market_open_for_ctrl)
-if (not isinstance(pool_quote_cache, dict)) or should_refresh_pool_quote or (not pool_quote_cache):
+force_refresh_requested = bool(st.session_state.get("fast_force_refresh", False))
+should_refresh_pool_quote = bool((auto_refresh_on and market_open_for_ctrl) or force_refresh_requested)
+if should_refresh_pool_quote:
     t0_pool = pytime.perf_counter()
     try:
-        pool_quote_cache = fetch_realtime_quotes_batch(all_pool_codes, timeout_sec=1.0)
+        pool_quote_cache = fetch_realtime_quotes_batch(
+            all_pool_codes,
+            timeout_sec=0.8,
+            fallback_to_provider=False,
+        )
         st.session_state["fast_pool_quote_cache"] = pool_quote_cache
         pool_quote_latency_ms = (pytime.perf_counter() - t0_pool) * 1000.0
         st.session_state["fast_pool_quote_latency_ms"] = pool_quote_latency_ms
@@ -4437,6 +4452,79 @@ with group_cols[2]:
     st.markdown('<div class="group-title">观察</div>', unsafe_allow_html=True)
     _render_stock_group(watch_rows, "watch")
 
+
+def _empty_order_book(levels: int = 10) -> dict:
+    return {
+        "buy": [{"level": i + 1, "price": None, "volume_lot": None} for i in range(levels)],
+        "sell": [{"level": i + 1, "price": None, "volume_lot": None} for i in range(levels)],
+    }
+
+
+def _empty_indicators() -> dict:
+    return {
+        "macd_hist": None,
+        "rsi6": None,
+        "rsi12": None,
+        "rsi24": None,
+        "ma5": None,
+        "ma10": None,
+        "ma20": None,
+        "ma60": None,
+        "boll_mid": None,
+        "boll_upper": None,
+        "boll_lower": None,
+        "boll_pct_b": None,
+        "boll_bandwidth": None,
+    }
+
+
+def _build_local_fast_panel(symbol: str, name: str, reason: str = "本地快速模式：未主动联网刷新") -> dict:
+    normalized = str(symbol).strip()
+    order_book_10 = _empty_order_book(10)
+    return {
+        "symbol": normalized,
+        "quote": {
+            "symbol": normalized,
+            "name": name or normalized,
+            "current_price": None,
+            "prev_close": None,
+            "open": None,
+            "change_amount": None,
+            "change_pct": None,
+            "high": None,
+            "low": None,
+            "volume": None,
+            "amount": None,
+            "turnover_rate": None,
+            "turnover_rate_estimated": False,
+            "amplitude_pct": None,
+            "float_market_value_yi": None,
+            "total_market_value_yi": None,
+            "volume_ratio": None,
+            "order_diff": None,
+            "vwap": None,
+            "premium_pct": None,
+            "quote_time": None,
+            "is_trading_data": False,
+            "pe_dynamic": None,
+            "pe_ttm": None,
+            "pb": None,
+            "order_book_5": {"buy": [], "sell": []},
+            "order_book_10": order_book_10,
+            "error": None,
+        },
+        "indicators": _empty_indicators(),
+        "intraday": pd.DataFrame(columns=["time", "price", "volume_lot", "amount"]),
+        "order_book_5": {"buy": [], "sell": []},
+        "order_book_10": order_book_10,
+        "rsi_multi": {},
+        "tf_indicators": {},
+        "depth_note": reason,
+        "error": reason,
+        "local_only": True,
+    }
+
+
 def _render_fast_panel(selected_code: str, selected_name: str, panel=None):
     if panel is None:
         panel = fetch_fast_panel(selected_code)
@@ -4446,11 +4534,10 @@ def _render_fast_panel(selected_code: str, selected_name: str, panel=None):
     order_book_5 = panel["order_book_5"]
 
     if panel.get("error") and not quote.get("current_price"):
-        st.warning(f"快引擎数据拉取失败: {panel['error']}")
-        return
+        st.caption(str(panel["error"]))
 
     selected_slow = next((r for r in rows if str(r.get("code")) == str(selected_code)), {})
-    live_val = fetch_live_valuation_snapshot(selected_code)
+    live_val = {} if (panel.get("local_only") or panel.get("realtime_only")) else fetch_live_valuation_snapshot(selected_code)
     quote_pe_dynamic = quote.get("pe_dynamic")
     quote_pb = quote.get("pb")
     quote_pe_ttm = quote.get("pe_ttm")
@@ -4587,6 +4674,19 @@ def _render_fast_panel(selected_code: str, selected_name: str, panel=None):
                 unsafe_allow_html=True,
             )
             st.caption(f"更新时间: {q_time if q_time else 'N/A'}")
+    else:
+        with head_left:
+            st.markdown(
+                f"""
+                <div class="fast-head-title">{selected_name} ({selected_code})</div>
+                <div class="fast-price-line">
+                    <span class="price-num">--</span>
+                    <span class="chg-num">本地快照</span>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+            st.caption("点击“立即刷新”获取实时盘口。")
     with head_right:
         copy_slot = st.container()
 
@@ -4924,45 +5024,53 @@ def _render_fast_panel(selected_code: str, selected_name: str, panel=None):
         )
     )
 
-    export_payload = {
-        "meta": {
-            "generated_at": datetime.now().isoformat(timespec="seconds"),
-            "app": "Quant",
-            "analysis_user": (st.session_state.get("deepseek_user_input", "") or "").strip(),
-        },
-        "stock": {"code": selected_code, "name": selected_name},
-        "slow_engine": selected_slow,
-        "fast_engine": {
-            "quote": quote,
-            "indicators": ind,
-            "rsi_multi": panel.get("rsi_multi", {}),
-            "tf_indicators": panel.get("tf_indicators", {}),
-            "order_book_5": order_book_5,
-            "intraday": intraday_df,
-            "depth_note": panel.get("depth_note"),
-            "error": panel.get("error"),
-            "compact_metrics": fast_compact_metrics,
-            "cards_snapshot": cards_snapshot,
-        },
-    }
-    export_json = json.dumps(_json_safe(export_payload), ensure_ascii=False, indent=2)
-    analysis_payload = _build_analysis_payload(export_payload)
-    analysis_json = json.dumps(analysis_payload, ensure_ascii=True, separators=(",", ":"))
-    json_b64 = base64.b64encode(export_json.encode("utf-8")).decode("ascii")
-    deep_json = analysis_json
-    deep_hash = hashlib.sha256(f"multi_agent_v1:deep:{deep_json}".encode("utf-8")).hexdigest()
-    live_job_id = _upsert_live_analysis_job(
-        stock_code=selected_code,
-        stock_name=selected_name,
-        quick_json="",
-        deep_json=deep_json,
-        quick_hash="",
-        deep_hash=deep_hash,
-    )
     run_analysis_now = False
     refresh_analysis_now = False
+    live_job_id = None
 
-    if copy_slot is not None:
+    lightweight_panel = bool(panel.get("local_only") or panel.get("realtime_only"))
+    if lightweight_panel:
+        if copy_slot is not None:
+            with copy_slot:
+                st.caption("完整刷新后可复制 JSON / 生成分析。")
+    else:
+        export_payload = {
+            "meta": {
+                "generated_at": datetime.now().isoformat(timespec="seconds"),
+                "app": "Quant",
+                "analysis_user": (st.session_state.get("deepseek_user_input", "") or "").strip(),
+            },
+            "stock": {"code": selected_code, "name": selected_name},
+            "slow_engine": selected_slow,
+            "fast_engine": {
+                "quote": quote,
+                "indicators": ind,
+                "rsi_multi": panel.get("rsi_multi", {}),
+                "tf_indicators": panel.get("tf_indicators", {}),
+                "order_book_5": order_book_5,
+                "intraday": intraday_df,
+                "depth_note": panel.get("depth_note"),
+                "error": panel.get("error"),
+                "compact_metrics": fast_compact_metrics,
+                "cards_snapshot": cards_snapshot,
+            },
+        }
+        export_json = json.dumps(_json_safe(export_payload), ensure_ascii=False, indent=2)
+        analysis_payload = _build_analysis_payload(export_payload)
+        analysis_json = json.dumps(analysis_payload, ensure_ascii=True, separators=(",", ":"))
+        json_b64 = base64.b64encode(export_json.encode("utf-8")).decode("ascii")
+        deep_json = analysis_json
+        deep_hash = hashlib.sha256(f"multi_agent_v1:deep:{deep_json}".encode("utf-8")).hexdigest()
+        live_job_id = _upsert_live_analysis_job(
+            stock_code=selected_code,
+            stock_name=selected_name,
+            quick_json="",
+            deep_json=deep_json,
+            quick_hash="",
+            deep_hash=deep_hash,
+        )
+
+    if copy_slot is not None and live_job_id is not None:
         with copy_slot:
             html(
                 f"""
@@ -5089,27 +5197,81 @@ def _render_fast_panel(selected_code: str, selected_name: str, panel=None):
     with doc_cols[0]:
         st.subheader(f"多智能体分析文档 · {selected_name} ({selected_code})")
     with doc_cols[1]:
-        refresh_analysis_now = st.button("刷新", key=f"refresh_inline_analysis_{selected_code}", width="stretch")
+        refresh_analysis_now = st.button(
+            "刷新",
+            key=f"refresh_inline_analysis_{selected_code}",
+            width="stretch",
+            disabled=live_job_id is None,
+        )
 
-    try:
-        if run_analysis_now or refresh_analysis_now:
-            done_job = _execute_analysis_job(
-                job_id=live_job_id,
-                mode="deep",
-                ui_prefix=f"{selected_name} ",
-                force_refresh=bool(refresh_analysis_now),
-            )
-            _render_final_report_block(live_job_id, done_job, f"inline_new_{selected_code}", height=520, stream_output=True)
-        else:
-            live_job_obj = _load_json_file(_analysis_job_file(live_job_id))
-            if isinstance(live_job_obj, dict) and live_job_obj.get("status") == "done":
-                _render_final_report_block(live_job_id, live_job_obj, f"inline_saved_{selected_code}", height=520)
-            elif isinstance(live_job_obj, dict) and live_job_obj.get("status") == "failed":
-                st.error(f"上次分析失败: {live_job_obj.get('error', '未知错误')}")
+    if live_job_id is None:
+        st.caption("当前是轻量快照模式。需要完整分时/技术指标后，再生成多智能体分析文档。")
+    else:
+        try:
+            if run_analysis_now or refresh_analysis_now:
+                done_job = _execute_analysis_job(
+                    job_id=live_job_id,
+                    mode="deep",
+                    ui_prefix=f"{selected_name} ",
+                    force_refresh=bool(refresh_analysis_now),
+                )
+                _render_final_report_block(live_job_id, done_job, f"inline_new_{selected_code}", height=520, stream_output=True)
             else:
-                st.caption("点击上方“多智能体分析”开始生成文档。")
+                live_job_obj = _load_json_file(_analysis_job_file(live_job_id))
+                if isinstance(live_job_obj, dict) and live_job_obj.get("status") == "done":
+                    _render_final_report_block(live_job_id, live_job_obj, f"inline_saved_{selected_code}", height=520)
+                elif isinstance(live_job_obj, dict) and live_job_obj.get("status") == "failed":
+                    st.error(f"上次分析失败: {live_job_obj.get('error', '未知错误')}")
+                else:
+                    st.caption("点击上方“多智能体分析”开始生成文档。")
+        except Exception as exc:
+            st.error(f"分析失败: {type(exc).__name__}: {exc}")
+
+
+@st.cache_resource(show_spinner=False)
+def _fast_panel_executor() -> concurrent.futures.ThreadPoolExecutor:
+    return concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="fast-panel")
+
+
+def _fast_panel_future_key(code: str) -> str:
+    return f"fast_panel_future_{code}"
+
+
+def _start_async_fast_refresh(code: str, *, mode: str = "realtime") -> concurrent.futures.Future:
+    future_key = _fast_panel_future_key(code)
+    existing = st.session_state.get(future_key)
+    if isinstance(existing, concurrent.futures.Future) and not existing.done():
+        return existing
+
+    fetcher = fetch_realtime_panel if mode == "realtime" else fetch_fast_panel
+    future = _fast_panel_executor().submit(fetcher, code)
+    st.session_state[future_key] = future
+    st.session_state[f"fast_panel_future_started_{code}"] = pytime.perf_counter()
+    st.session_state[f"fast_panel_future_mode_{code}"] = mode
+    return future
+
+
+def _consume_async_fast_refresh(code: str) -> tuple:
+    future_key = _fast_panel_future_key(code)
+    future = st.session_state.get(future_key)
+    if not isinstance(future, concurrent.futures.Future):
+        return None, False, None, None
+    mode = st.session_state.get(f"fast_panel_future_mode_{code}", "realtime")
+    if not future.done():
+        return None, True, None, mode
+
+    st.session_state.pop(future_key, None)
+    st.session_state.pop(f"fast_panel_future_started_{code}", None)
+    st.session_state.pop(f"fast_panel_future_mode_{code}", None)
+    try:
+        return future.result(), False, None, mode
     except Exception as exc:
-        st.error(f"分析失败: {type(exc).__name__}: {exc}")
+        return None, False, exc, mode
+
+
+def _fast_refresh_pending(code: str) -> bool:
+    future = st.session_state.get(_fast_panel_future_key(code))
+    return isinstance(future, concurrent.futures.Future) and not future.done()
 
 
 def _render_fast_panel_fragment():
@@ -5117,21 +5279,67 @@ def _render_fast_panel_fragment():
     selected_name = st.session_state.get("fast_selected_name", rows[0]["name"])
     market_open = _is_market_open(selected_code)
     cache_key = f"fast_panel_cache_{selected_code}"
+    force_refresh = bool(st.session_state.pop("fast_force_refresh", False))
+    recently_added = st.session_state.pop("fast_recently_added_code", None) == selected_code
+    auto_fetch_after_add = bool(st.session_state.pop("fast_auto_fetch_after_add", False))
 
     panel = None
-    if market_open:
-        panel = fetch_fast_panel(selected_code)
-        st.session_state[cache_key] = panel
+    if force_refresh or auto_fetch_after_add or (auto_refresh_on and market_open):
+        _start_async_fast_refresh(selected_code, mode="realtime")
+
+    async_panel, async_pending, async_error, async_mode = _consume_async_fast_refresh(selected_code)
+    if async_panel is not None:
+        st.session_state[cache_key] = async_panel
+        if async_mode == "realtime":
+            st.session_state["fast_refresh_message"] = f"正在补充 {selected_name} ({selected_code}) 的资金分时和技术指标..."
+            _start_async_fast_refresh(selected_code, mode="full")
+        else:
+            st.session_state["fast_refresh_message"] = ""
+        st.rerun()
+    elif async_pending:
+        started = st.session_state.get(f"fast_panel_future_started_{selected_code}", pytime.perf_counter())
+        elapsed = max(0.0, pytime.perf_counter() - float(started))
+        default_msg = (
+            f"正在补充 {selected_name} ({selected_code}) 的资金分时和技术指标..."
+            if async_mode == "full"
+            else f"正在获取 {selected_name} ({selected_code}) 的实时盘口..."
+        )
+        msg = st.session_state.get("fast_refresh_message") or default_msg
+        st.info(f"{msg} 已等待 {elapsed:.1f} 秒，页面先显示已可用数据。")
+        panel = st.session_state.get(cache_key)
+        if panel is None:
+            panel = _build_local_fast_panel(selected_code, selected_name, reason=msg)
+            st.session_state[cache_key] = panel
+    elif async_error is not None:
+        label = "完整分时/技术指标" if async_mode == "full" else "实时盘口"
+        st.warning(f"{label}获取失败: {async_error}")
+        panel = st.session_state.get(cache_key)
+        if panel is None:
+            panel = _build_local_fast_panel(selected_code, selected_name, reason=f"{label}获取失败: {async_error}")
+            st.session_state[cache_key] = panel
     else:
         panel = st.session_state.get(cache_key)
         if panel is None:
-            # 闭市时允许抓取一次静态快照用于查看，但不进入自动刷新循环
-            panel = fetch_fast_panel(selected_code)
+            reason = "刚加入股票，先显示本地快照；实时盘口请点“立即刷新”。" if recently_added else "本地快速模式：未主动联网刷新。"
+            panel = _build_local_fast_panel(selected_code, selected_name, reason=reason)
             st.session_state[cache_key] = panel
 
     _render_fast_panel(selected_code, selected_name, panel=panel)
 
-if auto_refresh_on and market_open_for_ctrl:
+selected_code_for_poll = st.session_state.get("fast_selected_code", rows[0]["code"])
+needs_fast_poll = (
+    bool(st.session_state.get("fast_auto_fetch_after_add"))
+    or bool(st.session_state.get("fast_force_refresh"))
+    or _fast_refresh_pending(str(selected_code_for_poll))
+)
+
+if needs_fast_poll:
+    @st.fragment(run_every="1s")
+    def _pending_fast_panel_fragment():
+        _render_fast_panel_fragment()
+
+    _pending_fast_panel_fragment()
+elif auto_refresh_on and market_open_for_ctrl:
     @st.fragment(run_every=f"{int(auto_refresh_sec)}s")
     def _auto_fast_panel_fragment():
         _render_fast_panel_fragment()

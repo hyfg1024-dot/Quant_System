@@ -1,5 +1,7 @@
 import asyncio
+import concurrent.futures
 import sys
+import time as pytime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -21,6 +23,8 @@ except Exception:  # pragma: no cover
 TENCENT_QUOTE_URL = "https://qt.gtimg.cn/q={exchange}{symbol}"
 TENCENT_MINUTE_URL = "https://web.ifzq.gtimg.cn/appstock/app/minute/query?code={exchange}{symbol}"
 TENCENT_DAILY_URL = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={exchange}{symbol},day,,,{count},qfq"
+EASTMONEY_QUOTE_URL = "http://push2.eastmoney.com/api/qt/stock/get"
+SINA_QUOTE_URL = "https://hq.sinajs.cn/list={exchange}{symbol}"
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
@@ -279,7 +283,274 @@ def _fetch_tencent_quote(symbol: str) -> Dict:
 
     payload = text.split('"', 1)[1].rsplit('"', 1)[0]
     fields = payload.split("~")
-    return _parse_tencent_fields(normalized, fields)
+    out = _parse_tencent_fields(normalized, fields)
+    out["source"] = "tencent"
+    return out
+
+
+def _eastmoney_secid(symbol: str) -> str:
+    exchange, normalized = _resolve_market(symbol)
+    if exchange == "hk":
+        return f"116.{normalized}"
+    market_id = "1" if exchange == "sh" else "0"
+    return f"{market_id}.{normalized}"
+
+
+def _em_price(value: Any, symbol: str) -> Optional[float]:
+    num = _to_float(value)
+    if num is None:
+        return None
+    scale = 1000.0 if _resolve_exchange(symbol) == "hk" else 100.0
+    return num / scale
+
+
+def _em_ratio(value: Any) -> Optional[float]:
+    num = _to_float(value)
+    if num is None:
+        return None
+    return num / 100.0
+
+
+def _empty_orderbook(levels: int = 10) -> Dict[str, List[Dict]]:
+    return {
+        "buy": [{"level": i + 1, "price": None, "volume_lot": None} for i in range(levels)],
+        "sell": [{"level": i + 1, "price": None, "volume_lot": None} for i in range(levels)],
+    }
+
+
+def _fetch_eastmoney_quote(symbol: str) -> Dict:
+    normalized = _normalize_symbol(symbol)
+    exchange = _resolve_exchange(normalized)
+    fields = ",".join(
+        [
+            "f43",  # 最新价
+            "f44",  # 最高
+            "f45",  # 最低
+            "f46",  # 今开
+            "f47",  # 成交量：A股为手，港股为股
+            "f48",  # 成交额
+            "f57",  # 代码
+            "f58",  # 名称
+            "f60",  # 昨收
+            "f116",  # 总市值
+            "f117",  # 流通市值
+            "f162",  # 动态PE
+            "f163",  # 静态PE
+            "f164",  # TTM PE
+            "f167",  # PB
+            "f168",  # 换手率
+            "f169",  # 涨跌额
+            "f170",  # 涨跌幅
+        ]
+    )
+    resp = requests.get(
+        EASTMONEY_QUOTE_URL,
+        params={"secid": _eastmoney_secid(normalized), "fields": fields},
+        headers={"User-Agent": "Mozilla/5.0", "Referer": "https://quote.eastmoney.com/"},
+        timeout=3,
+    )
+    resp.raise_for_status()
+    payload = resp.json()
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(data, dict):
+        raise ValueError("No Eastmoney quote payload")
+
+    price = _em_price(data.get("f43"), normalized)
+    prev_close = _em_price(data.get("f60"), normalized)
+    volume_raw = _to_float(data.get("f47"))
+    volume = volume_raw if exchange == "hk" else (volume_raw * 100 if volume_raw is not None else None)
+    amount = _to_float(data.get("f48"))
+    total_mv = _to_float(data.get("f116"))
+    float_mv = _to_float(data.get("f117"))
+
+    return {
+        "symbol": normalized,
+        "name": str(data.get("f58") or normalized),
+        "current_price": price,
+        "prev_close": prev_close,
+        "open": _em_price(data.get("f46"), normalized),
+        "change_amount": _em_price(data.get("f169"), normalized),
+        "change_pct": _em_ratio(data.get("f170")),
+        "high": _em_price(data.get("f44"), normalized),
+        "low": _em_price(data.get("f45"), normalized),
+        "volume": volume,
+        "amount": amount,
+        "turnover_rate": _em_ratio(data.get("f168")),
+        "turnover_rate_estimated": False,
+        "amplitude_pct": None,
+        "float_market_value_yi": float_mv / 1e8 if float_mv is not None else None,
+        "total_market_value_yi": total_mv / 1e8 if total_mv is not None else None,
+        "volume_ratio": None,
+        "order_diff": None,
+        "vwap": (amount / volume) if amount and volume else price,
+        "premium_pct": None,
+        "quote_time": None,
+        "is_trading_data": bool(volume and volume > 0),
+        "pe_dynamic": _em_ratio(data.get("f162")),
+        "pe_static": _em_ratio(data.get("f163")),
+        "pe_ttm": _em_ratio(data.get("f164")),
+        "pb": _em_ratio(data.get("f167")),
+        "order_book_5": {"buy": [], "sell": []},
+        "order_book_10": _empty_orderbook(10),
+        "error": None,
+        "source": "eastmoney",
+    }
+
+
+def _fetch_sina_quote(symbol: str) -> Dict:
+    exchange, normalized = _resolve_market(symbol)
+    if exchange == "hk":
+        sina_code = f"hk{normalized}"
+    else:
+        sina_code = f"{exchange}{normalized}"
+    resp = requests.get(
+        SINA_QUOTE_URL.format(exchange="", symbol=sina_code),
+        headers={"User-Agent": "Mozilla/5.0", "Referer": "https://finance.sina.com.cn/"},
+        timeout=4,
+    )
+    resp.raise_for_status()
+    resp.encoding = "gbk"
+    text = resp.text
+    if '"' not in text:
+        raise ValueError("No Sina quote payload")
+    payload = text.split('"', 1)[1].rsplit('"', 1)[0]
+    fields = payload.split(",")
+    if len(fields) < 10:
+        raise ValueError("Malformed Sina payload")
+
+    if exchange == "hk":
+        # 新浪港股字段口径和 A 股不同，保守只取能稳定确认的价格字段。
+        name = fields[1].strip() if len(fields) > 1 else normalized
+        current = _to_float(fields[6] if len(fields) > 6 else None)
+        prev_close = _to_float(fields[3] if len(fields) > 3 else None)
+        open_val = _to_float(fields[2] if len(fields) > 2 else None)
+        high = _to_float(fields[4] if len(fields) > 4 else None)
+        low = _to_float(fields[5] if len(fields) > 5 else None)
+        volume = _to_float(fields[12] if len(fields) > 12 else None)
+        amount = _to_float(fields[11] if len(fields) > 11 else None)
+    else:
+        name = fields[0].strip() or normalized
+        open_val = _to_float(fields[1])
+        prev_close = _to_float(fields[2])
+        current = _to_float(fields[3])
+        high = _to_float(fields[4])
+        low = _to_float(fields[5])
+        volume = _to_float(fields[8])
+        amount = _to_float(fields[9])
+
+    change_amount = (current - prev_close) if current is not None and prev_close else None
+    change_pct = (change_amount / prev_close * 100) if change_amount is not None and prev_close else None
+    orderbook = _empty_orderbook(10)
+    return {
+        "symbol": normalized,
+        "name": name,
+        "current_price": current,
+        "prev_close": prev_close,
+        "open": open_val,
+        "change_amount": change_amount,
+        "change_pct": change_pct,
+        "high": high,
+        "low": low,
+        "volume": volume,
+        "amount": amount,
+        "turnover_rate": None,
+        "turnover_rate_estimated": False,
+        "amplitude_pct": ((high - low) / prev_close * 100) if high is not None and low is not None and prev_close else None,
+        "float_market_value_yi": None,
+        "total_market_value_yi": None,
+        "volume_ratio": None,
+        "order_diff": None,
+        "vwap": (amount / volume) if amount and volume else current,
+        "premium_pct": None,
+        "quote_time": None,
+        "is_trading_data": bool(volume and volume > 0),
+        "pe_dynamic": None,
+        "pe_static": None,
+        "pe_ttm": None,
+        "pb": None,
+        "order_book_5": {"buy": [], "sell": []},
+        "order_book_10": orderbook,
+        "error": None,
+        "source": "sina",
+    }
+
+
+def _quote_has_orderbook(quote: Dict) -> bool:
+    ob5 = quote.get("order_book_5", {}) if isinstance(quote, dict) else {}
+    for side in ("buy", "sell"):
+        for row in ob5.get(side, []) or []:
+            if row.get("price") is not None and row.get("volume_lot") is not None:
+                return True
+    return False
+
+
+def _merge_quote(primary: Dict, secondary: Dict) -> Dict:
+    out = dict(primary)
+    for key, value in secondary.items():
+        if key in {"source", "source_order"}:
+            continue
+        if out.get(key) in (None, "", [], {}):
+            out[key] = value
+    if not _quote_has_orderbook(out) and _quote_has_orderbook(secondary):
+        out["order_book_5"] = secondary.get("order_book_5", {"buy": [], "sell": []})
+        out["order_book_10"] = secondary.get("order_book_10", _empty_orderbook(10))
+    sources = []
+    for item in (primary.get("source"), secondary.get("source")):
+        if item and item not in sources:
+            sources.append(item)
+    if sources:
+        out["source"] = "+".join(sources)
+        out["source_order"] = sources
+    return out
+
+
+def fetch_realtime_quote_public_fast(symbol: str, timeout_sec: float = 0.45) -> Dict:
+    """
+    公开行情源极速瀑布流：
+    - 东财 HTTP 通常最快，负责价格/成交/估值字段；
+    - 腾讯略慢但有五档盘口，若在短超时内返回则合并盘口；
+    - 新浪作为最后价格兜底。
+    """
+    normalized = _normalize_symbol(symbol)
+    fetchers = [
+        ("eastmoney", _fetch_eastmoney_quote),
+        ("tencent", _fetch_tencent_quote),
+        ("sina", _fetch_sina_quote),
+    ]
+    started = pytime.perf_counter()
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=len(fetchers))
+    futures = {executor.submit(fn, normalized): name for name, fn in fetchers}
+    done, pending = concurrent.futures.wait(
+        futures,
+        timeout=max(0.08, float(timeout_sec)),
+        return_when=concurrent.futures.ALL_COMPLETED,
+    )
+    quotes: Dict[str, Dict] = {}
+    errors: List[str] = []
+    for fut in done:
+        source = futures[fut]
+        try:
+            row = fut.result()
+            if row.get("current_price") is not None:
+                row["latency_ms"] = round((pytime.perf_counter() - started) * 1000.0, 1)
+                quotes[source] = row
+        except Exception as exc:
+            errors.append(f"{source}: {exc}")
+    for fut in pending:
+        fut.cancel()
+    executor.shutdown(wait=False, cancel_futures=True)
+
+    if not quotes:
+        raise RequestException(" | ".join(errors) if errors else "公开行情源超时")
+
+    # 当前实测东财最快；如果腾讯及时返回，则用东财价格 + 腾讯盘口。
+    primary = quotes.get("eastmoney") or quotes.get("tencent") or quotes.get("sina")
+    if primary is None:
+        raise RequestException("公开行情源无有效价格")
+    if "tencent" in quotes and primary is not quotes["tencent"]:
+        primary = _merge_quote(primary, quotes["tencent"])
+    primary["available_sources"] = sorted(quotes.keys())
+    return primary
 
 
 async def _fetch_tencent_quote_async(session, symbol: str, timeout_sec: float = 1.0) -> Dict:
@@ -327,7 +598,11 @@ async def _fetch_tencent_quotes_batch_async(symbols: Sequence[str], timeout_sec:
     return results
 
 
-def fetch_realtime_quotes_batch(symbols: Sequence[str], timeout_sec: float = 1.0) -> Dict[str, Dict]:
+def fetch_realtime_quotes_batch(
+    symbols: Sequence[str],
+    timeout_sec: float = 1.0,
+    fallback_to_provider: bool = True,
+) -> Dict[str, Dict]:
     """
     多标的实时快照批量抓取（aiohttp + asyncio.gather）。
     优先走腾讯批量异步，失败时逐只回退到统一 Provider。
@@ -354,14 +629,20 @@ def fetch_realtime_quotes_batch(symbols: Sequence[str], timeout_sec: float = 1.0
     out: Dict[str, Dict] = {}
     for s in uniq_symbols:
         row = async_result.get(s)
-        if row is None:
+        if row is None and fallback_to_provider:
             row = fetch_realtime_quote(s)
-        out[s] = row
+        if row is not None:
+            out[s] = row
     return out
 
 
 def fetch_realtime_quote(symbol: str) -> Dict:
     normalized = _normalize_symbol(symbol)
+    try:
+        return fetch_realtime_quote_public_fast(symbol)
+    except Exception:
+        pass
+
     try:
         return get_market_data_provider().get_realtime_quote(symbol)
     except Exception as exc:
@@ -398,6 +679,46 @@ def fetch_realtime_quote(symbol: str) -> Dict:
             },
             "error": str(exc),
         }
+
+
+def _empty_indicators() -> Dict[str, Optional[float]]:
+    return {
+        "macd_hist": None,
+        "rsi6": None,
+        "rsi12": None,
+        "rsi24": None,
+        "ma5": None,
+        "ma10": None,
+        "ma20": None,
+        "ma60": None,
+        "boll_mid": None,
+        "boll_upper": None,
+        "boll_lower": None,
+        "boll_pct_b": None,
+        "boll_bandwidth": None,
+    }
+
+
+def fetch_realtime_panel(symbol: str, timeout_sec: float = 0.45) -> Dict:
+    """只刷新实时价格和盘口，不拉历史K线/多周期指标。用于新增股票后的快速反馈。"""
+    quote = fetch_realtime_quote_public_fast(symbol, timeout_sec=timeout_sec)
+    source = quote.get("source") or "public"
+    note = f"实时盘口源: {source}"
+    if not _quote_has_orderbook(quote):
+        note += "；当前源未返回五档盘口，已显示价格快照。"
+    return {
+        "symbol": _normalize_symbol(symbol),
+        "quote": quote,
+        "indicators": _empty_indicators(),
+        "intraday": pd.DataFrame(columns=["time", "price", "volume_lot", "amount"]),
+        "order_book_5": quote.get("order_book_5", {"buy": [], "sell": []}),
+        "order_book_10": quote.get("order_book_10", _empty_orderbook(10)),
+        "rsi_multi": {},
+        "tf_indicators": {},
+        "depth_note": note,
+        "error": quote.get("error"),
+        "realtime_only": True,
+    }
 
 
 def _fetch_intraday_flow_legacy(symbol: str) -> pd.DataFrame:
@@ -694,21 +1015,7 @@ def fetch_fast_panel(symbol: str) -> Dict:
     quote = fetch_realtime_quote(symbol)
 
     intraday_df = pd.DataFrame(columns=["time", "price", "volume_lot", "amount"])
-    indicators = {
-        "macd_hist": None,
-        "rsi6": None,
-        "rsi12": None,
-        "rsi24": None,
-        "ma5": None,
-        "ma10": None,
-        "ma20": None,
-        "ma60": None,
-        "boll_mid": None,
-        "boll_upper": None,
-        "boll_lower": None,
-        "boll_pct_b": None,
-        "boll_bandwidth": None,
-    }
+    indicators = _empty_indicators()
     errors = []
 
     try:

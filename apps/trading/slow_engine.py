@@ -14,6 +14,7 @@ from apscheduler.triggers.cron import CronTrigger
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 DB_PATH = DATA_DIR / "quant_app.db"
+FILTER_DB_PATH = BASE_DIR.parent / "filter" / "data" / "filter_market.db"
 
 STOCK_POOL: List[Tuple[str, str]] = [
     ("601088", "中国神华"),
@@ -37,13 +38,13 @@ def _normalize_symbol_input(text: str) -> str:
     raw = str(text).strip().lower()
     digits = "".join(ch for ch in raw if ch.isdigit())
 
-    if raw.startswith("hk"):
+    if raw.startswith("hk") or raw.endswith(".hk"):
         if not digits:
             return ""
         return digits[-5:].zfill(5)
 
-    if len(digits) == 5:
-        return digits
+    if 0 < len(digits) <= 5:
+        return digits.zfill(5)
     if len(digits) >= 6:
         return digits[-6:]
     return ""
@@ -203,6 +204,204 @@ def _normalize_name(text: str) -> str:
     return normalized.replace(" ", "").replace("\u3000", "").upper()
 
 
+def _lookup_local_filter_stock(query: str, code_candidate: str = "") -> Optional[Tuple[str, str]]:
+    """Resolve stocks from the local filter database before hitting network APIs."""
+    if not FILTER_DB_PATH.exists():
+        return None
+
+    q = str(query).strip()
+    q_norm = _normalize_name(q)
+    markets: Tuple[str, ...]
+    if code_candidate and len(code_candidate) == 6:
+        markets = ("A",)
+    elif code_candidate and len(code_candidate) == 5:
+        markets = ("HK",)
+    else:
+        markets = ("A", "HK")
+
+    tables = ("stock_enrichment_latest", "market_snapshot")
+    try:
+        with sqlite3.connect(FILTER_DB_PATH) as conn:
+            existing_tables = {
+                str(row[0])
+                for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+            }
+            for table in tables:
+                if table not in existing_tables:
+                    continue
+                if code_candidate:
+                    row = conn.execute(
+                        f"""
+                        SELECT code, name
+                        FROM {table}
+                        WHERE market IN ({",".join("?" for _ in markets)})
+                          AND code = ?
+                          AND name IS NOT NULL
+                          AND TRIM(name) <> ''
+                        LIMIT 1
+                        """,
+                        (*markets, code_candidate),
+                    ).fetchone()
+                    if row:
+                        return str(row[0]).zfill(5) if len(str(row[0])) == 5 else str(row[0]), str(row[1])
+
+                rows = conn.execute(
+                    f"""
+                    SELECT code, name
+                    FROM {table}
+                    WHERE market IN ({",".join("?" for _ in markets)})
+                      AND name IS NOT NULL
+                      AND TRIM(name) <> ''
+                    """,
+                    markets,
+                ).fetchall()
+                exact_matches = [
+                    (str(code), str(name))
+                    for code, name in rows
+                    if _normalize_name(str(name)) == q_norm
+                ]
+                if exact_matches:
+                    code, name = exact_matches[0]
+                    return code.zfill(5) if len(code) == 5 else code, name
+                contains_matches = [
+                    (str(code), str(name))
+                    for code, name in rows
+                    if q_norm and q_norm in _normalize_name(str(name))
+                ]
+                if contains_matches:
+                    code, name = contains_matches[0]
+                    return code.zfill(5) if len(code) == 5 else code, name
+    except Exception:
+        return None
+    return None
+
+
+def _lookup_default_stock(code_candidate: str) -> Optional[Tuple[str, str]]:
+    for code, name in STOCK_POOL:
+        if str(code).strip() == code_candidate:
+            return str(code), str(name)
+    return None
+
+
+def resolve_stock_identity_local_first(query: str) -> Tuple[str, str]:
+    """
+    Resolve a stock for UI pool insertion without network I/O.
+
+    Code input must never block the page. If the code is not in local metadata yet,
+    use the code itself as a temporary display name and let later data jobs enrich it.
+    """
+    init_db()
+    q = str(query).strip()
+    if not q:
+        raise ValueError("请输入股票代码或股票名称")
+
+    code_candidate = _normalize_symbol_input(q)
+
+    with _connect() as conn:
+        if code_candidate and len(code_candidate) in {5, 6}:
+            row = conn.execute(
+                "SELECT code, name FROM stock_info WHERE code = ?",
+                (code_candidate,),
+            ).fetchone()
+            if row:
+                return str(row[0]), str(row[1])
+
+        row = conn.execute(
+            "SELECT code, name FROM stock_info WHERE name = ?",
+            (q,),
+        ).fetchone()
+        if row:
+            return str(row[0]), str(row[1])
+
+    local_filter_match = _lookup_local_filter_stock(q, code_candidate)
+    if local_filter_match:
+        return local_filter_match
+
+    default_match = _lookup_default_stock(code_candidate)
+    if default_match:
+        return default_match
+
+    if code_candidate and len(code_candidate) in {5, 6}:
+        return code_candidate, code_candidate
+
+    raise ValueError("本地未找到该名称，请直接输入 6 位A股代码或 5 位港股代码")
+
+
+def seed_fundamental_from_local_filter(symbol: str, default_name: str = "") -> bool:
+    """Seed one fundamental row from the local filter/enrichment database without network I/O."""
+    symbol = str(symbol).strip()
+    if not symbol or not FILTER_DB_PATH.exists():
+        return False
+
+    market = "HK" if _is_hk_symbol(symbol) else "A"
+    desired_cols = (
+        "name",
+        "pe_ttm",
+        "pe_dynamic",
+        "pe_static",
+        "pb",
+        "dividend_yield",
+    )
+    try:
+        with sqlite3.connect(FILTER_DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            existing_tables = {
+                str(row[0])
+                for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+            }
+            for table in ("stock_enrichment_latest", "market_snapshot"):
+                if table not in existing_tables:
+                    continue
+                table_cols = {
+                    str(row[1])
+                    for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+                }
+                select_cols = [col for col in desired_cols if col in table_cols]
+                if not select_cols:
+                    continue
+                row = conn.execute(
+                    f"""
+                    SELECT {", ".join(select_cols)}
+                    FROM {table}
+                    WHERE market = ? AND code = ?
+                    LIMIT 1
+                    """,
+                    (market, symbol),
+                ).fetchone()
+                if not row:
+                    continue
+
+                values = {col: row[col] if col in row.keys() else None for col in desired_cols}
+                pe_ttm = _to_float(values.get("pe_ttm"))
+                pe_dynamic = _to_float(values.get("pe_dynamic"))
+                pe_static = _to_float(values.get("pe_static"))
+                pb = _to_float(values.get("pb"))
+                dividend_yield = _to_float(values.get("dividend_yield"))
+                if all(v is None for v in (pe_ttm, pe_dynamic, pe_static, pb, dividend_yield)):
+                    continue
+
+                save_fundamental(
+                    {
+                        "trade_date": datetime.now().strftime("%Y-%m-%d"),
+                        "code": symbol,
+                        "name": str(values.get("name") or default_name or symbol),
+                        "pe": pe_ttm if pe_ttm is not None else pe_dynamic,
+                        "pe_ttm": pe_ttm,
+                        "pe_dynamic": pe_dynamic,
+                        "pe_static": pe_static,
+                        "pe_rolling": pe_ttm,
+                        "pb": pb,
+                        "dividend_yield": dividend_yield,
+                        "boll_index": None,
+                        "commodity_prices": {},
+                    }
+                )
+                return True
+    except Exception:
+        return False
+    return False
+
+
 def resolve_stock_identity(query: str) -> Tuple[str, str]:
     init_db()
     q = str(query).strip()
@@ -228,6 +427,14 @@ def resolve_stock_identity(query: str) -> Tuple[str, str]:
         ).fetchone()
         if row:
             return str(row[0]), str(row[1])
+
+    local_filter_match = _lookup_local_filter_stock(q, code_candidate)
+    if local_filter_match:
+        return local_filter_match
+
+    default_match = _lookup_default_stock(code_candidate)
+    if default_match:
+        return default_match
 
     # A股按代码精确查
     if code_candidate and len(code_candidate) == 6:
@@ -302,7 +509,7 @@ def resolve_stock_identity(query: str) -> Tuple[str, str]:
 
 
 def add_stock_by_query(query: str, pool_group: str = "watch") -> Tuple[str, str]:
-    code, name = resolve_stock_identity(query)
+    code, name = resolve_stock_identity_local_first(query)
     add_stock_to_pool(code, name, pool_group=pool_group)
     return code, name
 
