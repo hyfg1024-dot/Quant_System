@@ -23,13 +23,13 @@ except Exception:  # pragma: no cover
 TENCENT_QUOTE_URL = "https://qt.gtimg.cn/q={exchange}{symbol}"
 TENCENT_MINUTE_URL = "https://web.ifzq.gtimg.cn/appstock/app/minute/query?code={exchange}{symbol}"
 TENCENT_DAILY_URL = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={exchange}{symbol},day,,,{count},qfq"
-EASTMONEY_QUOTE_URL = "http://push2.eastmoney.com/api/qt/stock/get"
 SINA_QUOTE_URL = "https://hq.sinajs.cn/list={exchange}{symbol}"
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from shared.authoritative_market import EASTMONEY_HEADERS, EASTMONEY_QUOTE_URLS
 from shared.data_provider import build_default_provider
 
 _MARKET_DATA_PROVIDER = None
@@ -311,6 +311,36 @@ def _em_ratio(value: Any) -> Optional[float]:
     return num / 100.0
 
 
+def _em_percent_field(value: Any) -> Optional[float]:
+    num = _to_float(value)
+    if num is None:
+        return None
+    # 东财 f126 股息率在 stock/get 中常直接返回百分数，例如 4.02。
+    return num if abs(num) <= 100 else num / 100.0
+
+
+def _request_eastmoney_quote(params: Dict[str, Any], timeout: float = 2.0) -> Dict[str, Any]:
+    """Eastmoney 单股快照直连优先，避免 Surge 系统代理干扰。"""
+    last_error: Optional[Exception] = None
+    for url in EASTMONEY_QUOTE_URLS:
+        for trust_env in (False, True):
+            try:
+                session = requests.Session()
+                session.trust_env = trust_env
+                resp = session.get(url, params=params, headers=EASTMONEY_HEADERS, timeout=timeout)
+                resp.raise_for_status()
+                payload = resp.json() or {}
+                data = payload.get("data") if isinstance(payload, dict) else None
+                if isinstance(data, dict) and data:
+                    return data
+            except Exception as exc:
+                last_error = exc
+                continue
+    if last_error is not None:
+        raise last_error
+    raise ValueError("No Eastmoney quote payload")
+
+
 def _empty_orderbook(levels: int = 10) -> Dict[str, List[Dict]]:
     return {
         "buy": [{"level": i + 1, "price": None, "volume_lot": None} for i in range(levels)],
@@ -334,6 +364,7 @@ def _fetch_eastmoney_quote(symbol: str) -> Dict:
             "f60",  # 昨收
             "f116",  # 总市值
             "f117",  # 流通市值
+            "f126",  # 股息率
             "f162",  # 动态PE
             "f163",  # 静态PE
             "f164",  # TTM PE
@@ -343,17 +374,10 @@ def _fetch_eastmoney_quote(symbol: str) -> Dict:
             "f170",  # 涨跌幅
         ]
     )
-    resp = requests.get(
-        EASTMONEY_QUOTE_URL,
-        params={"secid": _eastmoney_secid(normalized), "fields": fields},
-        headers={"User-Agent": "Mozilla/5.0", "Referer": "https://quote.eastmoney.com/"},
-        timeout=3,
+    data = _request_eastmoney_quote(
+        {"secid": _eastmoney_secid(normalized), "fields": fields},
+        timeout=1.8,
     )
-    resp.raise_for_status()
-    payload = resp.json()
-    data = payload.get("data") if isinstance(payload, dict) else None
-    if not isinstance(data, dict):
-        raise ValueError("No Eastmoney quote payload")
 
     price = _em_price(data.get("f43"), normalized)
     prev_close = _em_price(data.get("f60"), normalized)
@@ -390,6 +414,7 @@ def _fetch_eastmoney_quote(symbol: str) -> Dict:
         "pe_static": _em_ratio(data.get("f163")),
         "pe_ttm": _em_ratio(data.get("f164")),
         "pb": _em_ratio(data.get("f167")),
+        "dividend_yield": _em_percent_field(data.get("f126")) if exchange != "hk" else None,
         "order_book_5": {"buy": [], "sell": []},
         "order_book_10": _empty_orderbook(10),
         "error": None,

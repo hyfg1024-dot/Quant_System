@@ -11,6 +11,12 @@ import requests
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
+from shared.authoritative_market import (
+    fetch_a_dividend_yield_ttm,
+    fetch_authoritative_valuation,
+    fetch_eastmoney_valuation,
+)
+
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 DB_PATH = DATA_DIR / "quant_app.db"
@@ -558,37 +564,13 @@ def _fetch_hk_valuation_from_baidu(symbol: str, indicator: str) -> Optional[floa
 
 
 def _fetch_metrics_from_eastmoney_direct(symbol: str) -> Dict[str, Optional[float]]:
-    secid = ("1." if str(symbol).startswith("6") else "0.") + str(symbol)
-    # 东方财富字段: f162=动态PE, f163=静态PE, f164=滚动PE(TTM), f167=PB
-    fields = "f57,f58,f162,f163,f164,f167"
-    urls = [
-        "https://push2.eastmoney.com/api/qt/stock/get",
-        "http://push2.eastmoney.com/api/qt/stock/get",
-    ]
-
-    headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://quote.eastmoney.com"}
-    for _ in range(3):
-        for url in urls:
-            try:
-                resp = requests.get(
-                    url,
-                    params={"invt": "2", "fltt": "2", "secid": secid, "fields": fields},
-                    headers=headers,
-                    timeout=8,
-                )
-                resp.raise_for_status()
-                payload = resp.json()
-                data = payload.get("data") or {}
-                return {
-                    "pe_dynamic": _to_float(data.get("f162")),
-                    "pe_static": _to_float(data.get("f163")),
-                    "pe_rolling": _to_float(data.get("f164")),
-                    "pb": _to_float(data.get("f167")),
-                }
-            except Exception:
-                continue
-
-    return {"pe_dynamic": None, "pe_static": None, "pe_rolling": None, "pb": None}
+    metrics = fetch_eastmoney_valuation(symbol)
+    return {
+        "pe_dynamic": metrics.get("pe_dynamic"),
+        "pe_static": metrics.get("pe_static"),
+        "pe_rolling": metrics.get("pe_rolling"),
+        "pb": metrics.get("pb"),
+    }
 
 
 def _fetch_metrics_from_tencent(symbol: str) -> Dict[str, Optional[float]]:
@@ -694,29 +676,7 @@ def _fetch_boll_index(symbol: str) -> Optional[float]:
 
 
 def _fetch_dividend_yield_from_em(symbol: str) -> Optional[float]:
-    try:
-        df = ak.stock_fhps_detail_em(symbol=str(symbol))
-        if df is None or df.empty:
-            return None
-        if "现金分红-股息率" not in df.columns:
-            return None
-
-        tmp = df.copy()
-        tmp["现金分红-股息率"] = pd.to_numeric(tmp["现金分红-股息率"], errors="coerce")
-        tmp = tmp.dropna(subset=["现金分红-股息率"])
-        if tmp.empty:
-            return None
-
-        # 优先使用年报(12-31)，避免中报分红导致股息率偏低。
-        annual = tmp[tmp["报告期"].astype(str).str.endswith("12-31")]
-        chosen = annual if not annual.empty else tmp
-        val = _to_float(chosen.iloc[-1]["现金分红-股息率"])
-        if val is None:
-            return None
-        # 接口返回小数口径(0.055)，统一转换为百分比口径(5.50)。
-        return val * 100
-    except Exception:
-        return None
+    return fetch_a_dividend_yield_ttm(symbol)
 
 
 def fetch_live_valuation_snapshot(symbol: str) -> Dict[str, Optional[float]]:
@@ -752,11 +712,12 @@ def fetch_live_valuation_snapshot(symbol: str) -> Dict[str, Optional[float]]:
         if pb is None:
             pb = _fetch_hk_valuation_from_baidu(symbol, "市净率")
     else:
-        em_metrics = _fetch_metrics_from_eastmoney_direct(symbol)
-        pe_dynamic = em_metrics.get("pe_dynamic")
-        pe_static = em_metrics.get("pe_static")
-        pe_rolling = em_metrics.get("pe_rolling")
-        pb = em_metrics.get("pb")
+        authoritative = fetch_authoritative_valuation(symbol)
+        pe_dynamic = authoritative.get("pe_dynamic")
+        pe_static = authoritative.get("pe_static")
+        pe_rolling = authoritative.get("pe_rolling")
+        pb = authoritative.get("pb")
+        dividend_yield = authoritative.get("dividend_yield")
 
         tx_metrics = _fetch_metrics_from_tencent(symbol)
         if pe_dynamic is None:
@@ -768,7 +729,8 @@ def fetch_live_valuation_snapshot(symbol: str) -> Dict[str, Optional[float]]:
 
         if pb is None:
             pb = _fetch_pb_from_baidu(symbol)
-        dividend_yield = _fetch_dividend_yield_from_em(symbol)
+        if dividend_yield is None:
+            dividend_yield = _fetch_dividend_yield_from_em(symbol)
 
     pe_ttm = pe_rolling
     pe = pe_rolling if pe_rolling is not None else pe_dynamic
@@ -781,6 +743,7 @@ def fetch_live_valuation_snapshot(symbol: str) -> Dict[str, Optional[float]]:
         "pe_rolling": pe_rolling,
         "pb": pb,
         "dividend_yield": dividend_yield,
+        "valuation_source": "eastmoney" if not _is_hk_symbol(symbol) else "eastmoney_hk",
     }
 
 
@@ -856,20 +819,31 @@ def fetch_latest_fundamental(symbol: str, default_name: str = "") -> Dict:
         if pb is None:
             pb = tx_metrics.get("pb")
     else:
-        # A股主通道：东方财富快照（AkShare）
+        # A股权威通道：交易页/基本面页的关键估值字段最终以东方财富直连为准。
+        authoritative = fetch_authoritative_valuation(symbol)
+        pe_dynamic = authoritative.get("pe_dynamic")
+        pe_static = authoritative.get("pe_static")
+        pe_rolling = authoritative.get("pe_rolling")
+        pb = authoritative.get("pb")
+        dividend_yield = authoritative.get("dividend_yield")
+
+        # A股名称和缺失字段兜底：AkShare 东方财富快照。
         try:
             spot_df = ak.stock_zh_a_spot_em()
             row_df = spot_df[spot_df["代码"] == symbol]
             if not row_df.empty:
                 row = row_df.iloc[0]
                 name = str(row.get("名称", name))
-                pe_dynamic = _to_float(row.get("市盈率-动态") or row.get("市盈率动态") or row.get("市盈率"))
-                pb = _to_float(row.get("市净率"))
-                dividend_yield = _to_float(row.get("股息率") or row.get("股息率(%)"))
+                if pe_dynamic is None:
+                    pe_dynamic = _to_float(row.get("市盈率-动态") or row.get("市盈率动态") or row.get("市盈率"))
+                if pb is None:
+                    pb = _to_float(row.get("市净率"))
+                if dividend_yield is None:
+                    dividend_yield = _to_float(row.get("股息率") or row.get("股息率(%)"))
         except Exception:
             pass
 
-        # A股兜底：东方财富接口 + 腾讯 + 百度
+        # A股兜底：东方财富接口 + 腾讯 + 百度。非空权威字段不被覆盖。
         if pe_dynamic is None or pe_static is None or pe_rolling is None or pb is None:
             em_metrics = _fetch_metrics_from_eastmoney_direct(symbol)
             if pe_dynamic is None:

@@ -23,6 +23,12 @@ APP_VERSION = "FND-20260420-02"
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
+from shared.authoritative_market import (
+    fetch_a_dividend_yield_ttm,
+    fetch_authoritative_valuation,
+    fetch_eastmoney_valuation,
+)
+
 ROOT_DIR = Path(__file__).resolve().parent
 DATA_DIR = ROOT_DIR / "data"
 CACHE_DIR = DATA_DIR / "cache"
@@ -669,38 +675,13 @@ def _normalize_dividend_value(value: Optional[float]) -> Optional[float]:
 
 
 def _fetch_metrics_from_eastmoney_direct(symbol: str) -> Dict[str, Optional[float]]:
-    secid = ("1." if str(symbol).startswith("6") else "0.") + str(symbol)
-    fields = "f57,f58,f162,f163,f164,f167"
-    urls = [
-        "https://push2.eastmoney.com/api/qt/stock/get",
-        "http://push2.eastmoney.com/api/qt/stock/get",
-    ]
-    headers = {
-        "User-Agent": "Mozilla/5.0",
-        "Referer": "https://quote.eastmoney.com",
+    metrics = fetch_eastmoney_valuation(symbol)
+    return {
+        "pe_dynamic": metrics.get("pe_dynamic"),
+        "pe_static": metrics.get("pe_static"),
+        "pe_ttm": metrics.get("pe_ttm"),
+        "pb": metrics.get("pb"),
     }
-    for _ in range(3):
-        for url in urls:
-            try:
-                session = requests.Session()
-                session.trust_env = False
-                resp = session.get(
-                    url,
-                    params={"invt": "2", "fltt": "2", "secid": secid, "fields": fields},
-                    headers=headers,
-                    timeout=8,
-                )
-                resp.raise_for_status()
-                data = (resp.json() or {}).get("data") or {}
-                return {
-                    "pe_dynamic": _normalize_pe_value(parse_cn_number(data.get("f162"))),
-                    "pe_static": _normalize_pe_value(parse_cn_number(data.get("f163"))),
-                    "pe_ttm": _normalize_pe_value(parse_cn_number(data.get("f164"))),
-                    "pb": _normalize_pb_value(parse_cn_number(data.get("f167"))),
-                }
-            except Exception:
-                continue
-    return {"pe_dynamic": None, "pe_static": None, "pe_ttm": None, "pb": None}
 
 
 def _fetch_metrics_from_tencent(symbol: str) -> Dict[str, Optional[float]]:
@@ -780,21 +761,7 @@ def _fetch_name_from_tencent(symbol: str) -> Optional[str]:
 
 
 def _fetch_dividend_yield_from_em(symbol: str) -> Optional[float]:
-    try:
-        df = ak.stock_fhps_detail_em(symbol=str(symbol))
-        if df is None or df.empty or "现金分红-股息率" not in df.columns:
-            return None
-        tmp = df.copy()
-        tmp["现金分红-股息率"] = pd.to_numeric(tmp["现金分红-股息率"], errors="coerce")
-        tmp = tmp.dropna(subset=["现金分红-股息率"])
-        if tmp.empty:
-            return None
-        annual = tmp[tmp["报告期"].astype(str).str.endswith("12-31")]
-        chosen = annual if not annual.empty else tmp
-        val = parse_cn_number(chosen.iloc[-1]["现金分红-股息率"])
-        return _normalize_dividend_value(val)
-    except Exception:
-        return None
+    return fetch_a_dividend_yield_ttm(symbol)
 
 
 def _growth_from_series(values: List[Optional[float]]) -> Optional[float]:
@@ -1070,41 +1037,46 @@ def analyze_fundamental(code: str, name: str = "", force_refresh: bool = False, 
     dividend_yield = _normalize_dividend_value(_pick_profile_number(p, ["股息率", "股息率(%)"]))
     total_mv = _pick_profile_number(p, ["总市值", "总市值(元)"])
 
-    # 多源估值兜底：东方财富直连 + 腾讯快照 + 分红详情
+    # 交易/基本面页面的关键估值字段以东方财富为最终口径；其他源只做缺失兜底。
+    auth_metrics = fetch_authoritative_valuation(code) if not _is_hk_symbol(code) else {}
     em_metrics = _fetch_metrics_from_eastmoney_direct(code) if not _is_hk_symbol(code) else {}
     tx_metrics = _fetch_metrics_from_tencent(code)
-    dy_em = _fetch_dividend_yield_from_em(code) if not _is_hk_symbol(code) else None
+    dy_em = auth_metrics.get("dividend_yield") if not _is_hk_symbol(code) else None
 
     pe_dynamic = _coalesce_number(
-        pe_dynamic,
+        auth_metrics.get("pe_dynamic"),
         em_metrics.get("pe_dynamic"),
+        pe_dynamic,
         tx_metrics.get("pe_dynamic"),
         _normalize_pe_value(stale_cache.get("pe_dynamic")),
     )
     pe_static = _coalesce_number(
-        pe_static,
+        auth_metrics.get("pe_static"),
         em_metrics.get("pe_static"),
+        pe_static,
         _normalize_pe_value(stale_cache.get("pe_static")),
         pe_ttm,
         pe_dynamic,
     )
     pe_ttm = _coalesce_number(
-        pe_ttm,
+        auth_metrics.get("pe_ttm") or auth_metrics.get("pe_rolling"),
         em_metrics.get("pe_ttm"),
+        pe_ttm,
         tx_metrics.get("pe_ttm"),
         _normalize_pe_value(stale_cache.get("pe_ttm")),
         pe_dynamic,
         pe_static,
     )
     pb = _coalesce_number(
-        pb,
+        auth_metrics.get("pb"),
         em_metrics.get("pb"),
+        pb,
         tx_metrics.get("pb"),
         _normalize_pb_value(stale_cache.get("pb")),
     )
     dividend_yield = _coalesce_number(
-        dividend_yield,
         dy_em,
+        dividend_yield,
         _normalize_dividend_value(stale_cache.get("dividend_yield")),
     )
     total_mv = _coalesce_number(total_mv, stale_cache.get("total_mv"))

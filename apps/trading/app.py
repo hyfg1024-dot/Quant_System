@@ -113,6 +113,7 @@ if str(FUNDAMENTAL_DIR) not in sys.path:
 
 from fundamental_engine import (
     APP_VERSION as FUND_APP_VERSION,
+    analyze_fundamental as analyze_fundamental_one,
     analyze_watchlist as analyze_fundamental_watchlist,
     build_overview_table as build_fundamental_overview_table,
     format_pct as format_fundamental_pct,
@@ -378,7 +379,7 @@ st.markdown(
         border: 1px solid rgba(255,255,255,0.10);
         border-radius: 10px;
         padding: 0.62rem 0.78rem;
-        height: 156px;
+        min-height: 172px;
         box-sizing: border-box;
         display: flex;
         flex-direction: column;
@@ -419,8 +420,12 @@ st.markdown(
     }
     .fast-card .d {
         color: rgba(232, 223, 210, 0.88);
-        font-size: 0.78rem;
+        font-size: 0.74rem;
+        line-height: 1.2;
         margin-top: 0.25rem;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
     }
     .ob-title {
         font-size: 1.95rem;
@@ -1689,7 +1694,16 @@ def _render_fundamental_page():
             )
             with st.container(key=wrap_key):
                 if st.button(str(row.get("name", "")), key=f"tr_fnd_name_pick_{row.get('code', '')}", type="tertiary"):
-                    st.session_state["fnd_selected_code"] = row.get("code", "")
+                    selected_fnd_code = str(row.get("code", ""))
+                    selected_fnd_name = str(row.get("name", ""))
+                    st.session_state["fnd_selected_code"] = selected_fnd_code
+                    with st.spinner(f"正在刷新 {selected_fnd_name} ({selected_fnd_code}) 的实时基本面数据..."):
+                        fresh_row = analyze_fundamental_one(selected_fnd_code, selected_fnd_name, force_refresh=True)
+                        fresh_row["type"] = row.get("type", "观察")
+                        st.session_state["fnd_rows"] = [
+                            fresh_row if str(x.get("code", "")) == selected_fnd_code else x
+                            for x in st.session_state.get("fnd_rows", [])
+                        ]
                     st.rerun()
         cols[2].markdown(f"<div class='fnd-overview-cell'>{row.get('total_score', '')}</div>", unsafe_allow_html=True)
         cols[3].markdown(f"<div class='fnd-overview-cell'>{row.get('type', '')}</div>", unsafe_allow_html=True)
@@ -4417,6 +4431,8 @@ def _render_stock_group(stock_rows, group_key_prefix: str) -> None:
                     ):
                         st.session_state["fast_selected_code"] = row["code"]
                         st.session_state["fast_selected_name"] = row["name"]
+                        st.session_state["fast_force_refresh"] = True
+                        st.session_state["fast_refresh_message"] = f"正在获取 {row['name']} ({row['code']}) 的实时盘口..."
                     st.markdown("</div>", unsafe_allow_html=True)
                 with del_col:
                     st.markdown('<div class="stock-del-inline-wrap">', unsafe_allow_html=True)
@@ -4566,7 +4582,9 @@ def _render_fast_panel(selected_code: str, selected_name: str, panel=None):
         else selected_slow.get("pb")
     )
     dy_live = (
-        live_val.get("dividend_yield")
+        quote.get("dividend_yield")
+        if quote.get("dividend_yield") is not None
+        else live_val.get("dividend_yield")
         if isinstance(live_val, dict) and live_val.get("dividend_yield") is not None
         else selected_slow.get("dividend_yield")
     )
@@ -4910,7 +4928,7 @@ def _render_fast_panel(selected_code: str, selected_name: str, panel=None):
                 ("总市值(亿)", _fmt(total_mv, 2)),
                 ("流通市值(亿)", _fmt(float_mv, 2)),
             ],
-            "",
+            "东财权威口径",
         ),
         (
             "RSI 组合",
@@ -5290,12 +5308,12 @@ def _render_fast_panel_fragment():
     async_panel, async_pending, async_error, async_mode = _consume_async_fast_refresh(selected_code)
     if async_panel is not None:
         st.session_state[cache_key] = async_panel
+        panel = async_panel
         if async_mode == "realtime":
             st.session_state["fast_refresh_message"] = f"正在补充 {selected_name} ({selected_code}) 的资金分时和技术指标..."
             _start_async_fast_refresh(selected_code, mode="full")
         else:
             st.session_state["fast_refresh_message"] = ""
-        st.rerun()
     elif async_pending:
         started = st.session_state.get(f"fast_panel_future_started_{selected_code}", pytime.perf_counter())
         elapsed = max(0.0, pytime.perf_counter() - float(started))
