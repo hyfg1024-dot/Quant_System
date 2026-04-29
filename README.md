@@ -2,6 +2,12 @@
 
 `Quant_System` 是一个基于 Streamlit 构建的本地量化研究工作台，面向日常股票研究、盘中交易观察、条件筛选、组合风控与策略回测场景。项目以 macOS 本地运行方式为主，强调可落地、可视化和低门槛部署。
 
+仓库可以直接下载后安装运行，但需要区分三类能力：
+
+- 基础模块：按本文档创建虚拟环境并安装根目录 `requirements.txt` 后即可运行
+- 可选增强：DuckDB 快筛、仓位风控、告警 worker，这些依赖已包含在统一安装里
+- 本地专属能力：QMT / `xtquant`、本地 API Key、推送凭证，需要使用者自己配置
+
 ## 项目概览
 
 当前版本包含 6 个核心模块：
@@ -49,8 +55,80 @@ Quant_System/
 - Python 3.9+
 - 终端可用 `python3` 与 `pip`
 - 首次安装依赖时可正常访问 Python 包源
-- 若使用仓位风控 / DuckDB 快筛，需要可安装 `duckdb`
 - 若使用 QMT 数据适配层，需要本机具备 `xtquant` 运行环境
+
+## 统一安装
+
+推荐所有使用者都从项目根目录安装，不要逐个模块单独猜依赖。
+
+### 1. 克隆仓库
+
+```bash
+git clone https://github.com/hyfg1024-dot/Quant_System.git
+cd Quant_System
+```
+
+### 2. 创建虚拟环境
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python3 -m pip install --upgrade pip
+```
+
+### 3. 安装项目依赖
+
+```bash
+python3 -m pip install -r requirements.txt
+```
+
+根目录 `requirements.txt` 已包含：
+
+- `streamlit`
+- `akshare`
+- `pandas`
+- `requests`
+- `duckdb`
+- `aiohttp`
+- `plotly`
+- `openai`
+- `APScheduler`
+- `PyYAML`
+
+这意味着：
+
+- 使用 DuckDB 快筛时，不需要额外再找 `duckdb` 怎么装
+- 使用仓位风控模块时，也不需要单独补装 `duckdb`
+- 如果你只做了部分安装，手工补装命令就是：
+
+```bash
+python3 -m pip install duckdb
+```
+
+## 可选环境说明
+
+### DuckDB 快筛 / 仓位风控
+
+只要按根目录 `requirements.txt` 安装，`duckdb` 就已经到位。
+
+### QMT / xtquant
+
+`xtquant` 不属于通用 `pip` 依赖，这个项目不会替别人自动装好。要启用 QMT：
+
+- 需要使用者本机先具备 QMT 环境
+- 需要本机 Python 能正确导入 `xtquant`
+- 没有 QMT 时，项目仍可运行，只是 QMT 数据源不会启用
+
+### DeepSeek / API Key
+
+AI 分析需要本地 API Key。推荐：
+
+- 在页面中填写，仅保存在本地
+- 或自行通过环境变量、本地偏好文件管理
+
+### Telegram / PushPlus / ServerChan
+
+后台预警推送需要本地环境变量或私有凭证配置，否则 worker 可启动，但无法真实推送
 
 ## 快速开始
 
@@ -72,44 +150,34 @@ xattr -d com.apple.quarantine create_desktop_launcher.command 2>/dev/null || tru
 
 ### 方式二：手动启动模块
 
+完成统一安装后，推荐直接在项目根目录启动。
+
 #### Trading / 主控台
 
 ```bash
-cd apps/trading
-python3 -m venv venv
-source venv/bin/activate
-python3 -m pip install -r requirements.txt
-streamlit run app.py
+source .venv/bin/activate
+streamlit run apps/trading/app.py
 ```
 
 #### Fundamental
 
 ```bash
-cd apps/fundamental
-python3 -m venv venv
-source venv/bin/activate
-python3 -m pip install -r requirements.txt
-streamlit run app.py
+source .venv/bin/activate
+streamlit run apps/fundamental/app.py
 ```
 
 #### Filter
 
 ```bash
-cd apps/filter
-python3 -m venv venv
-source venv/bin/activate
-python3 -m pip install -r requirements.txt
-streamlit run app.py
+source .venv/bin/activate
+streamlit run apps/filter/app.py
 ```
 
 #### Portfolio
 
 ```bash
-cd apps/trading
-python3 -m venv venv
-source venv/bin/activate
-python3 -m pip install duckdb streamlit pandas altair
-streamlit run app.py
+source .venv/bin/activate
+streamlit run apps/trading/app.py
 ```
 
 ## 默认访问地址
@@ -236,6 +304,12 @@ chmod +x ~/Desktop/启动Quant_System.command
 - Telegram / PushPlus / ServerChan 推送凭证建议仅保存在本机环境变量
 - 分析缓存、任务文件、回测产物和模拟实盘快照都保存在本地目录，不会自动上传到 GitHub
 
+如果你计划把项目部署到网站或给朋友使用，建议把运行体系拆成三层：
+
+- 源码层：GitHub 仓库，只放代码、README、配置模板、许可证
+- 数据层：SQLite、DuckDB、深补资产、备份目录，只保存在服务器本地磁盘
+- 密钥层：API Key、推送凭证、QMT 本地环境，只放环境变量或私有配置
+
 建议将以下内容视为本地运行态数据，而不是源码的一部分：
 
 - `data/`
@@ -246,11 +320,38 @@ chmod +x ~/Desktop/启动Quant_System.command
 
 ## 常见问题
 
-### 1. 依赖安装较慢
+### 1. 别人从 GitHub 下载后，能直接安装吗
+
+可以。标准方式就是：
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python3 -m pip install -r requirements.txt
+```
+
+装完后即可启动各个基础模块。
+
+需要额外说明的是：
+
+- DuckDB 快筛 / 仓位风控已经包含在统一依赖中
+- QMT / `xtquant` 仍然需要使用者自己准备本机环境
+
+### 2. DuckDB 要怎么安装
+
+如果已经按根目录 `requirements.txt` 安装，就不需要额外处理。
+
+如果单独安装，可以执行：
+
+```bash
+python3 -m pip install duckdb
+```
+
+### 3. 依赖安装较慢
 
 首次安装会下载较多 Python 包，等待时间取决于网络环境。
 
-### 2. 页面无法访问
+### 4. 页面无法访问
 
 请确认：
 
@@ -258,7 +359,7 @@ chmod +x ~/Desktop/启动Quant_System.command
 - Streamlit 已正常启动
 - 端口未被其他程序占用
 
-### 3. API Key 是否会进入仓库
+### 5. API Key 是否会进入仓库
 
 不会。项目默认将本地用户配置、运行缓存、DuckDB 数据库和模拟实盘产物排除在 Git 之外。
 
@@ -270,6 +371,18 @@ chmod +x ~/Desktop/启动Quant_System.command
 - 各模块均可独立启动，也可在主工作流中联动使用
 - 若修改模块逻辑，建议优先在对应 `apps/<module>/` 下完成验证
 
-## 许可证与使用说明
+## 许可证
 
-本仓库当前未在 README 中单独声明开源许可证。如需对外分发、商用或二次发布，建议先补充明确的许可证文件与使用条款。
+本项目使用 [MIT License](LICENSE)。
+
+这表示：
+
+- 允许个人使用、修改、分发
+- 允许二次开发
+- 允许商用
+- 软件按“原样”提供，不附带任何担保
+
+需要另外注意：
+
+- 第三方数据源本身的服务条款，不包含在 MIT 许可证里
+- 使用者应自行确认东方财富、腾讯、新浪、AkShare、QMT 等数据接口的合规边界

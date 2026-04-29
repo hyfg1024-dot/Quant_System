@@ -23,3 +23,7 @@ apps/backtest/paper_trades/
 backups/
 data/backups/
 *.restore_tmp
+
+# local backtest strategy drafts / throwaway files
+apps/backtest/config/strategies/my_strategy.yaml
+apps/backtest/config/strategies/_trash/
