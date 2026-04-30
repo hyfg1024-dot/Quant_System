@@ -1,12 +1,50 @@
 # Quant_System
 
-`Quant_System` 是一个基于 Streamlit 构建的本地量化研究工作台，面向日常股票研究、盘中交易观察、条件筛选、组合风控与策略回测场景。项目以 macOS 本地运行方式为主，强调可落地、可视化和低门槛部署。
+`Quant_System` 是一个基于 Streamlit 构建的本地量化研究工作台，覆盖交易观察、基本面研究、条件筛选、仓位风控、策略回测和模拟实盘。项目默认面向 macOS 本地运行。
 
-仓库可以直接下载后安装运行，但需要区分三类能力：
+## 快速开始
 
-- 基础模块：按本文档创建虚拟环境并安装根目录 `requirements.txt` 后即可运行
-- 可选增强：DuckDB 快筛、仓位风控、告警 worker，这些依赖已包含在统一安装里
-- 本地专属能力：QMT / `xtquant`、本地 API Key、推送凭证，需要使用者自己配置
+### 1. 安装
+
+```bash
+git clone https://github.com/hyfg1024-dot/Quant_System.git
+cd Quant_System
+python3 -m venv .venv
+source .venv/bin/activate
+python3 -m pip install --upgrade pip
+python3 -m pip install -r requirements.txt
+```
+
+默认会安装完整依赖，包含 `streamlit`、`akshare`、`duckdb`、`aiohttp`、`plotly`、`openai`、`APScheduler` 等。
+
+### 2. 启动主界面
+
+```bash
+source .venv/bin/activate
+streamlit run apps/trading/app.py
+```
+
+默认地址：
+
+- [http://localhost:8501](http://localhost:8501)
+
+### 3. 启动其他模块
+
+```bash
+source .venv/bin/activate
+streamlit run apps/fundamental/app.py
+streamlit run apps/filter/app.py
+```
+
+### 4. 桌面启动脚本
+
+```bash
+chmod +x create_desktop_launcher.command
+xattr -d com.apple.quarantine create_desktop_launcher.command 2>/dev/null || true
+./create_desktop_launcher.command
+```
+
+如果使用 QMT 数据源，仍需要使用者本机自己准备 `xtquant` 运行环境。
 
 ## 项目概览
 
@@ -53,144 +91,8 @@ Quant_System/
 
 - macOS
 - Python 3.9+
-- 终端可用 `python3` 与 `pip`
-- 首次安装依赖时可正常访问 Python 包源
-- 若使用 QMT 数据适配层，需要本机具备 `xtquant` 运行环境
-
-## 统一安装
-
-推荐所有使用者都从项目根目录安装，不要逐个模块单独猜依赖。
-
-### 1. 克隆仓库
-
-```bash
-git clone https://github.com/hyfg1024-dot/Quant_System.git
-cd Quant_System
-```
-
-### 2. 创建虚拟环境
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-python3 -m pip install --upgrade pip
-```
-
-### 3. 安装项目依赖
-
-```bash
-python3 -m pip install -r requirements.txt
-```
-
-根目录 `requirements.txt` 已包含：
-
-- `streamlit`
-- `akshare`
-- `pandas`
-- `requests`
-- `duckdb`
-- `aiohttp`
-- `plotly`
-- `openai`
-- `APScheduler`
-- `PyYAML`
-
-这意味着：
-
-- 使用 DuckDB 快筛时，不需要额外再找 `duckdb` 怎么装
-- 使用仓位风控模块时，也不需要单独补装 `duckdb`
-- 如果你只做了部分安装，手工补装命令就是：
-
-```bash
-python3 -m pip install duckdb
-```
-
-## 可选环境说明
-
-### DuckDB 快筛 / 仓位风控
-
-只要按根目录 `requirements.txt` 安装，`duckdb` 就已经到位。
-
-### QMT / xtquant
-
-`xtquant` 不属于通用 `pip` 依赖，这个项目不会替别人自动装好。要启用 QMT：
-
-- 需要使用者本机先具备 QMT 环境
-- 需要本机 Python 能正确导入 `xtquant`
-- 没有 QMT 时，项目仍可运行，只是 QMT 数据源不会启用
-
-### DeepSeek / API Key
-
-AI 分析需要本地 API Key。推荐：
-
-- 在页面中填写，仅保存在本地
-- 或自行通过环境变量、本地偏好文件管理
-
-### Telegram / PushPlus / ServerChan
-
-后台预警推送需要本地环境变量或私有凭证配置，否则 worker 可启动，但无法真实推送
-
-## 快速开始
-
-### 方式一：使用桌面启动脚本
-
-在项目根目录执行：
-
-```bash
-chmod +x create_desktop_launcher.command
-xattr -d com.apple.quarantine create_desktop_launcher.command 2>/dev/null || true
-./create_desktop_launcher.command
-```
-
-执行完成后，桌面会生成启动入口：
-
-- `启动Quant_System.command`
-
-双击后即可启动默认页面。
-
-### 方式二：手动启动模块
-
-完成统一安装后，推荐直接在项目根目录启动。
-
-#### Trading / 主控台
-
-```bash
-source .venv/bin/activate
-streamlit run apps/trading/app.py
-```
-
-#### Fundamental
-
-```bash
-source .venv/bin/activate
-streamlit run apps/fundamental/app.py
-```
-
-#### Filter
-
-```bash
-source .venv/bin/activate
-streamlit run apps/filter/app.py
-```
-
-#### Portfolio
-
-```bash
-source .venv/bin/activate
-streamlit run apps/trading/app.py
-```
-
-## 默认访问地址
-
-启动后默认访问：
-
-- [http://localhost:8501](http://localhost:8501)
-
-如果端口被占用，可以改为其他端口，例如：
-
-```bash
-streamlit run app.py --server.port 8510
-```
+- 可用的 `python3` / `pip`
+- 首次安装依赖时可访问 Python 包源
 
 ## 后台预警 Worker
 
