@@ -28,20 +28,24 @@ streamlit run apps/trading/app.py
 
 - [http://localhost:8501](http://localhost:8501)
 
-### 3. 启动其他模块
-
-```bash
-source .venv/bin/activate
-streamlit run apps/fundamental/app.py
-streamlit run apps/filter/app.py
-```
-
-### 4. 桌面启动脚本
+### 3. 设置桌面一键启动
 
 ```bash
 chmod +x create_desktop_launcher.command
 xattr -d com.apple.quarantine create_desktop_launcher.command 2>/dev/null || true
 ./create_desktop_launcher.command
+```
+
+执行后会在桌面生成一键启动入口：
+
+- `启动Quant_System.command`
+
+### 4. 启动其他模块
+
+```bash
+source .venv/bin/activate
+streamlit run apps/fundamental/app.py
+streamlit run apps/filter/app.py
 ```
 
 如果使用 QMT 数据源，仍需要使用者本机自己准备 `xtquant` 运行环境。
