@@ -40,14 +40,6 @@ xattr -d com.apple.quarantine create_desktop_launcher.command 2>/dev/null || tru
 
 - `启动Quant_System.command`
 
-### 4. 启动其他模块
-
-```bash
-source .venv/bin/activate
-streamlit run apps/fundamental/app.py
-streamlit run apps/filter/app.py
-```
-
 如果使用 QMT 数据源，仍需要使用者本机自己准备 `xtquant` 运行环境。
 
 ## 项目概览

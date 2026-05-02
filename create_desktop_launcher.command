@@ -2,26 +2,41 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
-APP_DIR="$ROOT_DIR/apps/trading"
-LAUNCHER_PATH="$HOME/Desktop/启动Quant_System.command"
+DESKTOP_DIR="$HOME/Desktop"
+LAUNCHER_PATH="$DESKTOP_DIR/启动Quant_System.command"
+
+if [ ! -f "$ROOT_DIR/requirements.txt" ]; then
+  echo "错误：未找到 $ROOT_DIR/requirements.txt"
+  echo "请确认你是在完整的 Quant_System 项目根目录中执行本脚本。"
+  exit 1
+fi
+
+if [ ! -f "$ROOT_DIR/apps/trading/app.py" ]; then
+  echo "错误：未找到 $ROOT_DIR/apps/trading/app.py"
+  echo "请确认 GitHub 项目下载完整。"
+  exit 1
+fi
+
+mkdir -p "$DESKTOP_DIR"
 
 cat > "$LAUNCHER_PATH" <<EOF
 #!/bin/zsh
 set -euo pipefail
 
-APP_DIR="$APP_DIR"
-cd "\$APP_DIR"
+ROOT_DIR="$ROOT_DIR"
+cd "\$ROOT_DIR"
 
-if [ ! -d "venv" ]; then
+if [ ! -d ".venv" ]; then
   echo "[首次启动] 创建虚拟环境..."
-  python3 -m venv venv
+  python3 -m venv .venv
 fi
 
-source venv/bin/activate
+source .venv/bin/activate
+python3 -m pip install --upgrade pip
 python3 -m pip install -r requirements.txt
 
 echo "正在启动 Quant_System..."
-exec python3 -m streamlit run app.py --server.headless false
+exec python3 -m streamlit run apps/trading/app.py --server.headless false
 EOF
 
 chmod +x "$LAUNCHER_PATH"
